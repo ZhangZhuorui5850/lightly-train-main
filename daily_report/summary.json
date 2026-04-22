@@ -1,0 +1,10 @@
+{
+  "out_dir": "/home/zzr/lightly-train-main/out",
+  "report_dir": "/home/zzr/lightly-train-main/daily_report",
+  "record_count": 5,
+  "generated_files": [
+    "/home/zzr/lightly-train-main/daily_report/2026-04-14/report.md",
+    "/home/zzr/lightly-train-main/daily_report/2026-04-14/report.json",
+    "/home/zzr/lightly-train-main/daily_report/2026-04-14/notes.md"
+  ]
+}

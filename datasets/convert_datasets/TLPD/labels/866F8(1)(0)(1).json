@@ -1,0 +1,35 @@
+{
+  "version": "5.1.1",
+  "flags": {},
+  "shapes": [
+    {
+      "description": "",
+      "label": "carplate",
+      "points": [
+        [
+          3.0,
+          9.599999999999994
+        ],
+        [
+          46.0,
+          11.0
+        ],
+        [
+          48.3,
+          23.5
+        ],
+        [
+          5.900000000000006,
+          23.699999999999996
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "polygon",
+      "flags": {}
+    }
+  ],
+  "imagePath": "866F8(1)(0).jpg",
+  "imageData": "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAAeADQDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDm7rXbG0uGgmVwy9cRmoW8Q6Y0e4rMF6bjCcA1sappWmah4ysoGctFcRNwnG5gCQPqapDwxZpJHLNaXkcElrJcGzMmHDo2CM46d+lITlYyZ9Z0qdCjSMN3Q+War2d5odk2TNknqdhNXbbRtKvJLyWNLzyLe2+0fZz8sgbIBGSORz6Cs2XTrIagqW7zPbuVOyRdsiZ6g9uPXpRYnnNM69o/AjkyfXySP6U+HVtNup1ihZPMPbbjNLrWmaTp98dNgjvYpUkVWmkdTGQe/T3ps3h+1025S4ia4/0e7W3lE6jDbs4ZSO3FFhqdyWS2RnJ2JRXVJpViigKyMOud1FKxZ5b4D1RbDxFDc3LOyRMGIznA74969Mi1uw042LXGtR3Tm8kKyDJaOGRSCGyOxxxXhcFxLbTCWJtr+uKtSa3dygCTy3weMoKuxEo3Z7bBqdvZT6c9xq1tPeMJopLmEZxGy/Jv47GsbxDeSR2Nlsv7efUfJeO6nt2yJU3AqDx1ry4a/fA8NGOMcIK6gSutkJeC3lhvxxTIcDpvF2tTagtnGt35tq1tE7xKQVSQD5h65q1quoJqOmX7tqED2dxBG1tAz/vI5VxwB19ea8wt9Yubi6SKTaVZsdKu6jdPp0QMKJlvUUgSsY8uqahBM8a31wAGPG80VRkcyyM56sc0UzQ//9k=",
+  "imageHeight": 30,
+  "imageWidth": 52
+}

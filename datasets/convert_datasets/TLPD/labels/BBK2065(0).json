@@ -1,0 +1,36 @@
+{
+  "version": "5.4.0a0",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "carplate",
+      "points": [
+        [
+          3.666666666666657,
+          88.34188034188034
+        ],
+        [
+          419.0512820512821,
+          145.6068376068376
+        ],
+        [
+          414.7777777777778,
+          363.982905982906
+        ],
+        [
+          3.666666666666657,
+          296.03418803418805
+        ]
+      ],
+      "group_id": null,
+      "description": "",
+      "shape_type": "polygon",
+      "flags": {},
+      "mask": null
+    }
+  ],
+  "imagePath": "BBK2065(0).jpg",
+  "imageData": null,
+  "imageHeight": 416,
+  "imageWidth": 424
+}

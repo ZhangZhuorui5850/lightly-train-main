@@ -1,0 +1,36 @@
+{
+  "version": "5.4.0a0",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "carplate",
+      "points": [
+        [
+          5.450000000000003,
+          11.400000000000002
+        ],
+        [
+          58.449999999999996,
+          10.000000000000004
+        ],
+        [
+          58.449999999999996,
+          24.500000000000004
+        ],
+        [
+          4.950000000000003,
+          25.7
+        ]
+      ],
+      "group_id": null,
+      "description": "",
+      "shape_type": "polygon",
+      "flags": {},
+      "mask": null
+    }
+  ],
+  "imagePath": "TDR2062(1)(0)(1).jpg",
+  "imageData": "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAAiAD4DASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDEHhbWed0/HvcGnL4Z1E/euYz9ZmNd9MGETNHA0zqMrEhALn054rHTXZJLVrj+xpVTzfIUtMo3SZxt/wDr0zKKctkcDeeC9RWVdl+0kbN8wDsSPxqGLwffW+sxxSbpYXzh0dmC+hYGvQ474JcCGLS5BqJm8l4ZZuAcZBB6YxWlZT3F5ZXE8dhm7glMJhEmRuB659KVypQmuhx6+Cf+mwPr/o7VKvglBgGdgT0AtuT+ZrqU1W8897Q2sLXPmrCjLITHuIyQT7VYW/jW2uZdQtojc2svkKI+d7HstAuWRy6eBrcj5p7r8LYf41ctfh/Y3IYLf3IdDhlaJQRW/PLrFvZefNHY26Ihdy2W2+iY9a0dGklkt3nmhEcr7dyenFBNmirbY80Ek4AJNcxDLEvh7RnmkVI5tRMrFjgYDMc10iM8IYm3MgIxgOoP6mmeZEsUcP8AZkPlJ9xHljwv0HanYUKnKzmmibV9fae3kkiS4lllglXgkIgAI9s1o200em+Gba/tp5FnuQYiWfKCQn5nPuK2opzGciO3H90tcDKj0GBwKkF4Qu3FkF7KJGOP/HaOU0liLq1jIFxplsdJNtP5ltbTlp5gpJLlep471TmDyTLdTG5gtpZpZo5IoyWLfw8dq6cX8gGA9sB6AOf6U0XUryq4kjLKMD91KRRyiVe3QxBfSyz2UespcGO3QSuqQljK5+7ux6Cuns5RKssq5Akk3AOuDjA7dqgF1cDGJlB/69n/AKmpY5UjjwTK7MSzMY8ZJo5SZVOYgREx91evpUqIn91evpRRVmRYRVz90flUqKNx4HSiikCFwM9BUfrRRQMjLNu+8fzqi88uP9a/X+8aKKBo/9k=",
+  "imageHeight": 34,
+  "imageWidth": 62
+}

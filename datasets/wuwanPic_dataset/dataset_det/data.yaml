@@ -1,0 +1,11 @@
+# Placeholder config for wuwanPic dataset detection.
+# This is the default dataset path currently used by det_tool.py.
+path: /home/zzr/lightly-train-main/datasets/wuwanPic_dataset/dataset_det
+train: images/train
+val: images/val
+test: images/test
+
+task: detect
+nc: 1
+names:
+  0: placeholder

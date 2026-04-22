@@ -1,0 +1,36 @@
+{
+  "version": "5.4.0a0",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "carplate",
+      "points": [
+        [
+          12.0,
+          68.0
+        ],
+        [
+          304.0,
+          169.0
+        ],
+        [
+          275.75,
+          215.25
+        ],
+        [
+          0.0,
+          119.0
+        ]
+      ],
+      "group_id": null,
+      "description": "",
+      "shape_type": "polygon",
+      "flags": {},
+      "mask": null
+    }
+  ],
+  "imagePath": "MFW8005(0).jpg",
+  "imageData": null,
+  "imageHeight": 243,
+  "imageWidth": 305
+}

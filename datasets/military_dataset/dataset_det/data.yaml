@@ -1,0 +1,11 @@
+# Placeholder config for military dataset detection.
+# Update names/nc after the real classes are finalized.
+path: /home/zzr/lightly-train-main/datasets/military_dataset/dataset_det
+train: images/train
+val: images/val
+test: images/test
+
+task: detect
+nc: 1
+names:
+  0: placeholder

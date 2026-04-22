@@ -1,0 +1,11 @@
+# Placeholder export config for wuwanPic dataset filtered output.
+# det_tool.py export will overwrite this file when exporting.
+path: /home/zzr/lightly-train-main/datasets/wuwanPic_dataset/dataset_det_A
+train: images/train
+val: images/val
+test: images/test
+
+task: detect
+nc: 1
+names:
+  0: placeholder

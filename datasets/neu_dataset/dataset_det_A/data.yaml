@@ -1,0 +1,11 @@
+path: /home/zzr/lightly-train-main/datasets/neu_dataset/dataset_det_A
+train: images/train
+val: images/val
+test: images/test
+task: detect
+nc: 4
+names:
+  0: crazing
+  1: pitted_surface
+  2: rolled-in_scale
+  3: scratches

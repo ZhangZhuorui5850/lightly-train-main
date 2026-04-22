@@ -1,0 +1,35 @@
+{
+  "version": "5.1.1",
+  "flags": {},
+  "shapes": [
+    {
+      "description": "",
+      "label": "carplate",
+      "points": [
+        [
+          5.649999999999999,
+          10.100000000000001
+        ],
+        [
+          43.449999999999996,
+          9.0
+        ],
+        [
+          43.65,
+          22.299999999999997
+        ],
+        [
+          6.149999999999999,
+          22.700000000000003
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "polygon",
+      "flags": {}
+    }
+  ],
+  "imagePath": "1437T5(1)(0).jpg",
+  "imageData": "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAAdADADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDkH126bgaVdZPoRVWTVbsvt/sq6DHoOM13WhwJNrlvGUU7g+AehO01Ncy2MPhRvE13p1ub1FZERdxBcOVUAZ9RTMbnnZvNQz/yB7z8qVbjU2Py6NdH68V6VJc6hFFY3v2KxWxufITByZHaQDJXnoCencA1PZW+rf27daddy2EipaiRZIoSux2YhQwJ56GnYnmPKxNq0k3lLpLeZ/cMozTZZtUicpJpwjcdQz128smo2UL311dadBINSawadbL7ijJ3dcnPHFVNfw15DKLyK8EturCeJNit8zDp2xjFA0za8Pgr4jsiRxuYZ/4Cat3mhyP4atLK41D+zrqG4uJYkZVbzSWfbwT6MPzqB4Yyq5DA43BkYqVPsRVvNzg5vrw7emZ2/wAaVxWu7iJpOuyaVoumTWMT/Zvs8ovDIFaBkI3Ar34GBjrXQ2VjLHrWr3M8YCXEkXlHIOQqDn25zXNs8w5N3dnHrcP/AI1VuJZdgP2m6/8AAh/8aYmjbiSaCfUraC3gnvP7QN5FFOp2shCZIfGFbrj+VcZr2mz6fdRpciMTyq87pG2RHvldtue+M0+4uJeQZrk/W4f/ABqhJLnkgsW6szEn8zQNI//Z",
+  "imageHeight": 29,
+  "imageWidth": 48
+}

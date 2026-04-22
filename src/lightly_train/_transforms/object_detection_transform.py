@@ -1,0 +1,373 @@
+#
+# Copyright (c) Lightly AG and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+#
+from __future__ import annotations
+
+from typing import Any, Literal
+
+import numpy as np
+import torch
+from albumentations import (
+    BboxParams,
+    Compose,
+    HorizontalFlip,
+    RandomRotate90,
+    Resize,
+    Rotate,
+    ToFloat,
+    VerticalFlip,
+)
+from albumentations.pytorch.transforms import ToTensorV2
+from numpy.typing import NDArray
+from pydantic import ConfigDict
+from torch import Tensor
+from typing_extensions import NotRequired
+
+from lightly_train._configs.validate import no_auto
+from lightly_train._transforms.channel_drop import ChannelDrop
+from lightly_train._transforms.normalize import NormalizeDtypeAware as Normalize
+from lightly_train._transforms.random_iou_crop import RandomIoUCrop
+from lightly_train._transforms.random_photometric_distort import (
+    RandomPhotometricDistort,
+)
+from lightly_train._transforms.random_zoom_out import RandomZoomOut
+from lightly_train._transforms.scale_jitter import ScaleJitter
+from lightly_train._transforms.task_transform import (
+    TaskCollateFunction,
+    TaskTransform,
+    TaskTransformArgs,
+    TaskTransformInput,
+    TaskTransformOutput,
+)
+from lightly_train._transforms.transform import (
+    ChannelDropArgs,
+    NormalizeArgs,
+    RandomFlipArgs,
+    RandomIoUCropArgs,
+    RandomPhotometricDistortArgs,
+    RandomRotate90Args,
+    RandomRotationArgs,
+    RandomZoomOutArgs,
+    ResizeArgs,
+    ScaleJitterArgs,
+    StopPolicyArgs,
+)
+from lightly_train.types import (
+    ImageSizeTuple,
+    NDArrayImage,
+    ObjectDetectionBatch,
+    ObjectDetectionDatasetItem,
+)
+
+
+class ObjectDetectionTransformInput(TaskTransformInput):
+    image: NDArrayImage
+    bboxes: NotRequired[NDArray[np.float64]]
+    class_labels: NotRequired[NDArray[np.int64]]
+
+
+class ObjectDetectionTransformOutput(TaskTransformOutput):
+    image: Tensor
+    bboxes: NotRequired[Tensor]
+    class_labels: NotRequired[Tensor]
+
+
+class ObjectDetectionTransformArgs(TaskTransformArgs):
+    channel_drop: ChannelDropArgs | None
+    num_channels: int | Literal["auto"]
+    photometric_distort: RandomPhotometricDistortArgs | None
+    random_zoom_out: RandomZoomOutArgs | None
+    random_iou_crop: RandomIoUCropArgs | None
+    random_flip: RandomFlipArgs | None
+    random_rotate_90: RandomRotate90Args | None
+    random_rotate: RandomRotationArgs | None
+    image_size: ImageSizeTuple | Literal["auto"]
+    stop_policy: StopPolicyArgs | None
+    scale_jitter: ScaleJitterArgs | None
+    resize: ResizeArgs | None
+    bbox_params: BboxParams | None
+    normalize: NormalizeArgs | Literal["auto"] | None
+
+    # Necessary for the StopPolicyArgs, which are not serializable by pydantic.
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def resolve_auto(self, model_init_args: dict[str, Any]) -> None:
+        pass
+
+    def resolve_incompatible(self) -> None:
+        # TODO: Lionel (09/25): Add checks for incompatible args.
+        pass
+
+    def get_scale_range(self) -> tuple[float, float] | None:
+        if self.scale_jitter is not None:
+            if (
+                self.scale_jitter.min_scale is None
+                or self.scale_jitter.max_scale is None
+            ):
+                return None
+            else:
+                return (
+                    self.scale_jitter.min_scale,
+                    self.scale_jitter.max_scale,
+                )
+        else:
+            return None
+
+
+class ObjectDetectionTransform(TaskTransform):
+    transform_args_cls: type[ObjectDetectionTransformArgs] = (
+        ObjectDetectionTransformArgs
+    )
+
+    def __init__(
+        self,
+        transform_args: ObjectDetectionTransformArgs,
+    ) -> None:
+        super().__init__(transform_args=transform_args)
+
+        self.transform_args: ObjectDetectionTransformArgs = transform_args
+        self.stop_step = (
+            transform_args.stop_policy.stop_step if transform_args.stop_policy else None
+        )
+
+        # TODO: Lionel (09/25): Implement stopping of certain augmentations after some steps.
+        if self.stop_step is not None:
+            raise NotImplementedError(
+                "Stopping certain augmentations after some steps is not implemented yet."
+            )
+        self.global_step = 0  # Currently hardcoded, will be set from outside.
+        self.stop_ops = (
+            transform_args.stop_policy.ops if transform_args.stop_policy else set()
+        )
+        self.past_stop = False
+
+        self.individual_transforms = []
+
+        if transform_args.channel_drop is not None:
+            self.individual_transforms += [
+                ChannelDrop(
+                    num_channels_keep=transform_args.channel_drop.num_channels_keep,
+                    weight_drop=transform_args.channel_drop.weight_drop,
+                )
+            ]
+
+        if transform_args.photometric_distort is not None:
+            self.individual_transforms += [
+                RandomPhotometricDistort(
+                    brightness=transform_args.photometric_distort.brightness,
+                    contrast=transform_args.photometric_distort.contrast,
+                    saturation=transform_args.photometric_distort.saturation,
+                    hue=transform_args.photometric_distort.hue,
+                    p=transform_args.photometric_distort.prob,
+                )
+            ]
+
+        if transform_args.random_zoom_out is not None:
+            self.individual_transforms += [
+                RandomZoomOut(
+                    fill=transform_args.random_zoom_out.fill,
+                    side_range=transform_args.random_zoom_out.side_range,
+                    p=transform_args.random_zoom_out.prob,
+                )
+            ]
+
+        if transform_args.random_iou_crop is not None:
+            self.individual_transforms += [
+                RandomIoUCrop(
+                    min_scale=transform_args.random_iou_crop.min_scale,
+                    max_scale=transform_args.random_iou_crop.max_scale,
+                    min_aspect_ratio=transform_args.random_iou_crop.min_aspect_ratio,
+                    max_aspect_ratio=transform_args.random_iou_crop.max_aspect_ratio,
+                    sampler_options=transform_args.random_iou_crop.sampler_options,
+                    crop_trials=transform_args.random_iou_crop.crop_trials,
+                    iou_trials=transform_args.random_iou_crop.iou_trials,
+                    p=transform_args.random_iou_crop.prob,
+                )
+            ]
+
+        if transform_args.random_flip is not None:
+            if transform_args.random_flip.horizontal_prob > 0.0:
+                self.individual_transforms += [
+                    HorizontalFlip(p=transform_args.random_flip.horizontal_prob)
+                ]
+            if transform_args.random_flip.vertical_prob > 0.0:
+                self.individual_transforms += [
+                    VerticalFlip(p=transform_args.random_flip.vertical_prob)
+                ]
+
+        if transform_args.random_rotate_90 is not None:
+            self.individual_transforms += [
+                RandomRotate90(p=transform_args.random_rotate_90.prob)
+            ]
+        if transform_args.random_rotate is not None:
+            self.individual_transforms += [
+                Rotate(
+                    limit=transform_args.random_rotate.degrees,
+                    interpolation=transform_args.random_rotate.interpolation,
+                    p=transform_args.random_rotate.prob,
+                )
+            ]
+
+        if transform_args.resize is not None:
+            self.individual_transforms += [
+                Resize(
+                    height=no_auto(transform_args.resize.height),
+                    width=no_auto(transform_args.resize.width),
+                )
+            ]
+
+        # Scale to [0, 1].
+        self.individual_transforms += [
+            ToFloat(max_value=255.0),
+        ]
+
+        # Only used with ViT-S/16, ViT-T/16+ and ViT-T/16.
+        if transform_args.normalize is not None:
+            self.individual_transforms += [
+                Normalize(
+                    mean=no_auto(transform_args.normalize).mean,
+                    std=no_auto(transform_args.normalize).std,
+                    max_pixel_value=1.0,  # Already scaled.
+                )
+            ]
+
+        self.individual_transforms += [
+            ToTensorV2(),
+        ]
+
+        self.transform = Compose(
+            self.individual_transforms,
+            bbox_params=transform_args.bbox_params,
+        )
+
+    def __call__(
+        self, input: ObjectDetectionTransformInput
+    ) -> ObjectDetectionTransformOutput:
+        # Adjust transform after stop_step is reached.
+        if (
+            self.stop_step is not None
+            and self.global_step >= self.stop_step
+            and not self.past_stop
+        ):
+            self.individual_transforms = [
+                t for t in self.individual_transforms if type(t) not in self.stop_ops
+            ]
+            self.transform = Compose(
+                self.individual_transforms,
+                bbox_params=self.transform_args.bbox_params,
+            )
+            self.past_stop = True
+
+        transformed = self.transform(
+            image=input["image"],
+            bboxes=input["bboxes"],
+            class_labels=input["class_labels"],
+        )
+
+        return {
+            "image": transformed["image"],
+            "bboxes": transformed["bboxes"],
+            "class_labels": transformed["class_labels"],
+        }
+
+
+class ObjectDetectionCollateFunction(TaskCollateFunction):
+    def __init__(
+        self, split: Literal["train", "val"], transform_args: TaskTransformArgs
+    ):
+        super().__init__(split, transform_args)
+        assert isinstance(transform_args, ObjectDetectionTransformArgs)
+        self.scale_jitter: Compose | None = None
+        if transform_args.scale_jitter is not None:
+            scale_range = transform_args.get_scale_range()
+            self.scale_jitter = Compose(
+                [
+                    ScaleJitter(
+                        sizes=transform_args.scale_jitter.sizes,
+                        target_size=(
+                            no_auto(transform_args.image_size)
+                            if transform_args.scale_jitter.sizes is None
+                            else None
+                        ),
+                        scale_range=scale_range,
+                        num_scales=transform_args.scale_jitter.num_scales,
+                        divisible_by=transform_args.scale_jitter.divisible_by,
+                        p=transform_args.scale_jitter.prob,
+                        step_seeding=transform_args.scale_jitter.step_seeding,
+                        seed_offset=transform_args.scale_jitter.seed_offset,
+                    )
+                ],
+                bbox_params=transform_args.bbox_params,
+            )
+        else:
+            self.scale_jitter = None
+
+    def __call__(self, batch: list[ObjectDetectionDatasetItem]) -> ObjectDetectionBatch:
+        if self.scale_jitter is not None:
+            # Turn into numpy again.
+            batch_np = [
+                {
+                    "image_path": item["image_path"],
+                    "image": item["image"].permute(1, 2, 0).numpy(),
+                    "bboxes": item["bboxes"].numpy(),
+                    "classes": item["classes"].numpy(),
+                    "original_size": item["original_size"],
+                }
+                for item in batch
+            ]
+
+            # Apply transform.
+            seed = np.random.randint(0, 1_000_000)
+            images = []
+            bboxes = []
+            classes = []
+            for item in batch_np:
+                self.scale_jitter.step = seed
+                out = self.scale_jitter(
+                    image=item["image"],
+                    bboxes=item["bboxes"],
+                    class_labels=item["classes"],
+                )
+                images.append(out["image"])
+                bboxes.append(out["bboxes"])
+                classes.append(out["class_labels"])
+
+            # Old versions of albumentations return classes/boxes as a list.
+            bboxes = [
+                bbox if isinstance(bbox, np.ndarray) else np.array(bbox)
+                for bbox in bboxes
+            ]
+            classes = [
+                cls_ if isinstance(cls_, np.ndarray) else np.array(cls_)
+                for cls_ in classes
+            ]
+
+            # Turn back into torch tensors.
+            images = [
+                torch.from_numpy(img).permute(2, 0, 1).to(torch.float32)
+                for img in images
+            ]
+            bboxes = [torch.from_numpy(bbox).to(torch.float32) for bbox in bboxes]
+            classes = [torch.from_numpy(cls).to(torch.int64) for cls in classes]
+
+            out_: ObjectDetectionBatch = {
+                "image_path": [item["image_path"] for item in batch],
+                "image": torch.stack(images),
+                "bboxes": bboxes,
+                "classes": classes,
+                "original_size": [item["original_size"] for item in batch],
+            }
+            return out_
+        else:
+            out_ = {
+                "image_path": [item["image_path"] for item in batch],
+                "image": torch.stack([item["image"] for item in batch]),
+                "bboxes": [item["bboxes"] for item in batch],
+                "classes": [item["classes"] for item in batch],
+                "original_size": [item["original_size"] for item in batch],
+            }
+            return out_

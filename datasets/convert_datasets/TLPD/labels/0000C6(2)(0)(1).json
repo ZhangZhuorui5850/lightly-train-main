@@ -1,0 +1,35 @@
+{
+    "version": "5.2.1",
+    "flags": {},
+    "shapes": [
+        {
+            "label": "carplate",
+            "points": [
+                [
+                    5.0,
+                    8.0
+                ],
+                [
+                    117.0,
+                    12.0
+                ],
+                [
+                    115.0,
+                    52.0
+                ],
+                [
+                    3.0,
+                    48.0
+                ]
+            ],
+            "group_id": null,
+            "description": "",
+            "shape_type": "polygon",
+            "flags": {}
+        }
+    ],
+    "imagePath": "0000C6(2)(0)(1).jpg",
+    "imageData": null,
+    "imageHeight": 60,
+    "imageWidth": 121
+}

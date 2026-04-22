@@ -1,0 +1,36 @@
+{
+  "version": "5.4.0a0",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "carplate",
+      "points": [
+        [
+          1.244493196372332,
+          131.092629802008
+        ],
+        [
+          191.5916114790287,
+          31.34105960264901
+        ],
+        [
+          191.15011037527591,
+          86.08719646799118
+        ],
+        [
+          16.094922737306852,
+          195.80022075055186
+        ]
+      ],
+      "group_id": null,
+      "description": "",
+      "shape_type": "polygon",
+      "flags": {},
+      "mask": null
+    }
+  ],
+  "imagePath": "MYW0897(1)(2).jpg",
+  "imageData": null,
+  "imageHeight": 215,
+  "imageWidth": 194
+}

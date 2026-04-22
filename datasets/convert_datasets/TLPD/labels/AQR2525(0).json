@@ -1,0 +1,36 @@
+{
+  "version": "5.4.0a0",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "carplate",
+      "points": [
+        [
+          15.711790393013118,
+          94.53275109170306
+        ],
+        [
+          419.20524017467255,
+          131.21397379912665
+        ],
+        [
+          417.02183406113534,
+          365.71179039301313
+        ],
+        [
+          8.0,
+          326.0
+        ]
+      ],
+      "group_id": null,
+      "description": "",
+      "shape_type": "polygon",
+      "flags": {},
+      "mask": null
+    }
+  ],
+  "imagePath": "AQR2525(0).jpg",
+  "imageData": null,
+  "imageHeight": 424,
+  "imageWidth": 424
+}
