@@ -350,7 +350,7 @@ def confirm_args(title: str, args: argparse.Namespace) -> argparse.Namespace | N
     return None
 
 
-def print_default_det_infer_summary(*, mode: str) -> None:
+def print_default_det_infer_summary(*, mode: str, data_path: Path | None = None) -> None:
     print("\n默认参数摘要")
     print(f"  input_mode: {mode}")
     print(f"  score_threshold: {rt.INFER_DEFAULT_SCORE_THRESHOLD}")
@@ -358,8 +358,10 @@ def print_default_det_infer_summary(*, mode: str) -> None:
     print("  save_visualization: True")
     print("  save_json: False")
     print("  save_txt: False")
-    print(f"  split: {rt.INFER_DEFAULT_SPLIT if mode == 'dataset' else '(not used)'}")
-    default_data = compact_display_path(rt.INFER_DEFAULT_DATA) if mode == "dataset" else "(not used)"
+    split_text = "交互选择 test / val / all" if mode == "dataset" else "(not used)"
+    print(f"  split: {split_text}")
+    selected_data = data_path if data_path is not None else rt.INFER_DEFAULT_DATA
+    default_data = compact_display_path(selected_data) if mode == "dataset" else "(not used)"
     print(f"  data: {default_data}")
     print(f"  output_dir: (auto)")
     print(f"  report_path: {'(auto)' if mode == 'dataset' else '(not used)'}")
@@ -367,6 +369,52 @@ def print_default_det_infer_summary(*, mode: str) -> None:
     print(f"  save_test_report: {'True' if mode == 'dataset' else 'False'}")
     print("  metric_classwise: False")
     print("  overwrite: False")
+
+
+def _guess_det_dataset_dir_from_data_yaml(data_path: Path) -> Path:
+    return data_path.expanduser().resolve().parent
+
+
+def _collect_existing_det_infer_outputs(
+    *,
+    experiment_dir: Path,
+    data_path: Path,
+    splits: tuple[str, ...] = ("test", "val"),
+) -> dict[str, Path]:
+    try:
+        checkpoint_path = rt.resolve_checkpoint_path(None, experiment_dir)
+        dataset_dir = _guess_det_dataset_dir_from_data_yaml(data_path)
+        existing: dict[str, Path] = {}
+        for split in splits:
+            output_dir = rt.derive_det_run_dir(
+                checkpoint_path=checkpoint_path,
+                dataset_dir=dataset_dir,
+                split=split,
+            )
+            if output_dir.exists() and any(output_dir.iterdir()):
+                existing[split] = output_dir
+        return existing
+    except Exception:
+        return {}
+
+
+def prompt_det_infer_split(*, experiment_dir: Path, data_path: Path) -> str:
+    existing_outputs = _collect_existing_det_infer_outputs(
+        experiment_dir=experiment_dir,
+        data_path=data_path,
+    )
+    if existing_outputs:
+        print("\n默认输出目录已有推理结果:")
+        for split, output_dir in existing_outputs.items():
+            print(f"  {split}: {compact_display_path(output_dir)}")
+    return prompt_choice(
+        "请选择数据集划分 --split",
+        [
+            ("test", "test"),
+            ("val", "val"),
+            ("all", "all (test + val)"),
+        ],
+    )
 
 
 def build_det_cli_preview(args: argparse.Namespace) -> str:
@@ -427,6 +475,8 @@ def build_convert_cli_preview(args: argparse.Namespace) -> str:
     parts = ["python", "launcher.py", "convert", source_value]
     if getattr(args, "output_name", None):
         parts.extend(["--output-name", str(args.output_name)])
+    if getattr(args, "task", "all") != "all":
+        parts.extend(["--task", str(args.task)])
     if args.label_format != "auto":
         parts.extend(["--label-format", str(args.label_format)])
     if args.seed is not None:
@@ -450,6 +500,15 @@ def build_interactive_args() -> argparse.Namespace | None:
             source_dir=source_dir,
             output_name=output_name,
             output_root=(rt.ROOT_DIR / "datasets" / output_name).resolve(),
+            task=prompt_choice(
+                "请选择输出任务",
+                [
+                    ("det", "det 检测"),
+                    ("cls", "cls 分类"),
+                    ("seg", "seg 分割"),
+                    ("all", "all 全部"),
+                ],
+            ),
             label_format=prompt_choice(
                 "请选择标注格式 --label-format",
                 [("auto", "auto 自动判断"), ("labelme", "labelme JSON"), ("yolo", "yolo TXT")],
@@ -464,8 +523,8 @@ def build_interactive_args() -> argparse.Namespace | None:
     if task in {"cls", "seg"}:
         action_options.append(("eval", "eval 评估"))
     if task == "det":
-        action_options.append(("eda", "eda 数据集 EDA"))
-        action_options.append(("export", "export 导出筛选数据集"))
+        action_options.append(("eda", "EDA 数据集分析"))
+        action_options.append(("export", "export 数据集筛选"))
         action_options.append(("report", "report 生成实验报告"))
     action = prompt_choice(f"请选择 {task} 功能", action_options)
 
@@ -596,6 +655,7 @@ def build_interactive_args() -> argparse.Namespace | None:
         experiment_dir = prompt_experiment_dir("det", rt.INFER_DEFAULT_EXPERIMENT_DIR)
         mode = prompt_choice("请选择输入方式", [("dataset", "dataset 数据集评测模式"), ("image", "image 单张图片"), ("image_dir", "image_dir 文件夹批量推理")])
         is_dataset_mode = mode == "dataset"
+        data_path = prompt_dataset_yaml("det", Path(rt.INFER_DEFAULT_DATA)) if is_dataset_mode else None
         config_mode = prompt_choice(
             "请选择 infer 配置方式",
             [
@@ -605,7 +665,7 @@ def build_interactive_args() -> argparse.Namespace | None:
         )
         use_custom = config_mode == "custom"
         if not use_custom:
-            print_default_det_infer_summary(mode=mode)
+            print_default_det_infer_summary(mode=mode, data_path=data_path)
         output_dir_raw = prompt_text("输出目录 --output-dir，直接回车自动生成", None) if use_custom else None
         args = argparse.Namespace(
             tool_task="det",
@@ -615,7 +675,7 @@ def build_interactive_args() -> argparse.Namespace | None:
             checkpoint=None,
             image=None,
             image_dir=None,
-            data=None,
+            data=data_path,
             split=rt.INFER_DEFAULT_SPLIT,
             output_dir=Path(output_dir_raw).expanduser() if output_dir_raw else None,
             score_threshold=prompt_float("置信度阈值 --score-threshold", rt.INFER_DEFAULT_SCORE_THRESHOLD)
@@ -646,11 +706,9 @@ def build_interactive_args() -> argparse.Namespace | None:
             infer_config_mode=config_mode,
         )
         if mode == "dataset":
-            args.data = prompt_dataset_yaml("det", Path(rt.INFER_DEFAULT_DATA))
-            args.split = (
-                prompt_choice("请选择数据集划分 --split", [("test", "test"), ("val", "val")])
-                if use_custom
-                else rt.INFER_DEFAULT_SPLIT
+            args.split = prompt_det_infer_split(
+                experiment_dir=experiment_dir,
+                data_path=args.data,
             )
         elif mode == "image":
             args.image = prompt_required_path("图片路径 --image")
@@ -682,6 +740,7 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     convert_parser.add_argument("source_dir", type=str, help="待转换数据集目录名或路径")
     convert_parser.add_argument("--output-name", type=str, default=None)
     convert_parser.add_argument("--output-root", type=Path, default=None)
+    convert_parser.add_argument("--task", choices=("det", "cls", "seg", "all"), default="all")
     convert_parser.add_argument("--label-format", choices=("auto", "labelme", "yolo"), default="auto")
     convert_parser.add_argument("--seed", type=int, default=None)
     convert_parser.add_argument("--dry-run", action="store_true", default=False)
@@ -693,7 +752,7 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     infer_input.add_argument("--image", type=Path, default=rt.INFER_DEFAULT_IMAGE)
     infer_input.add_argument("--image-dir", type=Path, default=None)
     infer_input.add_argument("--data", type=Path, default=None)
-    infer_parser.add_argument("--split", choices=("val", "test"), default=rt.INFER_DEFAULT_SPLIT)
+    infer_parser.add_argument("--split", choices=("val", "test", "all"), default=rt.INFER_DEFAULT_SPLIT)
     infer_parser.add_argument("--output-dir", type=Path, default=None)
     infer_parser.add_argument("--score-threshold", type=float, default=rt.INFER_DEFAULT_SCORE_THRESHOLD)
     infer_parser.add_argument("--device", type=str, default=rt.INFER_DEFAULT_DEVICE)

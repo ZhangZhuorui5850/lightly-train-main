@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from . import common as rt
@@ -187,20 +188,59 @@ def update_metric(metric, label_mapping: dict[int, int], prediction, gt_boxes, g
         target=[{"boxes": gt_boxes.to(rt.torch.float32), "labels": rt.remap_labels(gt_labels.to(rt.torch.int64), label_mapping)}],
     )
 
-def run_infer(args) -> None:
+
+def resolve_dataset_infer_splits(data_cfg: dict[str, Any], requested_split: str) -> list[str]:
+    if requested_split != "all":
+        return [requested_split]
+
+    splits = [split for split in ("test", "val") if data_cfg.get(split)]
+    if not splits:
+        raise ValueError("data.yaml 中未找到可用于 infer 的 test 或 val 配置。")
+    return splits
+
+
+def build_split_output_dir(
+    *,
+    args,
+    checkpoint_path: Path,
+    data_cfg: dict[str, Any] | None,
+    split: str,
+) -> Path:
+    split_mode = getattr(args, "requested_split", getattr(args, "split", None))
+    if args.output_dir is not None:
+        return args.output_dir / split if split_mode == "all" else args.output_dir
+
+    dataset_dir = rt.DATASET_DIR if data_cfg is None else data_cfg["_root_dir"]
+    return rt.derive_det_run_dir(
+        checkpoint_path=checkpoint_path,
+        dataset_dir=Path(dataset_dir),
+        split=split,
+    )
+
+
+def build_split_report_path(*, args, output_dir: Path, split: str) -> Path:
+    split_mode = getattr(args, "requested_split", getattr(args, "split", None))
+    if args.report_path is None:
+        return rt.build_det_report_path(output_dir)
+    if split_mode != "all":
+        return args.report_path
+    stem = args.report_path.stem
+    suffix = args.report_path.suffix or ".json"
+    return args.report_path.with_name(f"{stem}-{split}{suffix}")
+
+
+def run_single_infer(args) -> None:
     use_dataset = args.data is not None
     compute_full_metrics = use_dataset and (args.compute_metrics or args.save_test_report)
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
     data_cfg = rt.load_data_config(args.data) if use_dataset else None
-    output_dir = args.output_dir
-    if output_dir is None:
-        dataset_dir = rt.DATASET_DIR if data_cfg is None else data_cfg["_root_dir"]
-        output_dir = rt.derive_det_run_dir(
-            checkpoint_path=checkpoint_path,
-            dataset_dir=Path(dataset_dir),
-            split=args.split,
-        )
-    report_path = args.report_path if args.report_path is not None else rt.build_det_report_path(output_dir)
+    output_dir = build_split_output_dir(
+        args=args,
+        checkpoint_path=checkpoint_path,
+        data_cfg=data_cfg,
+        split=args.split,
+    )
+    report_path = build_split_report_path(args=args, output_dir=output_dir, split=args.split)
     run_meta_path = output_dir / "run_meta.json"
     images_dir = output_dir / "images"
     json_dir = output_dir / "json"
@@ -362,3 +402,19 @@ def run_infer(args) -> None:
         )
         for report_markdown_path in report_markdown_paths:
             print(f"single_report saved to: {report_markdown_path}")
+
+
+def run_infer(args) -> None:
+    if args.data is None or getattr(args, "split", None) != "all":
+        run_single_infer(args)
+        return
+
+    data_cfg = rt.load_data_config(args.data)
+    splits = resolve_dataset_infer_splits(data_cfg, args.split)
+    total = len(splits)
+    for index, split in enumerate(splits, start=1):
+        single_args = SimpleNamespace(**vars(args))
+        single_args.requested_split = args.split
+        single_args.split = split
+        print(f"\n=== [{index}/{total}] 开始推理 split: {split} ===")
+        run_single_infer(single_args)

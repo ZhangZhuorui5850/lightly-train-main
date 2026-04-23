@@ -102,12 +102,27 @@ def parse_args() -> argparse.Namespace:
         help="统一输出根目录，内部会生成 dataset_det、dataset_cls 和 dataset_seg",
     )
     parser.add_argument(
+        "--task",
+        choices=["det", "cls", "seg", "all"],
+        default="all",
+        help="输出任务类型：det/cls/seg/all",
+    )
+    parser.add_argument(
         "--source-format",
         choices=["auto", "labelme", "yolo"],
         default="auto",
         help="输入格式：auto 自动判断，labelme 为 JSON，yolo 为 TXT",
     )
     return parser.parse_args()
+
+
+def normalize_selected_tasks(task: str) -> set[str]:
+    task_key = task.strip().lower()
+    if task_key == "all":
+        return {"det", "cls", "seg"}
+    if task_key in {"det", "cls", "seg"}:
+        return {task_key}
+    raise ValueError(f"不支持的 task: {task}")
 
 
 # ============================================================
@@ -656,17 +671,19 @@ def convert_split_from_yolo(
     target_cls: Path,
     target_seg: Path,
     class_map: Dict[str, int],
+    selected_tasks: set[str],
 ) -> dict:
     src_dir = source_root / split
 
-    dst_img_det = target_det / "images" / split
-    dst_lbl_det = target_det / "labels" / split
-    dst_img_cls = target_cls / split
-    dst_img_seg = target_seg / "images" / split
-    dst_lbl_seg = target_seg / "labels" / split
+    dst_img_det = target_det / "images" / split if "det" in selected_tasks else None
+    dst_lbl_det = target_det / "labels" / split if "det" in selected_tasks else None
+    dst_img_cls = target_cls / split if "cls" in selected_tasks else None
+    dst_img_seg = target_seg / "images" / split if "seg" in selected_tasks else None
+    dst_lbl_seg = target_seg / "labels" / split if "seg" in selected_tasks else None
 
     for d in [dst_img_det, dst_lbl_det, dst_img_cls, dst_img_seg, dst_lbl_seg]:
-        safe_mkdir(d)
+        if d is not None:
+            safe_mkdir(d)
 
     if not src_dir.exists():
         print(f"  [WARN] split 目录不存在，跳过: {src_dir}")
@@ -719,9 +736,15 @@ def convert_split_from_yolo(
         relkey = str(img.relative_to(src_dir).with_suffix("")).replace("\\", "/")
         stem = image_to_stem[img.resolve()]
         dst_name = stem + img.suffix.lower()
-        shutil.copy2(img, dst_img_det / dst_name)
-        shutil.copy2(img, dst_img_seg / dst_name)
-        stats["images_copied"] += 1
+        copied = False
+        if dst_img_det is not None:
+            shutil.copy2(img, dst_img_det / dst_name)
+            copied = True
+        if dst_img_seg is not None:
+            shutil.copy2(img, dst_img_seg / dst_name)
+            copied = True
+        if copied:
+            stats["images_copied"] += 1
         log_progress("复制图片", img_index, total_annotated_images)
 
     total_txt_files = len(txt_files)
@@ -729,7 +752,7 @@ def convert_split_from_yolo(
         relkey = str(txt_file.relative_to(src_dir).with_suffix("")).replace("\\", "/")
         out_stem = relkey_to_stem.get(relkey, unique_stem(txt_file, src_dir))
         matched_image = relkey_to_image.get(relkey)
-        if matched_image is not None:
+        if "cls" in selected_tasks and matched_image is not None:
             size = _read_image_size(matched_image)
             if size is None:
                 skipped_detail.append({"file": txt_file.name, "shape": None, "reason": "cls 缺少图片尺寸"})
@@ -763,15 +786,18 @@ def convert_split_from_yolo(
             except Exception as e:
                 reason = f"{SKIP_CONVERT_ERROR}(yolo): {e}"
                 skipped_detail.append({"file": txt_file.name, "shape": "yolo", "reason": reason})
-                stats["skipped_shapes_det"] += 1
-                stats["skipped_shapes_seg"] += 1
+                if "det" in selected_tasks:
+                    stats["skipped_shapes_det"] += 1
+                if "seg" in selected_tasks:
+                    stats["skipped_shapes_seg"] += 1
                 continue
 
             if label_type == "detect":
-                det_lines.append(
-                    f"{cid} {' '.join(_format_float(_clip01(v)) for v in values)}"
-                )
-                if matched_image is not None and img_w is not None and img_h is not None:
+                if "det" in selected_tasks:
+                    det_lines.append(
+                        f"{cid} {' '.join(_format_float(_clip01(v)) for v in values)}"
+                    )
+                if "cls" in selected_tasks and matched_image is not None and img_w is not None and img_h is not None:
                     try:
                         class_name = class_map[cid]
                         x_min = (_clip01(values[0] - values[2] / 2.0)) * img_w
@@ -782,7 +808,7 @@ def convert_split_from_yolo(
                         save_crop_image(
                             matched_image,
                             (x_min, y_min, x_max, y_max),
-                            dst_img_cls / class_name / crop_name,
+                            dst_img_cls / class_name / crop_name,  # type: ignore[operator]
                         )
                         cls_crop_index += 1
                         stats["cls_crops"] += 1
@@ -790,24 +816,26 @@ def convert_split_from_yolo(
                         reason = f"{SKIP_CONVERT_ERROR}(cls): {e}"
                         skipped_detail.append({"file": txt_file.name, "shape": "detect", "reason": reason})
                         stats["cls_images_skipped"] += 1
-                else:
+                elif "cls" in selected_tasks:
                     skipped_detail.append({"file": txt_file.name, "shape": "detect", "reason": "cls 缺少源图片"})
                     stats["cls_images_skipped"] += 1
-            else:
+            elif "seg" in selected_tasks:
                 seg_coords = [_clip01(v) for v in values]
                 seg_lines.append(
                     f"{cid} {' '.join(_format_float(v) for v in seg_coords)}"
                 )
 
-        det_txt = dst_lbl_det / f"{out_stem}.txt"
-        det_txt.write_text("\n".join(det_lines), encoding="utf-8")
-        if not det_lines:
-            stats["empty_labels_det"] += 1
+        if dst_lbl_det is not None:
+            det_txt = dst_lbl_det / f"{out_stem}.txt"
+            det_txt.write_text("\n".join(det_lines), encoding="utf-8")
+            if not det_lines:
+                stats["empty_labels_det"] += 1
 
-        seg_txt = dst_lbl_seg / f"{out_stem}.txt"
-        seg_txt.write_text("\n".join(seg_lines), encoding="utf-8")
-        if not seg_lines:
-            stats["empty_labels_seg"] += 1
+        if dst_lbl_seg is not None:
+            seg_txt = dst_lbl_seg / f"{out_stem}.txt"
+            seg_txt.write_text("\n".join(seg_lines), encoding="utf-8")
+            if not seg_lines:
+                stats["empty_labels_seg"] += 1
 
         stats["json_converted"] += 1
         log_progress("转换标注", txt_index, total_txt_files)
@@ -815,6 +843,8 @@ def convert_split_from_yolo(
     if CREATE_EMPTY_TXT_FOR_IMAGE_WITHOUT_JSON:
         for _, out_stem in image_to_stem.items():
             for lbl_dir in [dst_lbl_det, dst_lbl_seg]:
+                if lbl_dir is None:
+                    continue
                 txt = lbl_dir / f"{out_stem}.txt"
                 if not txt.exists():
                     txt.write_text("", encoding="utf-8")
@@ -840,19 +870,19 @@ def convert_split(
     target_cls: Path,
     target_seg: Path,
     class_map: Dict[str, int],
+    selected_tasks: set[str],
 ) -> dict:
     src_dir = source_root / split
 
-    # 检测输出目录
-    dst_img_det = target_det / "images" / split
-    dst_lbl_det = target_det / "labels" / split
-    dst_img_cls = target_cls / split
-    # 分割输出目录
-    dst_img_seg = target_seg / "images" / split
-    dst_lbl_seg = target_seg / "labels" / split
+    dst_img_det = target_det / "images" / split if "det" in selected_tasks else None
+    dst_lbl_det = target_det / "labels" / split if "det" in selected_tasks else None
+    dst_img_cls = target_cls / split if "cls" in selected_tasks else None
+    dst_img_seg = target_seg / "images" / split if "seg" in selected_tasks else None
+    dst_lbl_seg = target_seg / "labels" / split if "seg" in selected_tasks else None
 
     for d in [dst_img_det, dst_lbl_det, dst_img_cls, dst_img_seg, dst_lbl_seg]:
-        safe_mkdir(d)
+        if d is not None:
+            safe_mkdir(d)
 
     if not src_dir.exists():
         print(f"  [WARN] split 目录不存在，跳过: {src_dir}")
@@ -896,9 +926,15 @@ def convert_split(
     for img_index, img in enumerate(annotated_image_paths, start=1):
         stem     = image_to_stem[img.resolve()]
         dst_name = stem + img.suffix.lower()
-        shutil.copy2(img, dst_img_det / dst_name)
-        shutil.copy2(img, dst_img_seg / dst_name)
-        stats["images_copied"] += 1
+        copied = False
+        if dst_img_det is not None:
+            shutil.copy2(img, dst_img_det / dst_name)
+            copied = True
+        if dst_img_seg is not None:
+            shutil.copy2(img, dst_img_seg / dst_name)
+            copied = True
+        if copied:
+            stats["images_copied"] += 1
         log_progress("复制图片", img_index, total_annotated_images)
 
     # ── 转换标注 → det txt + seg txt ─────────────────────────
@@ -935,39 +971,56 @@ def convert_split(
             if not label:
                 skipped_detail.append({"file": json_file.name, "shape": shape_type,
                                        "reason": SKIP_EMPTY_LABEL})
-                stats["skipped_shapes_det"] += 1
-                stats["skipped_shapes_seg"] += 1
+                if "det" in selected_tasks:
+                    stats["skipped_shapes_det"] += 1
+                if "seg" in selected_tasks:
+                    stats["skipped_shapes_seg"] += 1
                 continue
 
             if label not in class_map:
                 reason = f"{SKIP_UNKNOWN_LABEL}: '{label}'"
                 skipped_detail.append({"file": json_file.name, "shape": shape_type,
                                        "reason": reason})
-                stats["skipped_shapes_det"] += 1
-                stats["skipped_shapes_seg"] += 1
+                if "det" in selected_tasks:
+                    stats["skipped_shapes_det"] += 1
+                if "seg" in selected_tasks:
+                    stats["skipped_shapes_seg"] += 1
                 continue
 
             cid = class_map[label]
 
             if shape_type == "rectangle":
+                bbox = None
                 try:
                     bbox = shape_to_bbox(shape, img_w, img_h)
-                    cx, cy, w, h = bbox_to_yolo(*bbox, img_w, img_h)
-                    det_lines.append(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
                 except Exception as e:
-                    reason = f"{SKIP_SHAPE_TYPE}/{SKIP_CONVERT_ERROR}(det): {e}"
-                    skipped_detail.append({"file": json_file.name, "shape": shape_type,
-                                           "reason": reason})
-                    stats["skipped_shapes_det"] += 1
-                    bbox = None
+                    if "det" in selected_tasks:
+                        reason = f"{SKIP_SHAPE_TYPE}/{SKIP_CONVERT_ERROR}(det): {e}"
+                        skipped_detail.append({"file": json_file.name, "shape": shape_type,
+                                               "reason": reason})
+                        stats["skipped_shapes_det"] += 1
+                    if "cls" in selected_tasks:
+                        reason = f"{SKIP_CONVERT_ERROR}(cls): {e}"
+                        skipped_detail.append({"file": json_file.name, "shape": shape_type,
+                                               "reason": reason})
+                        stats["cls_images_skipped"] += 1
+                if bbox is not None and "det" in selected_tasks:
+                    try:
+                        cx, cy, w, h = bbox_to_yolo(*bbox, img_w, img_h)
+                        det_lines.append(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+                    except Exception as e:
+                        reason = f"{SKIP_SHAPE_TYPE}/{SKIP_CONVERT_ERROR}(det): {e}"
+                        skipped_detail.append({"file": json_file.name, "shape": shape_type,
+                                               "reason": reason})
+                        stats["skipped_shapes_det"] += 1
 
-                if bbox is not None and matched_image and matched_image.exists():
+                if "cls" in selected_tasks and bbox is not None and matched_image and matched_image.exists():
                     try:
                         crop_name = f"{out_stem}__{cls_crop_index:04d}{matched_image.suffix.lower()}"
                         save_crop_image(
                             matched_image,
                             bbox,
-                            dst_img_cls / label / crop_name,
+                            dst_img_cls / label / crop_name,  # type: ignore[operator]
                         )
                         cls_crop_index += 1
                         stats["cls_crops"] += 1
@@ -976,12 +1029,12 @@ def convert_split(
                         skipped_detail.append({"file": json_file.name, "shape": shape_type,
                                                "reason": reason})
                         stats["cls_images_skipped"] += 1
-                elif matched_image is None:
+                elif "cls" in selected_tasks and matched_image is None:
                     skipped_detail.append({"file": json_file.name, "shape": shape_type,
                                            "reason": "cls 缺少源图片"})
                     stats["cls_images_skipped"] += 1
 
-            elif shape_type == "polygon":
+            elif shape_type == "polygon" and "seg" in selected_tasks:
                 try:
                     coords = shape_to_seg(shape, img_w, img_h)
                     coord_str = " ".join(f"{v:.6f}" for v in coords)
@@ -995,20 +1048,22 @@ def convert_split(
                 reason = f"{SKIP_SHAPE_TYPE}: '{shape_type}'"
                 skipped_detail.append({"file": json_file.name, "shape": shape_type,
                                        "reason": reason})
-                stats["skipped_shapes_det"] += 1
-                stats["skipped_shapes_seg"] += 1
+                if "det" in selected_tasks:
+                    stats["skipped_shapes_det"] += 1
+                if "seg" in selected_tasks:
+                    stats["skipped_shapes_seg"] += 1
 
-        # 写 det txt
-        det_txt = dst_lbl_det / f"{out_stem}.txt"
-        det_txt.write_text("\n".join(det_lines), encoding="utf-8")
-        if not det_lines:
-            stats["empty_labels_det"] += 1
+        if dst_lbl_det is not None:
+            det_txt = dst_lbl_det / f"{out_stem}.txt"
+            det_txt.write_text("\n".join(det_lines), encoding="utf-8")
+            if not det_lines:
+                stats["empty_labels_det"] += 1
 
-        # 写 seg txt
-        seg_txt = dst_lbl_seg / f"{out_stem}.txt"
-        seg_txt.write_text("\n".join(seg_lines), encoding="utf-8")
-        if not seg_lines:
-            stats["empty_labels_seg"] += 1
+        if dst_lbl_seg is not None:
+            seg_txt = dst_lbl_seg / f"{out_stem}.txt"
+            seg_txt.write_text("\n".join(seg_lines), encoding="utf-8")
+            if not seg_lines:
+                stats["empty_labels_seg"] += 1
 
         stats["json_converted"] += 1
         log_progress("转换标注", json_index, total_json_files)
@@ -1017,6 +1072,8 @@ def convert_split(
     if CREATE_EMPTY_TXT_FOR_IMAGE_WITHOUT_JSON:
         for img_resolved, out_stem in image_to_stem.items():
             for lbl_dir in [dst_lbl_det, dst_lbl_seg]:
+                if lbl_dir is None:
+                    continue
                 txt = lbl_dir / f"{out_stem}.txt"
                 if not txt.exists():
                     txt.write_text("", encoding="utf-8")
@@ -1122,6 +1179,7 @@ def main() -> None:
     args = parse_args()
     source_root = Path(args.source_root)
     output_root = Path(args.output_root)
+    selected_tasks = normalize_selected_tasks(args.task)
     target_det = output_root / "dataset_det"
     target_cls = output_root / "dataset_cls"
     target_seg = output_root / "dataset_seg"
@@ -1136,9 +1194,13 @@ def main() -> None:
     print("=" * 60)
     print(f"SOURCE_ROOT : {source_root.resolve()}")
     print(f"OUTPUT_ROOT : {output_root.resolve()}")
-    print(f"TARGET_DET  : {target_det.resolve()}")
-    print(f"TARGET_CLS  : {target_cls.resolve()}")
-    print(f"TARGET_SEG  : {target_seg.resolve()}")
+    print(f"TASKS       : {sorted(selected_tasks)}")
+    if "det" in selected_tasks:
+        print(f"TARGET_DET  : {target_det.resolve()}")
+    if "cls" in selected_tasks:
+        print(f"TARGET_CLS  : {target_cls.resolve()}")
+    if "seg" in selected_tasks:
+        print(f"TARGET_SEG  : {target_seg.resolve()}")
     print(f"SPLITS      : {SPLITS}")
     print(f"RECURSIVE   : {RECURSIVE_SCAN}")
     print(f"SOURCE_FMT  : {source_format}")
@@ -1155,10 +1217,18 @@ def main() -> None:
         sys.exit(1)
 
     safe_mkdir(output_root)
-    for target in [target_det, target_cls, target_seg]:
+    selected_targets = []
+    if "det" in selected_tasks:
+        selected_targets.append(("det", target_det))
+    if "cls" in selected_tasks:
+        selected_targets.append(("cls", target_cls))
+    if "seg" in selected_tasks:
+        selected_targets.append(("seg", target_seg))
+
+    for task_name, target in selected_targets:
         safe_mkdir(target)
         handle_existing_output(target)
-        if target == target_cls:
+        if task_name == "cls":
             for split in SPLITS:
                 safe_mkdir(target / split)
         else:
@@ -1168,8 +1238,7 @@ def main() -> None:
     if source_format == "labelme":
         class_map = collect_classes(source_root, SPLITS)
     else:
-        class_id_to_name = collect_classes_from_yolo(source_root, SPLITS)
-        class_map = {name: cid for cid, name in class_id_to_name.items()}
+        class_map = collect_classes_from_yolo(source_root, SPLITS)
     if not class_map:
         print("\n[ERROR] 没有收集到任何类别！")
         print(f"  SOURCE_ROOT: {source_root.resolve()}")
@@ -1179,14 +1248,17 @@ def main() -> None:
     for k, v in sorted(class_map.items(), key=lambda x: x[1]):
         print(f"  {v:3d}  {k}")
 
-    write_classes_file(class_map, target_det / "classes.txt")
-    write_data_yaml(class_map, target_det, task="detect")
+    if "det" in selected_tasks:
+        write_classes_file(class_map, target_det / "classes.txt")
+        write_data_yaml(class_map, target_det, task="detect")
 
-    write_classes_file(class_map, target_cls / "classes.txt")
-    write_cls_data_yaml(class_map, target_cls)
+    if "cls" in selected_tasks:
+        write_classes_file(class_map, target_cls / "classes.txt")
+        write_cls_data_yaml(class_map, target_cls)
 
-    write_classes_file(class_map, target_seg / "classes.txt")
-    write_data_yaml(class_map, target_seg, task="segment")
+    if "seg" in selected_tasks:
+        write_classes_file(class_map, target_seg / "classes.txt")
+        write_data_yaml(class_map, target_seg, task="segment")
 
     all_stats: dict = {}
     for split in SPLITS:
@@ -1194,7 +1266,7 @@ def main() -> None:
         print(f"[INFO] 处理 split: {split} ...")
         if source_format == "labelme":
             all_stats[split] = convert_split(
-                split, source_root, target_det, target_cls, target_seg, class_map
+                split, source_root, target_det, target_cls, target_seg, class_map, selected_tasks
             )
         else:
             all_stats[split] = convert_split_from_yolo(
@@ -1204,18 +1276,25 @@ def main() -> None:
                 target_cls,
                 target_seg,
                 {cid: name for name, cid in class_map.items()},
+                selected_tasks,
             )
 
     print_report(all_stats)
 
     if INTEGRITY_CHECK:
-        integrity_check(target_det, SPLITS, "det")
-        integrity_check_cls(target_cls, SPLITS)
-        integrity_check(target_seg, SPLITS, "seg")
+        if "det" in selected_tasks:
+            integrity_check(target_det, SPLITS, "det")
+        if "cls" in selected_tasks:
+            integrity_check_cls(target_cls, SPLITS)
+        if "seg" in selected_tasks:
+            integrity_check(target_seg, SPLITS, "seg")
 
-    print(f"\n检测输出: {target_det.resolve()}")
-    print(f"分类输出: {target_cls.resolve()}")
-    print(f"分割输出: {target_seg.resolve()}")
+    if "det" in selected_tasks:
+        print(f"\n检测输出: {target_det.resolve()}")
+    if "cls" in selected_tasks:
+        print(f"分类输出: {target_cls.resolve()}")
+    if "seg" in selected_tasks:
+        print(f"分割输出: {target_seg.resolve()}")
     print("\n转换完成 ✓  原数据集未被修改。")
 
 

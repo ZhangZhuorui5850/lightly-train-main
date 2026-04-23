@@ -55,6 +55,7 @@ def run_convert(args) -> None:
     module.run_conversion(
         [source_dir],
         output_root,
+        task=args.task,
         label_format=args.label_format,
         seed=args.seed,
         dry_run=args.dry_run,

@@ -43,6 +43,15 @@ def copy_yolo_metadata(src_roots: list[Path], synced_root: Path) -> None:
                 return
 
 
+def normalize_selected_tasks(task: str) -> tuple[str, ...]:
+    task_key = task.strip().lower()
+    if task_key == "all":
+        return ("det", "cls", "seg")
+    if task_key in {"det", "cls", "seg"}:
+        return (task_key,)
+    raise ValueError(f"不支持的任务类型: {task}")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="一键整理原始数据并输出统一的 dataset_det / dataset_cls / dataset_seg",
@@ -53,6 +62,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-root",
         required=True,
         help="总输出目录，内部会生成 dataset_det、dataset_cls、dataset_seg",
+    )
+    parser.add_argument(
+        "--task",
+        choices=["det", "cls", "seg", "all"],
+        default="all",
+        help="输出任务类型：det/cls/seg/all",
     )
     parser.add_argument(
         "--label-format",
@@ -78,12 +93,14 @@ def run_conversion(
     sources: list[str | Path],
     output_root: str | Path,
     *,
+    task: str = "all",
     label_format: str = "auto",
     seed: int | None = None,
     dry_run: bool = False,
 ) -> None:
     sync_module = load_module("sync_picture_module", SYNC_PATH)
     convert_module = load_module("labelme_to_yolo_module", CONVERT_PATH)
+    selected_tasks = normalize_selected_tasks(task)
 
     src_roots = [Path(s).expanduser().resolve() for s in sources]
     for src in src_roots:
@@ -106,11 +123,15 @@ def run_conversion(
     print("  一键转换开始")
     print("=" * 60)
     print(f"SOURCES      : {[str(p.resolve()) for p in src_roots]}")
+    print(f"TASKS        : {', '.join(selected_tasks)}")
     print(f"LABEL_FORMAT : {label_format}")
     print(f"OUTPUT_ROOT  : {output_root.resolve()}")
-    print(f"DET_ROOT     : {(output_root / 'dataset_det').resolve()}")
-    print(f"CLS_ROOT     : {(output_root / 'dataset_cls').resolve()}")
-    print(f"SEG_ROOT     : {(output_root / 'dataset_seg').resolve()}")
+    if "det" in selected_tasks:
+        print(f"DET_ROOT     : {(output_root / 'dataset_det').resolve()}")
+    if "cls" in selected_tasks:
+        print(f"CLS_ROOT     : {(output_root / 'dataset_cls').resolve()}")
+    if "seg" in selected_tasks:
+        print(f"SEG_ROOT     : {(output_root / 'dataset_seg').resolve()}")
 
     with tempfile.TemporaryDirectory(prefix="dataset_sync_") as temp_dir:
         synced_root = Path(temp_dir) / "synced_source"
@@ -146,6 +167,8 @@ def run_conversion(
                 str(synced_root),
                 "--output-root",
                 str(output_root),
+                "--task",
+                task,
                 "--source-format",
                 label_format,
             ]
@@ -160,6 +183,7 @@ def main(argv: list[str] | None = None) -> None:
     run_conversion(
         args.sources,
         args.output_root,
+        task=args.task,
         label_format=args.label_format,
         seed=args.seed,
         dry_run=args.dry_run,
