@@ -21,10 +21,13 @@ from PIL import Image
 from . import common as rt
 
 REPORT_BASENAME = "single_report"
-TRAIN_SINGLE_REPORT_ROOT = rt.OUT_DIR / "train_sigle_report"
 SMALL_OBJECT_AREA_THRESHOLD = 32.0 * 32.0
 MEDIUM_OBJECT_AREA_THRESHOLD = 96.0 * 96.0
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+RUN_RECORD_CANDIDATES = (
+    Path("daily_report/run_records.jsonl"),
+    Path("out/daily_reports/run_records.jsonl"),
+)
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,70 @@ def _extract_last_match(text: str, pattern: str) -> str | None:
     return value.strip() if isinstance(value, str) else str(value).strip()
 
 
+def _parse_duration_to_minutes(text: str | None) -> float | None:
+    if not text:
+        return None
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(h|hr|hrs|hour|hours|min|m|sec|s)\b", text.lower())
+    if match is None:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2)
+    if unit in {"h", "hr", "hrs", "hour", "hours"}:
+        return value * 60.0
+    if unit in {"min", "m"}:
+        return value
+    return value / 60.0
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _parse_ratio_percent(text: str | None) -> float | None:
+    if not text:
+        return None
+    match = re.search(r"\(([0-9]+(?:\.[0-9]+)?)%\)", text)
+    if match is None:
+        return None
+    return float(match.group(1))
+
+
+def _parse_seconds_per_step(text: str | None) -> float | None:
+    if not text:
+        return None
+    match = re.search(r"\(([0-9]+(?:\.[0-9]+)?)\s*s/step\)", text)
+    if match is None:
+        return None
+    return float(match.group(1))
+
+
+def _format_minutes(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.1f} min"
+
+
+def _classify_model_scale(model_name: str | None) -> str:
+    text = (model_name or "").lower()
+    if any(token in text for token in ("vitl", "large")):
+        return "L"
+    if any(token in text for token in ("vitb", "vitm", "base", "medium")):
+        return "M"
+    if any(token in text for token in ("vits", "small", "tiny")):
+        return "S"
+    return "UNKNOWN"
+
+
 def _format_metric(value: Any, digits: int = 4) -> str:
     if isinstance(value, (int, float)):
         return f"{float(value):.{digits}f}"
@@ -171,8 +238,41 @@ def _build_report_filename(primary_run: InferRunRecord, train_info: dict[str, An
     return f"{REPORT_BASENAME}.md"
 
 
-def _experiment_archive_dir(experiment_dir: Path) -> Path:
-    return TRAIN_SINGLE_REPORT_ROOT / experiment_dir.name
+def _extract_backbone_name(args_payload: dict[str, Any]) -> str:
+    model_args = args_payload.get("model_args")
+    if isinstance(model_args, dict):
+        backbone_weights = model_args.get("backbone_weights")
+        if isinstance(backbone_weights, str) and backbone_weights.strip():
+            weight_name = Path(backbone_weights).stem
+            match = re.search(r"(dinov\d+[_-][A-Za-z0-9]+)", weight_name)
+            if match:
+                return match.group(1).replace("_", "/")
+            return weight_name
+        backbone_args = model_args.get("backbone_args")
+        if isinstance(backbone_args, dict):
+            weights = backbone_args.get("weights")
+            if isinstance(weights, str) and weights.strip():
+                weight_name = Path(weights).stem
+                match = re.search(r"(dinov\d+[_-][A-Za-z0-9]+)", weight_name)
+                if match:
+                    return match.group(1).replace("_", "/")
+                return weight_name
+
+    model_name = str(args_payload.get("model") or "").strip()
+    if "/" in model_name and "-" in model_name:
+        return model_name.rsplit("-", 1)[0]
+    if model_name:
+        return model_name
+    return "待补充"
+
+
+def _build_epoch_text(steps: Any, batch_size: Any, train_images: int) -> str:
+    if not isinstance(steps, int):
+        return "待补充"
+    if isinstance(batch_size, int) and train_images > 0:
+        epochs = (steps * batch_size) / float(train_images)
+        return f"{epochs:.2f} epoch / {steps} steps"
+    return f"{steps} steps"
 
 
 def _build_lr_text(args_payload: dict[str, Any]) -> str:
@@ -263,6 +363,13 @@ def _parse_train_log(experiment_dir: Path) -> dict[str, Any]:
             "final_val_line": None,
             "best_result": None,
             "lr_text": None,
+            "total_minutes": None,
+            "train_minutes": None,
+            "val_minutes": None,
+            "train_ratio_percent": None,
+            "val_ratio_percent": None,
+            "train_seconds_per_step": None,
+            "val_seconds_per_step": None,
         }
 
     text = train_log_path.read_text(encoding="utf-8", errors="ignore")
@@ -283,20 +390,31 @@ def _parse_train_log(experiment_dir: Path) -> dict[str, Any]:
     if best_result is None:
         best_result = _extract_last_match(text, r"\]\[INFO\] The best validation metric\s+(.+?)\s+was reached\.$")
 
+    total_time_text = _extract_first_match(text, r"\]\[INFO\]\s+Total Time\s+:\s+(.+)$")
+    train_time_text = _extract_first_match(text, r"\]\[INFO\]\s+Train Time\s+:\s+(.+)$")
+    val_time_text = _extract_first_match(text, r"\]\[INFO\]\s+Val Time\s+:\s+(.+)$")
+
     return {
         "path": train_log_path,
         "args": args_payload,
         "start_time": timestamps[0] if timestamps else None,
         "end_time": timestamps[-1] if timestamps else None,
-        "total_time": _extract_first_match(text, r"\]\[INFO\]\s+Total Time\s+:\s+(.+)$"),
-        "train_time": _extract_first_match(text, r"\]\[INFO\]\s+Train Time\s+:\s+(.+)$"),
-        "val_time": _extract_first_match(text, r"\]\[INFO\]\s+Val Time\s+:\s+(.+)$"),
+        "total_time": total_time_text,
+        "train_time": train_time_text,
+        "val_time": val_time_text,
         "train_throughput": _extract_first_match(text, r"\]\[INFO\]\s+Train Throughput\s+:\s+(.+)$"),
         "val_throughput": _extract_first_match(text, r"\]\[INFO\]\s+Val Throughput\s+:\s+(.+)$"),
         "hardware_summary": hardware_summary,
         "final_val_line": final_val_line,
         "best_result": best_result,
         "lr_text": _build_lr_text_from_log(text),
+        "total_minutes": _parse_duration_to_minutes(total_time_text),
+        "train_minutes": _parse_duration_to_minutes(train_time_text),
+        "val_minutes": _parse_duration_to_minutes(val_time_text),
+        "train_ratio_percent": _parse_ratio_percent(train_time_text),
+        "val_ratio_percent": _parse_ratio_percent(val_time_text),
+        "train_seconds_per_step": _parse_seconds_per_step(train_time_text),
+        "val_seconds_per_step": _parse_seconds_per_step(val_time_text),
     }
 
 
@@ -350,13 +468,143 @@ def _dataset_summary(train_info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _load_training_benchmark_summary(experiment_dir: Path, train_info: dict[str, Any]) -> dict[str, Any]:
+    expected_dir = experiment_dir.expanduser().resolve()
+    rows: list[dict[str, Any]] = []
+    current_row: dict[str, Any] | None = None
+
+    for record_path in RUN_RECORD_CANDIDATES:
+        resolved_path = (rt.ROOT_DIR / record_path).resolve()
+        if not resolved_path.exists():
+            continue
+        for line in resolved_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("record_kind") != "train_run":
+                continue
+            if payload.get("task") != "object_detection":
+                continue
+            train_payload = payload.get("train") or {}
+            model_name = str(train_payload.get("model") or "")
+            row = {
+                "scale": _classify_model_scale(model_name),
+                "name": payload.get("name"),
+                "model": model_name,
+                "source_dir": str(payload.get("source_dir") or train_payload.get("output_dir") or ""),
+                "total_minutes": _parse_duration_to_minutes(train_payload.get("total_time")),
+                "train_minutes": _parse_duration_to_minutes(train_payload.get("train_time")),
+                "val_minutes": _parse_duration_to_minutes(train_payload.get("val_time")),
+                "start_time": payload.get("start_time"),
+                "end_time": payload.get("end_time"),
+            }
+            rows.append(row)
+            source_dir = Path(row["source_dir"]).expanduser().resolve() if row["source_dir"] else None
+            if source_dir == expected_dir:
+                current_row = row
+
+    if current_row is None:
+        model_name = str(train_info.get("args", {}).get("model") or "")
+        current_row = {
+            "scale": _classify_model_scale(model_name),
+            "name": expected_dir.name,
+            "model": model_name,
+            "source_dir": str(expected_dir),
+            "total_minutes": train_info.get("total_minutes"),
+            "train_minutes": train_info.get("train_minutes"),
+            "val_minutes": train_info.get("val_minutes"),
+            "start_time": train_info.get("start_time"),
+            "end_time": train_info.get("end_time"),
+        }
+
+    current_scale = current_row.get("scale") or "UNKNOWN"
+    same_scale_rows = [row for row in rows if row.get("scale") == current_scale]
+    total_values = [float(row["total_minutes"]) for row in same_scale_rows if isinstance(row.get("total_minutes"), (int, float))]
+    train_values = [float(row["train_minutes"]) for row in same_scale_rows if isinstance(row.get("train_minutes"), (int, float))]
+    val_values = [float(row["val_minutes"]) for row in same_scale_rows if isinstance(row.get("val_minutes"), (int, float))]
+
+    latest_same_scale = None
+    if same_scale_rows:
+        latest_same_scale = max(same_scale_rows, key=lambda item: str(item.get("start_time") or ""))
+
+    return {
+        "current": current_row,
+        "same_scale": {
+            "scale": current_scale,
+            "count": len(same_scale_rows),
+            "latest": latest_same_scale,
+            "avg_total_minutes": sum(total_values) / len(total_values) if total_values else None,
+            "avg_train_minutes": sum(train_values) / len(train_values) if train_values else None,
+            "avg_val_minutes": sum(val_values) / len(val_values) if val_values else None,
+        },
+    }
+
+
+def _build_time_occupancy_section(train_info: dict[str, Any], benchmark_summary: dict[str, Any]) -> list[str]:
+    current = benchmark_summary.get("current") or {}
+    same_scale = benchmark_summary.get("same_scale") or {}
+    train_step_text = "-"
+    if isinstance(train_info.get("train_seconds_per_step"), (int, float)):
+        train_step_text = f"{float(train_info['train_seconds_per_step']):.2f}"
+    val_step_text = "-"
+    if isinstance(train_info.get("val_seconds_per_step"), (int, float)):
+        val_step_text = f"{float(train_info['val_seconds_per_step']):.2f}"
+    lines = [
+        "### 3. 训练耗时与占用分析",
+        f"- 起止时间：{train_info.get('start_time') or '-'} -> {train_info.get('end_time') or '-'}",
+        f"- 总耗时：{train_info.get('total_time') or _format_minutes(current.get('total_minutes'))}",
+        f"- 训练阶段：{train_info.get('train_time') or _format_minutes(current.get('train_minutes'))}",
+        f"- 验证阶段：{train_info.get('val_time') or _format_minutes(current.get('val_minutes'))}",
+        f"- 训练吞吐：{train_info.get('train_throughput') or '-'}",
+        f"- 验证吞吐：{train_info.get('val_throughput') or '-'}",
+        "",
+        "| 维度 | 当前实验 | 同尺度参考 |",
+        "|---|---|---|",
+        f"| 模型尺度 | {current.get('scale') or '-'} | {same_scale.get('scale') or '-'} |",
+        f"| 总耗时 | {_format_minutes(current.get('total_minutes'))} | {_format_minutes(same_scale.get('avg_total_minutes'))} |",
+        f"| 训练耗时 | {_format_minutes(current.get('train_minutes'))} | {_format_minutes(same_scale.get('avg_train_minutes'))} |",
+        f"| 验证耗时 | {_format_minutes(current.get('val_minutes'))} | {_format_minutes(same_scale.get('avg_val_minutes'))} |",
+        f"| 训练占比 | {str(train_info.get('train_ratio_percent')) + '%' if train_info.get('train_ratio_percent') is not None else '-'} | - |",
+        f"| 验证占比 | {str(train_info.get('val_ratio_percent')) + '%' if train_info.get('val_ratio_percent') is not None else '-'} | - |",
+        f"| Train s/step | {train_step_text} | - |",
+        f"| Val s/step | {val_step_text} | - |",
+        "",
+        f"- 同尺度样本数：{same_scale.get('count', 0)}",
+    ]
+    latest = same_scale.get("latest") or {}
+    if latest:
+        lines.append(
+            f"- 同尺度最近记录：{latest.get('name') or '-'}，总耗时 {_format_minutes(latest.get('total_minutes'))}，训练耗时 {_format_minutes(latest.get('train_minutes'))}。"
+        )
+    lines.append("")
+    return lines
+
+
 def _find_report_path(output_dir: Path, run_meta: dict[str, Any]) -> Path | None:
     report_path = _resolve_optional_path(run_meta.get("paths", {}).get("report_path"))
     if report_path is not None and report_path.exists():
         return report_path
-    candidates = sorted(output_dir.glob("*-test_report.json"))
+    split_name = str(run_meta.get("split") or "").strip().lower()
+    candidates = sorted(output_dir.glob("*test_report.json"))
     if candidates:
-        return candidates[0]
+        prioritized = []
+        for candidate in candidates:
+            score = 0
+            name = candidate.name.lower()
+            if name.endswith("test_report.json"):
+                score += 10
+            if split_name and f"-{split_name}-" in name:
+                score += 6
+            if split_name and name.endswith(f"-{split_name}-test_report.json"):
+                score += 8
+            if split_name and split_name in name:
+                score += 2
+            prioritized.append((score, candidate.stat().st_mtime, candidate))
+        prioritized.sort(reverse=True)
+        return prioritized[0][2]
     fallback = output_dir / "test_report.json"
     if fallback.exists():
         return fallback
@@ -365,49 +613,57 @@ def _find_report_path(output_dir: Path, run_meta: dict[str, Any]) -> Path | None
 
 def _discover_infer_runs(experiment_dir: Path) -> list[InferRunRecord]:
     runs: list[InferRunRecord] = []
-    infer_root = rt.TEST_OUTPUT_ROOT_DIR
-    if not infer_root.exists():
-        return runs
-
     expected_experiment_dir = experiment_dir.expanduser().resolve()
-    for run_meta_path in infer_root.rglob("run_meta.json"):
-        run_meta = _load_json(run_meta_path)
-        if run_meta is None:
-            continue
-        if run_meta.get("task") != "det" or run_meta.get("action") != "infer":
-            continue
-        paths_payload = run_meta.get("paths", {})
-        recorded_experiment_dir = _resolve_optional_path(paths_payload.get("experiment_dir"))
-        if recorded_experiment_dir != expected_experiment_dir:
-            continue
+    search_roots: list[Path] = [expected_experiment_dir]
+    if rt.TEST_OUTPUT_ROOT_DIR.exists() and rt.TEST_OUTPUT_ROOT_DIR != expected_experiment_dir:
+        search_roots.append(rt.TEST_OUTPUT_ROOT_DIR)
 
-        output_dir = _resolve_optional_path(paths_payload.get("output_dir"))
-        if output_dir is None:
-            output_dir = run_meta_path.parent
-        report_path = _find_report_path(output_dir, run_meta)
-        metrics_path = _resolve_optional_path(run_meta.get("artifacts", {}).get("metrics_summary"))
-        if metrics_path is None:
-            candidate = output_dir / "metrics_summary.json"
-            metrics_path = candidate if candidate.exists() else None
+    seen_run_meta_paths: set[Path] = set()
+    for search_root in search_roots:
+        if not search_root.exists():
+            continue
+        for run_meta_path in search_root.rglob("run_meta.json"):
+            resolved_run_meta_path = run_meta_path.resolve()
+            if resolved_run_meta_path in seen_run_meta_paths:
+                continue
+            seen_run_meta_paths.add(resolved_run_meta_path)
+            run_meta = _load_json(run_meta_path)
+            if run_meta is None:
+                continue
+            if run_meta.get("task") != "det" or run_meta.get("action") != "infer":
+                continue
+            paths_payload = run_meta.get("paths", {})
+            recorded_experiment_dir = _resolve_optional_path(paths_payload.get("experiment_dir"))
+            if recorded_experiment_dir != expected_experiment_dir:
+                continue
 
-        report_payload = _load_json(report_path)
-        metrics_payload = _load_json(metrics_path)
-        report_config = report_payload.get("config", {}) if isinstance(report_payload, dict) else {}
-        split = str(run_meta.get("split") or report_config.get("split") or "unknown")
-        runs.append(
-            InferRunRecord(
-                output_dir=output_dir,
-                split=split,
-                created_at=str(run_meta.get("created_at")) if run_meta.get("created_at") else None,
-                report_path=report_path,
-                metrics_path=metrics_path,
-                run_meta_path=run_meta_path,
-                report_payload=report_payload,
-                metrics_payload=metrics_payload,
-                run_meta=run_meta,
-                mtime=run_meta_path.stat().st_mtime,
+            output_dir = _resolve_optional_path(paths_payload.get("output_dir"))
+            if output_dir is None:
+                output_dir = run_meta_path.parent
+            report_path = _find_report_path(output_dir, run_meta)
+            metrics_path = _resolve_optional_path(run_meta.get("artifacts", {}).get("metrics_summary"))
+            if metrics_path is None:
+                candidate = output_dir / "metrics_summary.json"
+                metrics_path = candidate if candidate.exists() else None
+
+            report_payload = _load_json(report_path)
+            metrics_payload = _load_json(metrics_path)
+            report_config = report_payload.get("config", {}) if isinstance(report_payload, dict) else {}
+            split = str(run_meta.get("split") or report_config.get("split") or "unknown")
+            runs.append(
+                InferRunRecord(
+                    output_dir=output_dir,
+                    split=split,
+                    created_at=str(run_meta.get("created_at")) if run_meta.get("created_at") else None,
+                    report_path=report_path,
+                    metrics_path=metrics_path,
+                    run_meta_path=run_meta_path,
+                    report_payload=report_payload,
+                    metrics_payload=metrics_payload,
+                    run_meta=run_meta,
+                    mtime=run_meta_path.stat().st_mtime,
+                )
             )
-        )
 
     runs.sort(
         key=lambda item: (
@@ -492,51 +748,6 @@ def _compute_size_buckets(report_payload: dict[str, Any] | None) -> dict[int, di
     return {class_id: dict(values) for class_id, values in buckets.items()}
 
 
-def _classwise_map_lookup(run: InferRunRecord) -> dict[str, float]:
-    if not run.metrics_payload:
-        return {}
-    metrics = run.metrics_payload.get("metrics")
-    if not isinstance(metrics, dict):
-        return {}
-    lookup: dict[str, float] = {}
-    prefix = "eval_metric_classwise/map_"
-    for key, value in metrics.items():
-        if key.startswith(prefix) and isinstance(value, (int, float)):
-            lookup[key[len(prefix) :]] = float(value)
-    return lookup
-
-
-def _classwise_size_map_lookup(run: InferRunRecord, size_name: str) -> dict[str, float]:
-    if not run.metrics_payload:
-        return {}
-    metrics = run.metrics_payload.get("metrics")
-    if not isinstance(metrics, dict):
-        return {}
-
-    prefixes = [
-        f"eval_metric_classwise/map_{size_name}_",
-        f"eval_metric_classwise/map_{size_name}/",
-    ]
-    suffixes = [
-        f"_{size_name}",
-        f"/{size_name}",
-    ]
-
-    lookup: dict[str, float] = {}
-    for key, value in metrics.items():
-        if not isinstance(value, (int, float)):
-            continue
-        for prefix in prefixes:
-            if key.startswith(prefix):
-                lookup[key[len(prefix) :]] = float(value)
-        for suffix in suffixes:
-            if key.startswith("eval_metric_classwise/map_") and key.endswith(suffix):
-                class_name = key[len("eval_metric_classwise/map_") : -len(suffix)]
-                if class_name:
-                    lookup[class_name] = float(value)
-    return lookup
-
-
 def _dominant_bucket(bucket_counts: dict[str, int]) -> str:
     if not bucket_counts:
         return "-"
@@ -562,13 +773,22 @@ def _build_overall_table(run: InferRunRecord) -> str:
 def _build_per_class_table(run: InferRunRecord) -> str:
     report_payload = run.report_payload or {}
     per_class_ap = report_payload.get("per_class_ap")
+    default_headers = ["类别名称 (Label)", "GT", "Pred", "AP@0.5"]
+    default_align = ["---", "---:", "---:", "---:"]
     if not isinstance(per_class_ap, dict) or not per_class_ap:
-        return "| 类别名称 (Label) | GT | Pred | AP@0.5 | mAP@0.5:0.95 | mAP(S) | mAP(M) | mAP(L) | 备注 |\n|---|---:|---:|---:|---:|---:|---:|---:|---|\n| 当前 split 缺少按类结果 | - | - | - | - | - | - | - | - |"
+        return (
+            f"| {' | '.join(default_headers)} |\n"
+            f"| {' | '.join(default_align)} |\n"
+            "| 当前 split 缺少按类结果 | - | - | - |"
+        )
 
-    classwise_lookup = _classwise_map_lookup(run)
-    small_lookup = _classwise_size_map_lookup(run, "small")
-    medium_lookup = _classwise_size_map_lookup(run, "medium")
-    large_lookup = _classwise_size_map_lookup(run, "large")
+    column_specs = [
+        ("name", "类别名称 (Label)", lambda value, class_id: str(value) if isinstance(value, str) and value.strip() else f"class_{class_id}", "---"),
+        ("gt", "GT", lambda value, _class_id: _format_count(value), "---:"),
+        ("pred", "Pred", lambda value, _class_id: _format_count(value), "---:"),
+        ("ap", "AP@0.5", lambda value, _class_id: _format_metric(value), "---:"),
+    ]
+
     entries: list[tuple[int, dict[str, Any]]] = []
     for class_id_raw, info in per_class_ap.items():
         try:
@@ -577,35 +797,60 @@ def _build_per_class_table(run: InferRunRecord) -> str:
             continue
         if isinstance(info, dict):
             entries.append((class_id, info))
-    entries.sort(key=lambda item: item[0])
 
+    present_columns = []
+    for key, header, formatter, align in column_specs:
+        if any(key in info for _, info in entries):
+            present_columns.append((key, header, formatter, align))
+    if not present_columns:
+        present_columns = column_specs
+
+    entries.sort(
+        key=lambda item: (
+            float(item[1]["ap"]) if isinstance(item[1].get("ap"), (int, float)) else float("inf"),
+            item[0],
+        )
+    )
+
+    headers = [header for _, header, _, _ in present_columns]
+    aligns = [align for _, _, _, align in present_columns]
     lines = [
-        "| 类别名称 (Label) | GT | Pred | AP@0.5 | mAP@0.5:0.95 | mAP(S) | mAP(M) | mAP(L) | 备注 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        f"| {' | '.join(headers)} |",
+        f"| {' | '.join(aligns)} |",
     ]
     for class_id, info in entries:
-        class_name = str(info.get("name") or f"class_{class_id}")
-        remark = "来源: test_report.per_class_ap"
-        if class_name in small_lookup or class_name in medium_lookup or class_name in large_lookup:
-            remark = "来源: test_report + classwise size mAP"
+        row = []
+        for key, _header, formatter, _align in present_columns:
+            row.append(formatter(info.get(key), class_id))
         lines.append(
-            "| "
-            + " | ".join(
-                [
-                    class_name,
-                    _format_count(info.get("gt")),
-                    _format_count(info.get("pred")),
-                    _format_metric(info.get("ap")),
-                    _format_metric(classwise_lookup.get(class_name)),
-                    _format_metric(small_lookup.get(class_name)),
-                    _format_metric(medium_lookup.get(class_name)),
-                    _format_metric(large_lookup.get(class_name)),
-                    remark,
-                ]
-            )
-            + " |"
+            "| " + " | ".join(row) + " |"
         )
     return "\n".join(lines)
+
+
+def _build_per_class_sections(runs: list[InferRunRecord]) -> list[str]:
+    sections: list[str] = []
+    for run in runs:
+        sections.extend(
+            [
+                f"#### {run.split}",
+                "",
+                _build_per_class_table(run),
+                "",
+            ]
+        )
+    if not sections:
+        sections.extend(
+            [
+                "#### test",
+                "",
+                "| 类别名称 (Label) | GT | Pred | AP@0.5 |",
+                "|---|---:|---:|---:|",
+                "| 当前没有可用的按类结果 | - | - | - |",
+                "",
+            ]
+        )
+    return sections
 
 
 def _build_split_table(runs: list[InferRunRecord]) -> str:
@@ -691,9 +936,11 @@ def _render_report(
             experiment_date = primary_run.created_at[:10]
 
     model_name = str(args_payload.get("model") or "待补充")
+    backbone_name = _extract_backbone_name(args_payload)
     batch_size = args_payload.get("batch_size")
     steps = args_payload.get("steps")
     class_count = len(class_names) if class_names else "-"
+    epoch_text = _build_epoch_text(steps, batch_size, counts.get("train", 0))
     data_root_text = f"`{_display_path(data_root)}`" if data_root is not None else "待补充"
     class_list_text = _format_class_list(class_names, limit=5)
     lr_text = train_info.get("lr_text") or _build_lr_text(args_payload)
@@ -702,6 +949,7 @@ def _render_report(
     train_time_text = train_info.get("train_time") or "待补充"
     val_time_text = train_info.get("val_time") or "待补充"
     conclusion_lines = _build_conclusion_lines(primary_run, train_info)
+    benchmark_summary = _load_training_benchmark_summary(experiment_dir, train_info)
 
     lines = [
         "# 算法实验验证报告",
@@ -728,40 +976,49 @@ def _render_report(
         f"- 训练耗时：{train_time_text}",
         f"- 验证耗时：{val_time_text}",
         "",
-        "### 4. 基本参数设置",
-        "",
-        "| 参数项 | 内容 |",
-        "|---|---|",
-        f"| 骨干网 (Backbone) | {model_name} |",
-        f"| Epoch / Iters | {steps if isinstance(steps, int) else '待补充'} steps |",
-        f"| Batch Size | {batch_size if isinstance(batch_size, int) else '待补充'} |",
-        f"| 学习率 (LR) | {lr_text} |",
-        f"| 硬件环境 | {hardware_text} |",
-        f"| 类别数量 | {class_count} |",
-        "",
-        "## 三、验证结果分析",
-        "",
-        f"### 1. 整体及不同尺寸目标准确度（主结果：{primary_run.split})",
-        "",
-        _build_overall_table(primary_run),
-        "",
-        f"### 2. 具体类别（Label）准确度（主结果：{primary_run.split})",
-        "> 每个类别的 GT / Pred / AP@0.5 来自 `test_report.per_class_ap`；按类 mAP(S/M/L) 有值时会直接写入。",
-        "",
-        _build_per_class_table(primary_run),
-        "",
-        "### 3. 对应 infer 结果汇总",
-        "",
-        _build_split_table(split_runs),
-        "",
-        "### 4. 训练收敛摘要",
-        "",
-        f"- 最终验证日志：{train_info.get('final_val_line') or '待补充'}",
-        f"- 最佳指标：{train_info.get('best_result') or '待补充'}",
-        "",
-        "## 四、结论与后续建议",
-        "",
     ]
+    lines.extend(_build_time_occupancy_section(train_info, benchmark_summary))
+    lines.extend(
+        [
+            "### 4. 基本参数设置",
+            "",
+            "| 参数项 | 内容 |",
+            "|---|---|",
+            f"| 模型结构 (Model) | {model_name} |",
+            f"| 骨干网 (Backbone) | {backbone_name} |",
+            f"| Epoch / Iters | {epoch_text} |",
+            f"| Batch Size | {batch_size if isinstance(batch_size, int) else '待补充'} |",
+            f"| 学习率 (LR) | {lr_text} |",
+            f"| 硬件环境 | {hardware_text} |",
+            f"| 类别数量 | {class_count} |",
+            "",
+            "## 三、验证结果分析",
+            "",
+            f"### 1. 整体及不同尺寸目标准确度（主结果：{primary_run.split})",
+            "",
+            _build_overall_table(primary_run),
+            "",
+            "### 2. 具体类别（Label）准确度",
+            "> 每个类别的指标直接来自对应 split 的 `test_report.per_class_ap`，并按 AP@0.5 从低到高排序。",
+            "",
+        ]
+    )
+    lines.extend(_build_per_class_sections(split_runs))
+    lines.extend(
+        [
+            "### 3. 对应 infer 结果汇总",
+            "",
+            _build_split_table(split_runs),
+            "",
+            "### 4. 训练收敛摘要",
+            "",
+            f"- 最终验证日志：{train_info.get('final_val_line') or '待补充'}",
+            f"- 最佳指标：{train_info.get('best_result') or '待补充'}",
+            "",
+            "## 四、结论与后续建议",
+            "",
+        ]
+    )
     for item in conclusion_lines:
         lines.append(f"- {item}")
     lines.extend(
@@ -806,13 +1063,8 @@ def generate_experiment_report(
 
     if output_dir is not None:
         target_dirs = [output_dir.expanduser().resolve()]
-    elif write_all_infer_dirs:
-        target_dirs = list(dict.fromkeys(run.output_dir for run in infer_runs))
     else:
-        target_dirs = [primary_run.output_dir]
-    archive_dir = _experiment_archive_dir(resolved_experiment_dir)
-    if archive_dir not in target_dirs:
-        target_dirs.append(archive_dir)
+        target_dirs = [resolved_experiment_dir]
 
     output_paths: list[Path] = []
     for target_dir in target_dirs:

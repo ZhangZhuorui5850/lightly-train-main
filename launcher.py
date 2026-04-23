@@ -14,9 +14,8 @@ from tool_lib.interactive import build_interactive_args, parse_cli_args
 COMMON_SETTINGS = {
     "out_dir": "out",
     "experiment_root_dir": "out",
-    "infer_output_root_dir": "out/infer",
+    "infer_output_root_dir": "out",
     "eda_output_root_dir": "out/EDA",
-    "report_archive_root_dir": "out/test_reports",
 }
 
 # 检测配置：保留在一个地方，通过注释和空行分组
@@ -41,7 +40,7 @@ DET_SETTINGS = {
     # 如果你不填，系统会自动推导：
     # det_data_yaml          -> <det_dataset_dir>/data.yaml
     # det_infer_image_dir    -> <det_dataset_dir>/images/<det_default_split>
-    # det_infer_output_dir   -> <infer_output_root_dir>/<MMDD>/det/<MMDD-det-权重-数据集-split>
+    # det_infer_output_dir   -> <experiment_dir>/infer-<dataset>-<split>
     # det_eval_output_dir    -> 同 det_infer_output_dir
     # det_eval_report_path   -> <det_infer_output_dir>/<run_name>-test_report.json
     # det_export_report_json -> 同 det_eval_report_path
@@ -49,10 +48,10 @@ DET_SETTINGS = {
     # 只有你确实想和自动规则不一样时，再单独打开某一项覆盖。
     # "det_data_yaml": "datasets/wuwanPic_dataset/dataset_det/data.yaml",
     # "det_infer_image_dir": "datasets/wuwanPic_dataset/dataset_det/images/test",
-    # "det_infer_output_dir": "out/infer/0414/det/0414-det-web-military-val",
-    # "det_eval_output_dir": "out/infer/0414/det/0414-det-web-military-val",
-    # "det_eval_report_path": "out/infer/0414/det/0414-det-web-military-val/0414-det-web-military-val-test_report.json",
-    # "det_export_report_json": "out/infer/0414/det/0414-det-web-military-val/0414-det-web-military-val-test_report.json",
+    # "det_infer_output_dir": "out/2026-04-14/NEU_train/infer-neu-test",
+    # "det_eval_output_dir": "out/2026-04-14/NEU_train/infer-neu-test",
+    # "det_eval_report_path": "out/2026-04-14/NEU_train/infer-neu-test/infer-neu-test-test_report.json",
+    # "det_export_report_json": "out/2026-04-14/NEU_train/infer-neu-test/infer-neu-test-test_report.json",
 
     # export 默认配置
     # det_export_source_data 不填时，默认跟 det_data_yaml 一致

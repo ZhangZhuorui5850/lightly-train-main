@@ -12,8 +12,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
 
-from PIL import Image
-
 from . import common as rt
 from .det_analysis import (
     allocate_box_targets_per_split,
@@ -177,7 +175,12 @@ def _bucket_box_area(area_pixels: float) -> str:
 
 
 def _open_image_size(image_path: Path) -> tuple[int, int]:
-    with Image.open(image_path) as image:
+    if rt.Image is None and not rt.ensure_plot_dependencies():
+        raise ModuleNotFoundError("Missing runtime dependency Pillow. Please install pillow in the current environment.")
+    image_module = rt.Image
+    if image_module is None:
+        raise ModuleNotFoundError("Missing runtime dependency Pillow. Please install pillow in the current environment.")
+    with image_module.open(image_path) as image:
         width, height = image.size
     return int(width), int(height)
 
@@ -651,7 +654,7 @@ def _report_matches_source_data(report_payload: dict[str, Any], source_data_path
 
 def _iter_report_candidates() -> list[Path]:
     patterns = ["*-test_report.json", "test_report.json"]
-    roots = [rt.REPORT_ARCHIVE_ROOT_DIR, rt.TEST_OUTPUT_ROOT_DIR, rt.EXPERIMENT_ROOT_DIR]
+    roots = [rt.EXPERIMENT_ROOT_DIR, rt.TEST_OUTPUT_ROOT_DIR]
     results: dict[str, Path] = {}
     for root in roots:
         if not root.exists():

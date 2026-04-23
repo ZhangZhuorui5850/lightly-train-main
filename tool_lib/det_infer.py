@@ -6,7 +6,12 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -23,18 +28,36 @@ from .det_shared import (
 )
 from .det_report import generate_report_for_infer_output
 
+GPU_HIGH_MEMORY_RATIO_THRESHOLD = 0.75
+
+
+def is_shard_child(args) -> bool:
+    shard_index = getattr(args, "shard_index", None)
+    num_shards = int(getattr(args, "num_shards", 1) or 1)
+    return shard_index is not None and num_shards > 1
+
+
+def filter_samples_for_shard(samples: list[rt.ImageSample], args) -> list[rt.ImageSample]:
+    if not is_shard_child(args):
+        return samples
+    shard_index = int(args.shard_index)
+    num_shards = int(args.num_shards)
+    return [sample for index, sample in enumerate(samples) if index % num_shards == shard_index]
+
 
 def get_input_samples(args) -> tuple[list[rt.ImageSample], dict[int, str], str]:
     if args.image is not None:
         image_path = args.image.expanduser().resolve()
         if not image_path.exists():
             raise FileNotFoundError(f"Image does not exist: {image_path}")
-        return [rt.ImageSample(image_path=image_path, relative_path=Path(image_path.name))], {}, "image"
+        samples = [rt.ImageSample(image_path=image_path, relative_path=Path(image_path.name))]
+        return filter_samples_for_shard(samples, args), {}, "image"
     if args.image_dir is not None:
-        return rt.list_directory_samples(args.image_dir), {}, "dir"
+        samples = rt.list_directory_samples(args.image_dir)
+        return filter_samples_for_shard(samples, args), {}, "dir"
     data_cfg = rt.load_data_config(args.data)
     samples, class_names = rt.list_dataset_samples(data_cfg=data_cfg, split=args.split)
-    return samples, class_names, "dataset"
+    return filter_samples_for_shard(samples, args), class_names, "dataset"
 
 def ensure_object_detection_model(model: Any) -> None:
     class_name = model.__class__.__name__.lower()
@@ -135,7 +158,7 @@ def print_dry_run_summary(
         planned_artifacts.append(output_dir / "metrics_summary.json")
     if args.save_test_report:
         planned_artifacts.append(report_path)
-        planned_artifacts.append(rt.build_report_archive_path(report_path))
+        planned_artifacts.append(rt.experiment_dir_from_checkpoint_path(checkpoint_path) / "single_report.md")
 
     print("[dry-run] detection infer plan")
     print(f"  checkpoint: {checkpoint_path}")
@@ -229,9 +252,581 @@ def build_split_report_path(*, args, output_dir: Path, split: str) -> Path:
     return args.report_path.with_name(f"{stem}-{split}{suffix}")
 
 
+def query_gpu_inventory() -> tuple[list[dict[str, float]], str]:
+    if rt.torch is None or not rt.torch.cuda.is_available():
+        return [], "CUDA 当前不可用，进入单卡顺序模式。"
+
+    nvidia_smi_path = shutil.which("nvidia-smi")
+    if nvidia_smi_path is None:
+        return [], "当前环境未找到 nvidia-smi，进入单卡顺序模式。"
+
+    result = subprocess.run(
+        [
+            nvidia_smi_path,
+            "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "nvidia-smi 执行失败。"
+        return [], f"{message} 进入单卡顺序模式。"
+
+    gpus: list[dict[str, float]] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 4:
+            continue
+        try:
+            index = int(parts[0])
+            memory_used = int(parts[1])
+            memory_total = int(parts[2])
+            utilization = int(parts[3])
+        except ValueError:
+            continue
+        used_ratio = float(memory_used) / float(max(memory_total, 1))
+        gpus.append(
+            {
+                "index": index,
+                "memory_used": memory_used,
+                "memory_total": memory_total,
+                "utilization": utilization,
+                "used_ratio": used_ratio,
+            }
+        )
+
+    gpus.sort(key=lambda item: (item["used_ratio"], item["memory_used"], item["utilization"], item["index"]))
+    visible_devices_raw = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible_devices_raw:
+        visible_indices: set[int] = set()
+        for token in visible_devices_raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                visible_indices.add(int(token))
+            except ValueError:
+                continue
+        if visible_indices:
+            gpus = [gpu for gpu in gpus if int(gpu["index"]) in visible_indices]
+    return gpus, ""
+
+
+def filter_high_memory_gpus(gpus: list[dict[str, float]]) -> list[dict[str, float]]:
+    return [gpu for gpu in gpus if float(gpu["used_ratio"]) < GPU_HIGH_MEMORY_RATIO_THRESHOLD]
+
+
+def split_gpu_groups_for_parallel(
+    gpus: list[dict[str, float]],
+    num_splits: int,
+) -> list[list[dict[str, float]]]:
+    if num_splits <= 1:
+        return [gpus] if gpus else []
+    if len(gpus) < num_splits:
+        return []
+    midpoint = (len(gpus) + 1) // 2
+    groups = [gpus[:midpoint], gpus[midpoint:]]
+    return [group for group in groups if group]
+
+
+def format_gpu_summary(gpu: dict[str, float]) -> str:
+    return (
+        f"GPU {int(gpu['index'])}: "
+        f"memory.used={int(gpu['memory_used'])}/{int(gpu['memory_total'])} MiB "
+        f"({float(gpu['used_ratio']):.1%}), util={int(gpu['utilization'])}%"
+    )
+
+
+def select_fallback_single_gpu(gpus: list[dict[str, float]], eligible_gpus: list[dict[str, float]]) -> tuple[str | None, str]:
+    candidates = eligible_gpus if eligible_gpus else gpus
+    if not candidates:
+        return None, "[det/infer] 当前未检测到可用 GPU，进入默认顺序模式。"
+    chosen = candidates[0]
+    return f"cuda:{int(chosen['index'])}", f"[det/infer] 进入单卡顺序模式，使用 {format_gpu_summary(chosen)}"
+
+
+def build_parallel_child_command(
+    *,
+    args,
+    split: str,
+    device: str,
+    output_dir: Path,
+    report_path: Path,
+    shard_index: int | None = None,
+    num_shards: int = 1,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(rt.ROOT_DIR / "launcher.py"),
+        "infer",
+    ]
+    if args.experiment_dir is not None:
+        command.extend(["--experiment-dir", str(args.experiment_dir)])
+    if args.checkpoint is not None:
+        command.extend(["--checkpoint", str(args.checkpoint)])
+    if args.data is not None:
+        command.extend(["--data", str(args.data)])
+    if args.image is not None:
+        command.extend(["--image", str(args.image)])
+    if args.image_dir is not None:
+        command.extend(["--image-dir", str(args.image_dir)])
+
+    command.extend(
+        [
+            "--split",
+            split,
+            "--output-dir",
+            str(output_dir),
+            "--report-path",
+            str(report_path),
+            "--score-threshold",
+            str(args.score_threshold),
+            "--report-iou-threshold",
+            str(args.report_iou_threshold),
+            "--device",
+            device,
+        ]
+    )
+
+    command.append("--save-visualization" if args.save_visualization else "--skip-visualization")
+    if args.save_json:
+        command.append("--save-json")
+    if args.save_txt:
+        command.append("--save-txt")
+    if args.compute_metrics:
+        command.append("--compute-metrics")
+    if args.metric_classwise:
+        command.append("--metric-classwise")
+    if args.save_test_report:
+        command.append("--save-test-report")
+    if args.overwrite:
+        command.append("--overwrite")
+    if getattr(args, "dry_run", False):
+        command.append("--dry-run")
+    if shard_index is not None:
+        command.extend(["--shard-index", str(shard_index), "--num-shards", str(num_shards)])
+    return command
+
+
+def build_metric_entry(prediction, gt_boxes, gt_labels) -> dict[str, Any]:
+    return {
+        "pred_boxes": prediction["bboxes"].detach().cpu().to(rt.torch.float32).tolist(),
+        "pred_scores": prediction["scores"].detach().cpu().to(rt.torch.float32).tolist(),
+        "pred_labels": prediction["labels"].detach().cpu().to(rt.torch.int64).tolist(),
+        "gt_boxes": gt_boxes.detach().cpu().to(rt.torch.float32).tolist(),
+        "gt_labels": gt_labels.detach().cpu().to(rt.torch.int64).tolist(),
+    }
+
+
+def serialize_legacy_class_data(class_data: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for class_id, info in class_data.items():
+        payload[str(class_id)] = {
+            "gt": int(info.get("gt", 0)),
+            "pairs": [[float(score), int(flag)] for score, flag in info.get("pairs", [])],
+        }
+    return payload
+
+
+def deserialize_legacy_class_data(payload: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    class_data: dict[int, dict[str, Any]] = {}
+    for class_id_raw, info in payload.items():
+        if not isinstance(info, dict):
+            continue
+        try:
+            class_id = int(class_id_raw)
+        except ValueError:
+            continue
+        pairs_raw = info.get("pairs", [])
+        pairs: list[tuple[float, int]] = []
+        if isinstance(pairs_raw, list):
+            for pair in pairs_raw:
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    try:
+                        pairs.append((float(pair[0]), int(pair[1])))
+                    except (TypeError, ValueError):
+                        continue
+        class_data[class_id] = {
+            "gt": int(info.get("gt", 0)),
+            "pairs": pairs,
+        }
+    return class_data
+
+
+def write_shard_result(
+    shard_output_dir: Path,
+    *,
+    split: str,
+    class_names: dict[int, str],
+    num_images: int,
+    processed_images: int,
+    infer_time_sum_ms: float,
+    metrics_meta: dict[str, int],
+    legacy_class_data: dict[int, dict[str, Any]],
+    total_gt: int,
+    total_pred: int,
+    total_tp: int,
+    metric_entries: list[dict[str, Any]],
+) -> Path:
+    payload = {
+        "split": split,
+        "class_names": {str(class_id): name for class_id, name in class_names.items()},
+        "num_images": num_images,
+        "processed_images": processed_images,
+        "infer_time_sum_ms": infer_time_sum_ms,
+        "metrics_meta": metrics_meta,
+        "legacy_class_data": serialize_legacy_class_data(legacy_class_data),
+        "total_gt": total_gt,
+        "total_pred": total_pred,
+        "total_tp": total_tp,
+        "metric_entries": metric_entries,
+    }
+    result_path = shard_output_dir / "shard_result.json"
+    result_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return result_path
+
+
+def copy_tree_contents(source_dir: Path, target_dir: Path) -> None:
+    if not source_dir.exists():
+        return
+    for path in source_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        rel_path = path.relative_to(source_dir)
+        destination = target_dir / rel_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
+
+
+def aggregate_metric_entries(metric, label_mapping: dict[int, int], metric_entries: list[dict[str, Any]]) -> None:
+    for entry in metric_entries:
+        pred_boxes = rt.torch.as_tensor(entry.get("pred_boxes", []), dtype=rt.torch.float32).reshape(-1, 4)
+        pred_scores = rt.torch.as_tensor(entry.get("pred_scores", []), dtype=rt.torch.float32)
+        pred_labels = rt.torch.as_tensor(entry.get("pred_labels", []), dtype=rt.torch.int64)
+        gt_boxes = rt.torch.as_tensor(entry.get("gt_boxes", []), dtype=rt.torch.float32).reshape(-1, 4)
+        gt_labels = rt.torch.as_tensor(entry.get("gt_labels", []), dtype=rt.torch.int64)
+        metric.update_with_predictions(
+            preds=[{"boxes": pred_boxes, "scores": pred_scores, "labels": rt.remap_labels(pred_labels, label_mapping)}],
+            target=[{"boxes": gt_boxes, "labels": rt.remap_labels(gt_labels, label_mapping)}],
+        )
+
+
+def merge_shard_results(
+    *,
+    shard_output_dirs: list[Path],
+    final_output_dir: Path,
+    checkpoint_path: Path,
+    data_cfg: dict[str, Any] | None,
+    split: str,
+    args,
+) -> None:
+    merged_class_names: dict[int, str] = {}
+    merged_metric_entries: list[dict[str, Any]] = []
+    merged_legacy_class_data: dict[int, dict[str, Any]] = defaultdict(lambda: {"gt": 0, "pairs": []})
+    num_images = 0
+    processed_images = 0
+    infer_time_sum_ms = 0.0
+    total_gt = 0
+    total_pred = 0
+    total_tp = 0
+    metrics_meta = {"images_with_labels": 0, "images_without_labels": 0}
+
+    for shard_output_dir in shard_output_dirs:
+        shard_result_path = shard_output_dir / "shard_result.json"
+        shard_payload = json.loads(shard_result_path.read_text(encoding="utf-8"))
+        class_names_payload = shard_payload.get("class_names", {})
+        if isinstance(class_names_payload, dict):
+            for class_id_raw, name in class_names_payload.items():
+                try:
+                    merged_class_names[int(class_id_raw)] = str(name)
+                except ValueError:
+                    continue
+        merged_metric_entries.extend(shard_payload.get("metric_entries", []))
+        for class_id, info in deserialize_legacy_class_data(shard_payload.get("legacy_class_data", {})).items():
+            merged_legacy_class_data[class_id]["gt"] += int(info.get("gt", 0))
+            merged_legacy_class_data[class_id]["pairs"].extend(info.get("pairs", []))
+        num_images += int(shard_payload.get("num_images", 0))
+        processed_images += int(shard_payload.get("processed_images", 0))
+        infer_time_sum_ms += float(shard_payload.get("infer_time_sum_ms", 0.0))
+        total_gt += int(shard_payload.get("total_gt", 0))
+        total_pred += int(shard_payload.get("total_pred", 0))
+        total_tp += int(shard_payload.get("total_tp", 0))
+        shard_metrics_meta = shard_payload.get("metrics_meta", {})
+        metrics_meta["images_with_labels"] += int(shard_metrics_meta.get("images_with_labels", 0))
+        metrics_meta["images_without_labels"] += int(shard_metrics_meta.get("images_without_labels", 0))
+        if args.save_visualization:
+            copy_tree_contents(shard_output_dir / "images", final_output_dir / "images")
+        if args.save_json:
+            copy_tree_contents(shard_output_dir / "json", final_output_dir / "json")
+        if args.save_txt:
+            copy_tree_contents(shard_output_dir / "txt", final_output_dir / "txt")
+
+    aggregated_metric_values: dict[str, float] | None = None
+    compute_full_metrics = data_cfg is not None and (args.compute_metrics or args.save_test_report)
+    if compute_full_metrics and merged_class_names and metrics_meta["images_with_labels"] > 0:
+        metric, label_mapping = maybe_create_metric(True, merged_class_names, args.metric_classwise)
+        aggregate_metric_entries(metric, label_mapping, merged_metric_entries)
+        aggregated_metric_values = metric.compute_aggregated_values().metric_values
+        metrics_payload = {
+            "checkpoint": str(checkpoint_path),
+            "input_mode": "dataset",
+            "num_images": num_images,
+            **metrics_meta,
+            "metrics": aggregated_metric_values,
+            "avg_infer_time_ms": infer_time_sum_ms / max(num_images, 1),
+        }
+        metrics_path = final_output_dir / "metrics_summary.json"
+        metrics_path.write_text(json.dumps(metrics_payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"Metrics saved to: {metrics_path}")
+
+    if data_cfg is not None and args.save_test_report:
+        report_path = build_split_report_path(args=args, output_dir=final_output_dir, split=split)
+        report_payload = build_legacy_report(
+            checkpoint_path=checkpoint_path,
+            data_cfg=data_cfg,
+            split=split,
+            score_threshold=args.score_threshold,
+            iou_threshold=args.report_iou_threshold,
+            class_names=merged_class_names,
+            class_data=dict(merged_legacy_class_data),
+            num_images=num_images,
+            processed_images=processed_images,
+            total_gt=total_gt,
+            total_pred=total_pred,
+            total_tp=total_tp,
+            avg_infer_time_ms=infer_time_sum_ms / max(num_images, 1),
+            metric_values=aggregated_metric_values,
+            metrics_meta=metrics_meta,
+        )
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report_payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"test_report saved to: {report_path}")
+
+
+def finalize_parallel_infer_output(
+    *,
+    args,
+    checkpoint_path: Path,
+    data_cfg: dict[str, Any] | None,
+    final_output_dir: Path,
+    split: str,
+    input_mode: str,
+    num_images: int,
+) -> None:
+    copied_curve_paths = rt.copy_training_curve_artifacts(
+        checkpoint_path=checkpoint_path,
+        output_dir=final_output_dir,
+    )
+    for curve_path in copied_curve_paths:
+        print(f"training_curve copied to: {curve_path}")
+
+    report_path = build_split_report_path(args=args, output_dir=final_output_dir, split=split)
+    run_meta_path = final_output_dir / "run_meta.json"
+    args.output_dir = final_output_dir
+    args.report_path = report_path
+    write_run_meta(
+        run_meta_path,
+        checkpoint_path=checkpoint_path,
+        output_dir=final_output_dir,
+        report_path=report_path,
+        input_mode=input_mode,
+        args=args,
+        data_cfg=data_cfg,
+        num_images=num_images,
+        copied_curve_paths=copied_curve_paths,
+    )
+    print(f"run_meta saved to: {run_meta_path}")
+
+    if args.save_test_report:
+        report_markdown_paths = generate_report_for_infer_output(
+            experiment_dir=rt.experiment_dir_from_checkpoint_path(checkpoint_path),
+            output_dir=final_output_dir,
+        )
+        for report_markdown_path in report_markdown_paths:
+            print(f"single_report saved to: {report_markdown_path}")
+
+
+def run_parallel_split_infer(args) -> bool:
+    if getattr(args, "dry_run", False):
+        print("[det/infer] dry-run 保持顺序模式。")
+        return False
+    if is_shard_child(args):
+        return False
+    if args.data is None or args.split == "all":
+        return False
+    if args.device != "auto":
+        return False
+
+    all_gpus, inventory_message = query_gpu_inventory()
+    if inventory_message:
+        print(f"[det/infer] {inventory_message}")
+        return False
+    eligible_gpus = filter_high_memory_gpus(all_gpus)
+    if len(eligible_gpus) < 2:
+        print(
+            f"[det/infer] 当前 split={args.split} 保留 GPU 数量为 {len(eligible_gpus)}，进入单卡顺序模式。"
+        )
+        return False
+
+    checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
+    data_cfg = rt.load_data_config(args.data)
+    final_output_dir = build_split_output_dir(
+        args=args,
+        checkpoint_path=checkpoint_path,
+        data_cfg=data_cfg,
+        split=args.split,
+    )
+    rt.prepare_output_dir(final_output_dir, args.overwrite)
+
+    base_samples, _, input_mode = get_input_samples(SimpleNamespace(**{**vars(args), "shard_index": None, "num_shards": 1}))
+    rt.ensure_image_samples(base_samples)
+    num_shards = min(len(eligible_gpus), len(base_samples))
+    if num_shards < 2:
+        print(f"[det/infer] split={args.split} 可分配 shard 数量为 {num_shards}，进入单卡顺序模式。")
+        return False
+
+    shard_output_dirs: list[Path] = []
+    shard_processes: list[tuple[int, str, subprocess.Popen[str]]] = []
+    report_path = build_split_report_path(args=args, output_dir=final_output_dir, split=args.split)
+    for shard_index, gpu in enumerate(eligible_gpus[:num_shards]):
+        shard_output_dir = final_output_dir / "_shards" / f"shard_{shard_index:02d}"
+        shard_output_dirs.append(shard_output_dir)
+        command = build_parallel_child_command(
+            args=args,
+            split=args.split,
+            device="auto",
+            output_dir=shard_output_dir,
+            report_path=report_path.with_name(f"{report_path.stem}-shard-{shard_index:02d}{report_path.suffix}"),
+            shard_index=shard_index,
+            num_shards=num_shards,
+        )
+        child_env = os.environ.copy()
+        child_env["CUDA_VISIBLE_DEVICES"] = str(int(gpu["index"]))
+        process = subprocess.Popen(command, cwd=str(rt.ROOT_DIR), env=child_env)
+        shard_processes.append((shard_index, str(int(gpu["index"])), process))
+
+    print(f"[det/infer] split={args.split} 已进入 shard 多卡推理模式。")
+    selected_gpus = eligible_gpus[:num_shards]
+    for gpu in selected_gpus:
+        print(f"[det/infer] 保留 {format_gpu_summary(gpu)}")
+    for shard_index, visible_device, _ in shard_processes:
+        print(f"[det/infer] shard={shard_index}/{num_shards} -> CUDA_VISIBLE_DEVICES={visible_device}")
+
+    failed_shards: list[str] = []
+    for shard_index, _, process in shard_processes:
+        return_code = process.wait()
+        if return_code != 0:
+            failed_shards.append(f"shard_{shard_index:02d}(exit={return_code})")
+    if failed_shards:
+        raise RuntimeError(f"shard infer 失败: {', '.join(failed_shards)}")
+
+    merge_shard_results(
+        shard_output_dirs=shard_output_dirs,
+        final_output_dir=final_output_dir,
+        checkpoint_path=checkpoint_path,
+        data_cfg=data_cfg,
+        split=args.split,
+        args=args,
+    )
+    finalize_parallel_infer_output(
+        args=args,
+        checkpoint_path=checkpoint_path,
+        data_cfg=data_cfg,
+        final_output_dir=final_output_dir,
+        split=args.split,
+        input_mode=input_mode,
+        num_images=len(base_samples),
+    )
+    return True
+
+
+def run_parallel_all_infer(args, splits: list[str]) -> bool:
+    if getattr(args, "dry_run", False):
+        print("[det/infer] dry-run 保持顺序模式。")
+        return False
+    if args.device != "auto":
+        print(f"[det/infer] 当前使用指定 device={args.device}，进入单卡顺序模式。")
+        return False
+    if len(splits) < 2:
+        print(f"[det/infer] 当前可执行 split 数量为 {len(splits)}，进入单卡顺序模式。")
+        return False
+
+    all_gpus, inventory_message = query_gpu_inventory()
+    if inventory_message:
+        print(f"[det/infer] {inventory_message}")
+        return False
+    eligible_gpus = filter_high_memory_gpus(all_gpus)
+    gpu_groups = split_gpu_groups_for_parallel(eligible_gpus, len(splits))
+    if len(gpu_groups) < len(splits):
+        print(
+            f"[det/infer] 检测到 {len(all_gpus)} 张 GPU，剔除高显存占用后剩余 {len(eligible_gpus)} 张，进入单卡顺序模式。"
+        )
+        return False
+
+    checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
+    data_cfg = rt.load_data_config(args.data) if args.data is not None else None
+    launch_specs: list[tuple[str, str, Path, Path, list[str], str]] = []
+    for split, gpu_group in zip(splits, gpu_groups):
+        child_args = SimpleNamespace(**vars(args))
+        child_args.requested_split = args.split
+        child_args.split = split
+        output_dir = build_split_output_dir(
+            args=child_args,
+            checkpoint_path=checkpoint_path,
+            data_cfg=data_cfg,
+            split=split,
+        )
+        report_path = build_split_report_path(
+            args=child_args,
+            output_dir=output_dir,
+            split=split,
+        )
+        visible_devices = ",".join(str(int(gpu["index"])) for gpu in gpu_group)
+        command = build_parallel_child_command(
+            args=args,
+            split=split,
+            device="auto",
+            output_dir=output_dir,
+            report_path=report_path,
+        )
+        launch_specs.append((split, visible_devices, output_dir, report_path, command, visible_devices))
+
+    print("[det/infer] 已进入自动多卡并行模式。")
+    print(
+        f"[det/infer] 共检测到 {len(all_gpus)} 张 GPU，剔除高显存占用后保留 {len(eligible_gpus)} 张，按 split 分组。"
+    )
+    for gpu in eligible_gpus:
+        print(f"[det/infer] 保留 {format_gpu_summary(gpu)}")
+    for split, visible_devices, output_dir, _, _, _ in launch_specs:
+        print(f"[det/infer] split={split} -> CUDA_VISIBLE_DEVICES={visible_devices} -> {output_dir}")
+
+    processes: list[tuple[str, subprocess.Popen[str]]] = []
+    for split, _, _, _, command, visible_devices in launch_specs:
+        child_env = os.environ.copy()
+        child_env["CUDA_VISIBLE_DEVICES"] = visible_devices
+        process = subprocess.Popen(command, cwd=str(rt.ROOT_DIR), env=child_env)
+        processes.append((split, process))
+
+    failed_splits: list[str] = []
+    for split, process in processes:
+        return_code = process.wait()
+        if return_code != 0:
+            failed_splits.append(f"{split}(exit={return_code})")
+
+    if failed_splits:
+        raise RuntimeError(f"并行 infer 失败: {', '.join(failed_splits)}")
+    return True
+
+
 def run_single_infer(args) -> None:
     use_dataset = args.data is not None
     compute_full_metrics = use_dataset and (args.compute_metrics or args.save_test_report)
+    shard_child = is_shard_child(args)
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
     data_cfg = rt.load_data_config(args.data) if use_dataset else None
     output_dir = build_split_output_dir(
@@ -265,10 +860,12 @@ def run_single_infer(args) -> None:
         return
 
     rt.prepare_output_dir(args.output_dir, args.overwrite)
-    copied_curve_paths = rt.copy_training_curve_artifacts(
-        checkpoint_path=checkpoint_path,
-        output_dir=args.output_dir,
-    )
+    copied_curve_paths: list[Path] = []
+    if not shard_child:
+        copied_curve_paths = rt.copy_training_curve_artifacts(
+            checkpoint_path=checkpoint_path,
+            output_dir=args.output_dir,
+        )
 
     model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
     model.eval()
@@ -285,18 +882,19 @@ def run_single_infer(args) -> None:
     for curve_path in copied_curve_paths:
         print(f"training_curve copied to: {curve_path}")
 
-    write_run_meta(
-        run_meta_path,
-        checkpoint_path=checkpoint_path,
-        output_dir=args.output_dir,
-        report_path=report_path,
-        input_mode=input_mode,
-        args=args,
-        data_cfg=data_cfg,
-        num_images=len(samples),
-        copied_curve_paths=copied_curve_paths,
-    )
-    print(f"run_meta saved to: {run_meta_path}")
+    if not shard_child:
+        write_run_meta(
+            run_meta_path,
+            checkpoint_path=checkpoint_path,
+            output_dir=args.output_dir,
+            report_path=report_path,
+            input_mode=input_mode,
+            args=args,
+            data_cfg=data_cfg,
+            num_images=len(samples),
+            copied_curve_paths=copied_curve_paths,
+        )
+        print(f"run_meta saved to: {run_meta_path}")
 
     infer_time_sum_ms = 0.0
     metrics_meta = {"images_with_labels": 0, "images_without_labels": 0}
@@ -304,6 +902,7 @@ def run_single_infer(args) -> None:
     legacy_total_gt = 0
     legacy_total_pred = 0
     legacy_total_tp = 0
+    metric_entries: list[dict[str, Any]] = []
     for idx, sample in enumerate(samples, start=1):
         with rt.Image.open(sample.image_path) as image:
             image_size = image.size
@@ -344,6 +943,8 @@ def run_single_infer(args) -> None:
             else:
                 metrics_meta["images_without_labels"] += 1
             update_metric(metric, label_mapping, prediction, gt_boxes, gt_labels)
+            if shard_child:
+                metric_entries.append(build_metric_entry(prediction, gt_boxes, gt_labels))
             if args.save_test_report:
                 gt_items = gt_records(gt_boxes, gt_labels)
                 image_total_gt, image_total_pred, image_total_tp = update_legacy_report_state(
@@ -358,6 +959,24 @@ def run_single_infer(args) -> None:
 
         if idx == 1 or idx % 20 == 0 or idx == len(samples):
             print(f"[{idx}/{len(samples)}] processed: {sample.image_path}")
+
+    if shard_child:
+        shard_result_path = write_shard_result(
+            args.output_dir,
+            split=args.split,
+            class_names=class_names,
+            num_images=len(samples),
+            processed_images=len(samples),
+            infer_time_sum_ms=infer_time_sum_ms,
+            metrics_meta=metrics_meta,
+            legacy_class_data=legacy_class_data,
+            total_gt=legacy_total_gt,
+            total_pred=legacy_total_pred,
+            total_tp=legacy_total_tp,
+            metric_entries=metric_entries,
+        )
+        print(f"shard_result saved to: {shard_result_path}")
+        return
 
     aggregated_metric_values: dict[str, float] | None = None
     if use_dataset and metric is not None and metrics_meta["images_with_labels"] > 0:
@@ -393,9 +1012,7 @@ def run_single_infer(args) -> None:
         )
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report_payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        archive_path = rt.archive_report_copy(report_path)
         print(f"test_report saved to: {report_path}")
-        print(f"test_report archived to: {archive_path}")
         report_markdown_paths = generate_report_for_infer_output(
             experiment_dir=rt.experiment_dir_from_checkpoint_path(checkpoint_path),
             output_dir=args.output_dir,
@@ -405,16 +1022,42 @@ def run_single_infer(args) -> None:
 
 
 def run_infer(args) -> None:
-    if args.data is None or getattr(args, "split", None) != "all":
+    if is_shard_child(args):
+        run_single_infer(args)
+        return
+
+    if args.data is None:
+        run_single_infer(args)
+        return
+
+    if getattr(args, "split", None) != "all":
+        if run_parallel_split_infer(args):
+            return
         run_single_infer(args)
         return
 
     data_cfg = rt.load_data_config(args.data)
     splits = resolve_dataset_infer_splits(data_cfg, args.split)
+    if run_parallel_all_infer(args, splits):
+        return
+
+    fallback_device: str | None = None
+    if args.device == "auto":
+        all_gpus, inventory_message = query_gpu_inventory()
+        if inventory_message:
+            print(f"[det/infer] {inventory_message}")
+        eligible_gpus = filter_high_memory_gpus(all_gpus)
+        fallback_device, fallback_message = select_fallback_single_gpu(all_gpus, eligible_gpus)
+        print(fallback_message)
+
     total = len(splits)
     for index, split in enumerate(splits, start=1):
         single_args = SimpleNamespace(**vars(args))
         single_args.requested_split = args.split
         single_args.split = split
+        if fallback_device is not None:
+            single_args.device = fallback_device
         print(f"\n=== [{index}/{total}] 开始推理 split: {split} ===")
+        if run_parallel_split_infer(single_args):
+            continue
         run_single_infer(single_args)

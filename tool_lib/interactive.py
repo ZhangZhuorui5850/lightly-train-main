@@ -768,6 +768,8 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     infer_parser.add_argument("--report-path", type=Path, default=None)
     infer_parser.add_argument("--overwrite", action="store_true", default=rt.INFER_DEFAULT_OVERWRITE)
     infer_parser.add_argument("--dry-run", action="store_true", default=False)
+    infer_parser.add_argument("--shard-index", type=int, default=None, help=argparse.SUPPRESS)
+    infer_parser.add_argument("--num-shards", type=int, default=1, help=argparse.SUPPRESS)
 
     export_parser = subparsers.add_parser("export")
     export_parser.add_argument("--report-json", type=Path, default=None)

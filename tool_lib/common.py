@@ -40,7 +40,7 @@ InstanceSegmentationTaskMetricArgs = None
 
 OUT_DIR = ROOT_DIR / "out"
 EXPERIMENT_ROOT_DIR = OUT_DIR
-TEST_OUTPUT_ROOT_DIR = OUT_DIR / "infer"
+TEST_OUTPUT_ROOT_DIR = OUT_DIR
 EDA_OUTPUT_ROOT_DIR = OUT_DIR / "EDA"
 REPORT_ARCHIVE_ROOT_DIR = OUT_DIR / "test_reports"
 DATASET_DIR = ROOT_DIR / "datasets" / "military_dataset" / "dataset_det"
@@ -58,7 +58,7 @@ VISUALIZATION_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".we
 INFER_DEFAULT_EXPERIMENT_DIR = EXPERIMENT_DIR
 INFER_DEFAULT_IMAGE = None
 INFER_DEFAULT_IMAGE_DIR = DATASET_DIR / "images" / "test"
-INFER_DEFAULT_OUTPUT_DIR = EXPERIMENT_DIR / "infer" / "test"
+INFER_DEFAULT_OUTPUT_DIR = EXPERIMENT_DIR / "infer-test"
 INFER_DEFAULT_DATA = DATASET_DIR / "data.yaml"
 INFER_DEFAULT_SPLIT = "test"
 
@@ -77,7 +77,7 @@ INFER_DEFAULT_SAVE_TEST_REPORT = True
 INFER_DEFAULT_REPORT_PATH = INFER_DEFAULT_OUTPUT_DIR / "test_report.json"
 
 EVAL_DEFAULT_DATA = DATASET_DIR / "data.yaml"
-EVAL_DEFAULT_OUTPUT_DIR = EXPERIMENT_DIR / "infer" / "test"
+EVAL_DEFAULT_OUTPUT_DIR = EXPERIMENT_DIR / "infer-test"
 EVAL_DEFAULT_REPORT_PATH = EVAL_DEFAULT_OUTPUT_DIR / "test_report.json"
 
 EXPORT_DEFAULT_REPORT_JSON = EVAL_DEFAULT_REPORT_PATH
@@ -115,6 +115,8 @@ TRAINING_CURVE_FILENAMES = {
     "lr": "training_curve_lr.png",
     "dashboard": "training_dashboard.png",
 }
+TRAINING_TEMP_DIRNAME = "_temp"
+TENSORBOARD_EVENT_GLOB = "events.out.tfevents.*"
 
 
 @dataclass
@@ -795,13 +797,11 @@ def timestamp_now_iso() -> str:
 def build_task_infer_root(task: str, *, output_root: Path | None = None, date_tag: str | None = None) -> Path:
     root = TEST_OUTPUT_ROOT_DIR if output_root is None else output_root.expanduser().resolve()
     day = date_tag or date_tag_now()
-    return root / day / sanitize_tag(task)
+    return root / day
 
 
 def build_det_run_name(*, checkpoint_path: Path, dataset_dir: Path, split: str) -> str:
-    return sanitize_tag(
-        f"{date_tag_now()}-det-{checkpoint_tag_from_path(checkpoint_path)}-{dataset_tag_from_dir(dataset_dir)}-{split}"
-    )
+    return sanitize_tag(f"infer-{dataset_tag_from_dir(dataset_dir)}-{split}")
 
 
 def build_det_report_path(output_dir: Path) -> Path:
@@ -840,10 +840,43 @@ def experiment_dir_from_checkpoint_path(checkpoint_path: Path) -> Path:
     return checkpoint_path.parent
 
 
+def training_temp_dir(experiment_dir: Path) -> Path:
+    return experiment_dir / TRAINING_TEMP_DIRNAME
+
+
+def consolidate_training_artifacts(experiment_dir: Path) -> list[Path]:
+    resolved_experiment_dir = experiment_dir.expanduser().resolve()
+    if not resolved_experiment_dir.exists():
+        return []
+
+    temp_dir = training_temp_dir(resolved_experiment_dir)
+    candidate_paths = [
+        *resolved_experiment_dir.glob(TENSORBOARD_EVENT_GLOB),
+        *(resolved_experiment_dir / filename for filename in TRAINING_CURVE_FILENAMES.values()),
+    ]
+
+    moved_paths: list[Path] = []
+    for source_path in candidate_paths:
+        if not source_path.exists() or not source_path.is_file():
+            continue
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        destination_path = temp_dir / source_path.name
+        if destination_path.exists():
+            destination_path.unlink()
+        shutil.move(str(source_path), str(destination_path))
+        moved_paths.append(destination_path)
+    return moved_paths
+
+
 def list_event_files(experiment_dir: Path) -> list[Path]:
     if not experiment_dir.exists():
         return []
-    files = sorted(experiment_dir.glob("events.out.tfevents.*"))
+    files = list(experiment_dir.glob(TENSORBOARD_EVENT_GLOB))
+    temp_dir = training_temp_dir(experiment_dir)
+    if temp_dir.exists():
+        files.extend(temp_dir.glob(TENSORBOARD_EVENT_GLOB))
+    unique_files = {path.resolve(): path.resolve() for path in files}
+    files = list(unique_files.values())
     files.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
     return files
 
@@ -1171,12 +1204,15 @@ def compose_training_dashboard(
 
 def generate_training_curve_artifacts(experiment_dir: Path) -> list[Path]:
     experiment_dir = experiment_dir.expanduser().resolve()
+    consolidate_training_artifacts(experiment_dir)
     event_file = select_best_event_file(experiment_dir)
     if event_file is None or not ensure_plot_dependencies():
         return []
 
+    temp_dir = training_temp_dir(experiment_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
     created_paths: list[Path] = []
-    loss_path = experiment_dir / TRAINING_CURVE_FILENAMES["loss"]
+    loss_path = temp_dir / TRAINING_CURVE_FILENAMES["loss"]
     if render_scalar_plot(
         loss_path,
         title="Training and Validation Loss",
@@ -1187,7 +1223,7 @@ def generate_training_curve_artifacts(experiment_dir: Path) -> list[Path]:
     ):
         created_paths.append(loss_path)
 
-    map_path = experiment_dir / TRAINING_CURVE_FILENAMES["map"]
+    map_path = temp_dir / TRAINING_CURVE_FILENAMES["map"]
     if render_scalar_plot(
         map_path,
         title="Validation mAP Curves",
@@ -1201,7 +1237,7 @@ def generate_training_curve_artifacts(experiment_dir: Path) -> list[Path]:
     ):
         created_paths.append(map_path)
 
-    lr_path = experiment_dir / TRAINING_CURVE_FILENAMES["lr"]
+    lr_path = temp_dir / TRAINING_CURVE_FILENAMES["lr"]
     if render_scalar_plot(
         lr_path,
         title="Learning Rate Curves",
@@ -1214,11 +1250,11 @@ def generate_training_curve_artifacts(experiment_dir: Path) -> list[Path]:
     ):
         created_paths.append(lr_path)
 
-    dashboard_path = experiment_dir / TRAINING_CURVE_FILENAMES["dashboard"]
+    dashboard_path = temp_dir / TRAINING_CURVE_FILENAMES["dashboard"]
     ordered_curve_paths = [
-        experiment_dir / TRAINING_CURVE_FILENAMES["loss"],
-        experiment_dir / TRAINING_CURVE_FILENAMES["map"],
-        experiment_dir / TRAINING_CURVE_FILENAMES["lr"],
+        temp_dir / TRAINING_CURVE_FILENAMES["loss"],
+        temp_dir / TRAINING_CURVE_FILENAMES["map"],
+        temp_dir / TRAINING_CURVE_FILENAMES["lr"],
     ]
     if compose_training_dashboard(
         dashboard_path,
@@ -1248,7 +1284,10 @@ def derive_det_run_dir(
     split: str,
     output_root: Path | None = None,
 ) -> Path:
-    root = build_task_infer_root("det", output_root=output_root)
+    if output_root is not None:
+        root = output_root.expanduser().resolve()
+    else:
+        root = experiment_dir_from_checkpoint_path(checkpoint_path)
     run_name = build_det_run_name(
         checkpoint_path=checkpoint_path,
         dataset_dir=dataset_dir,

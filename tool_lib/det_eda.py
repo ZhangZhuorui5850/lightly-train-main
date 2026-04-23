@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
 try:
     import yaml
 except ModuleNotFoundError:
@@ -190,8 +189,7 @@ def _collect_source_image_infos_light(
         try:
             export_split_paths[split_name] = split_image_dir.resolve().relative_to(source_root).as_posix()
         except ValueError:
-            export_split_paths[split_name] = Path("images") / split_name
-            export_split_paths[split_name] = export_split_paths[split_name].as_posix()
+            export_split_paths[split_name] = (Path("images") / split_name).as_posix()
     return source_infos_by_split, export_split_paths
 
 
@@ -374,7 +372,12 @@ def _parse_label_file(label_path: Path) -> dict[str, Any]:
 
 
 def _open_image_size(image_path: Path) -> tuple[int, int]:
-    with Image.open(image_path) as image:
+    if rt.Image is None and not rt.ensure_plot_dependencies():
+        raise ModuleNotFoundError("Missing runtime dependency Pillow. Please install pillow in the current environment.")
+    image_module = rt.Image
+    if image_module is None:
+        raise ModuleNotFoundError("Missing runtime dependency Pillow. Please install pillow in the current environment.")
+    with image_module.open(image_path) as image:
         width, height = image.size
     return int(width), int(height)
 
@@ -1070,7 +1073,7 @@ def _default_eda_output_dir(source_data_path: Path) -> Path:
     source_cfg = _load_data_config_light(source_data_path)
     source_root = Path(source_cfg["_root_dir"]).resolve()
     dataset_tag = rt.dataset_tag_from_dir(source_root)
-    base_dir = rt.EDA_OUTPUT_ROOT_DIR / rt.date_folder_today() / "det" / f"{dataset_tag}-eda"
+    base_dir = rt.EDA_OUTPUT_ROOT_DIR / f"{dataset_tag}-eda"
     return rt.deduplicate_path(base_dir)
 
 
