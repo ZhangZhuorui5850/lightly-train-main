@@ -1513,6 +1513,113 @@ def allocate_box_targets_per_split(
             desired[split_name][class_id] = class_targets[split_name]
     return desired
 
+
+def allocate_image_coverage_targets_per_split(
+    *,
+    selected_candidates: list[ExportImageCandidate],
+    split_image_targets: dict[str, int],
+    kept_class_ids: list[int],
+) -> dict[str, dict[int, int]]:
+    desired: dict[str, dict[int, int]] = {
+        split_name: {class_id: 0 for class_id in kept_class_ids}
+        for split_name in ("train", "val", "test")
+    }
+    active_splits = [
+        split_name
+        for split_name in ("train", "val", "test")
+        if split_image_targets.get(split_name, 0) > 0
+    ]
+    if not active_splits:
+        return desired
+
+    available_images_per_class = count_candidate_images_per_class(selected_candidates, kept_class_ids)
+    eval_splits = sorted(
+        (split_name for split_name in active_splits if split_name != "train"),
+        key=lambda split_name: (split_image_targets.get(split_name, 0), split_name),
+    )
+    coverage_priority = (["train"] if "train" in active_splits else []) + eval_splits
+    for class_id in kept_class_ids:
+        remaining_images = available_images_per_class.get(class_id, 0)
+        if remaining_images <= 0:
+            continue
+        for split_name in coverage_priority:
+            if remaining_images <= 0:
+                break
+            desired[split_name][class_id] = 1
+            remaining_images -= 1
+    return desired
+
+
+def allocate_image_targets_per_split(
+    *,
+    selected_candidates: list[ExportImageCandidate],
+    split_image_targets: dict[str, int],
+    kept_class_ids: list[int],
+) -> dict[str, dict[int, int]]:
+    desired: dict[str, dict[int, int]] = {
+        split_name: {class_id: 0 for class_id in kept_class_ids}
+        for split_name in ("train", "val", "test")
+    }
+    active_splits = [
+        split_name
+        for split_name in ("train", "val", "test")
+        if split_image_targets.get(split_name, 0) > 0
+    ]
+    if not active_splits:
+        return desired
+
+    ratio_total = sum(split_image_targets.get(split_name, 0) for split_name in active_splits)
+    available_images_per_class = count_candidate_images_per_class(selected_candidates, kept_class_ids)
+    for class_id in kept_class_ids:
+        total_class_images = available_images_per_class.get(class_id, 0)
+        if total_class_images <= 0 or ratio_total <= 0:
+            continue
+        raw_targets = {
+            split_name: (
+                total_class_images * split_image_targets.get(split_name, 0) / ratio_total
+            )
+            for split_name in active_splits
+        }
+        class_targets = {split_name: int(raw_targets[split_name]) for split_name in active_splits}
+        assigned = sum(class_targets.values())
+        remainders = sorted(
+            (
+                raw_targets[split_name] - class_targets[split_name],
+                split_name,
+            )
+            for split_name in active_splits
+        )
+        while assigned < total_class_images:
+            _, split_name = remainders.pop()
+            class_targets[split_name] += 1
+            assigned += 1
+            remainders.append((raw_targets[split_name] - int(raw_targets[split_name]), split_name))
+            remainders.sort()
+
+        if total_class_images >= len(active_splits):
+            zero_target_splits = [
+                split_name
+                for split_name in active_splits
+                if class_targets[split_name] <= 0
+            ]
+            for split_name in zero_target_splits:
+                donor_split = max(
+                    (
+                        donor_name
+                        for donor_name in active_splits
+                        if class_targets[donor_name] > 1
+                    ),
+                    key=lambda donor_name: (class_targets[donor_name], split_image_targets.get(donor_name, 0), donor_name),
+                    default="",
+                )
+                if donor_split:
+                    class_targets[donor_split] -= 1
+                    class_targets[split_name] += 1
+        for split_name in active_splits:
+            desired[split_name][class_id] = class_targets[split_name]
+    return desired
+
+
 def assign_candidates_to_new_splits(
     *,
     selected_candidates: list[ExportImageCandidate],
@@ -1530,18 +1637,119 @@ def assign_candidates_to_new_splits(
         "val": {class_id: 0 for class_id in kept_class_ids},
         "test": {class_id: 0 for class_id in kept_class_ids},
     }
+    desired_image_coverage_by_split = allocate_image_coverage_targets_per_split(
+        selected_candidates=selected_candidates,
+        split_image_targets=split_image_targets,
+        kept_class_ids=kept_class_ids,
+    )
+    desired_image_targets_by_split = allocate_image_targets_per_split(
+        selected_candidates=selected_candidates,
+        split_image_targets=split_image_targets,
+        kept_class_ids=kept_class_ids,
+    )
+    assigned_image_counts = {
+        "train": {class_id: 0 for class_id in kept_class_ids},
+        "val": {class_id: 0 for class_id in kept_class_ids},
+        "test": {class_id: 0 for class_id in kept_class_ids},
+    }
     remaining_image_targets = dict(split_image_targets)
     ordered_candidates = sorted(
         selected_candidates,
         key=lambda item: (-item.total_boxes, -len(item.class_box_counts), item.rel_path.as_posix(), item.split_name),
     )
+    remaining_candidates = list(ordered_candidates)
 
-    for candidate in ordered_candidates:
+    active_splits = [
+        split_name
+        for split_name in ("train", "val", "test")
+        if split_image_targets.get(split_name, 0) > 0
+    ]
+    limited_coverage_classes = {
+        class_id: sum(1 for candidate in selected_candidates if class_id in candidate.class_box_counts)
+        for class_id in kept_class_ids
+        if sum(1 for candidate in selected_candidates if class_id in candidate.class_box_counts) < len(active_splits)
+    }
+
+    while remaining_candidates:
+        best_candidate_idx = -1
+        best_split = ""
+        best_score = float("-inf")
+        best_total_boxes = 0
+        best_class_count = 0
+        best_path = ""
+        for idx, candidate in enumerate(remaining_candidates):
+            path_key = candidate.rel_path.as_posix()
+            for split_name in ("train", "val", "test"):
+                if remaining_image_targets.get(split_name, 0) <= 0:
+                    continue
+                coverage_gain = sum(
+                    1
+                    for class_id in candidate.class_box_counts
+                    if assigned_image_counts[split_name][class_id] < desired_image_coverage_by_split[split_name][class_id]
+                )
+                if coverage_gain <= 0:
+                    continue
+                image_deficit_gain = sum(
+                    1
+                    for class_id in candidate.class_box_counts
+                    if assigned_image_counts[split_name][class_id] < desired_image_targets_by_split[split_name][class_id]
+                )
+                deficit_gain = 0.0
+                for class_id, box_count in candidate.class_box_counts.items():
+                    remaining_box_need = (
+                        desired_box_targets_by_split[split_name][class_id]
+                        - assigned_box_counts[split_name][class_id]
+                    )
+                    if remaining_box_need > 0:
+                        deficit_gain += min(box_count, remaining_box_need)
+                smaller_split_bonus = 1.0 / max(split_image_targets.get(split_name, 0), 1)
+                score = (coverage_gain * 1000.0) + (image_deficit_gain * 100.0) + deficit_gain + smaller_split_bonus
+                should_take = False
+                if best_split == "" or score > best_score + 1e-12:
+                    should_take = True
+                elif abs(score - best_score) <= 1e-12 and coverage_gain > best_class_count:
+                    should_take = True
+                elif abs(score - best_score) <= 1e-12 and coverage_gain == best_class_count and candidate.total_boxes < best_total_boxes:
+                    should_take = True
+                elif (
+                    abs(score - best_score) <= 1e-12
+                    and coverage_gain == best_class_count
+                    and candidate.total_boxes == best_total_boxes
+                    and (best_path == "" or path_key < best_path)
+                ):
+                    should_take = True
+                if should_take:
+                    best_candidate_idx = idx
+                    best_split = split_name
+                    best_score = score
+                    best_total_boxes = candidate.total_boxes
+                    best_class_count = coverage_gain
+                    best_path = path_key
+        if best_candidate_idx < 0 or best_split == "":
+            break
+        candidate = remaining_candidates.pop(best_candidate_idx)
+        assigned_candidates[best_split].append(candidate)
+        remaining_image_targets[best_split] = max(remaining_image_targets.get(best_split, 0) - 1, 0)
+        for class_id, box_count in candidate.class_box_counts.items():
+            assigned_box_counts[best_split][class_id] += box_count
+            assigned_image_counts[best_split][class_id] += 1
+
+    for candidate in remaining_candidates:
         best_split = ""
         best_score = float("-inf")
         for split_name in ("train", "val", "test"):
             if remaining_image_targets.get(split_name, 0) <= 0:
                 continue
+            coverage_gain = sum(
+                1
+                for class_id in candidate.class_box_counts
+                if assigned_image_counts[split_name][class_id] < desired_image_coverage_by_split[split_name][class_id]
+            )
+            image_deficit_gain = sum(
+                1
+                for class_id in candidate.class_box_counts
+                if assigned_image_counts[split_name][class_id] < desired_image_targets_by_split[split_name][class_id]
+            )
             deficit_gain = 0.0
             for class_id, box_count in candidate.class_box_counts.items():
                 remaining_box_need = (
@@ -1550,7 +1758,12 @@ def assign_candidates_to_new_splits(
                 )
                 if remaining_box_need > 0:
                     deficit_gain += min(box_count, remaining_box_need)
-            score = deficit_gain + (0.01 * remaining_image_targets[split_name])
+            score = (
+                (coverage_gain * 1000.0)
+                + (image_deficit_gain * 100.0)
+                + deficit_gain
+                + (0.01 * remaining_image_targets[split_name])
+            )
             if best_split == "" or score > best_score:
                 best_split = split_name
                 best_score = score
@@ -1563,10 +1776,22 @@ def assign_candidates_to_new_splits(
         remaining_image_targets[best_split] = max(remaining_image_targets.get(best_split, 0) - 1, 0)
         for class_id, box_count in candidate.class_box_counts.items():
             assigned_box_counts[best_split][class_id] += box_count
+            assigned_image_counts[best_split][class_id] += 1
 
     for split_name in assigned_candidates:
         assigned_candidates[split_name].sort(key=lambda item: (item.rel_path.as_posix(), item.split_name))
 
+    missing_image_coverage_by_split = {
+        split_name: {
+            class_id: max(
+                desired_image_coverage_by_split[split_name][class_id] - assigned_image_counts[split_name][class_id],
+                0,
+            )
+            for class_id in kept_class_ids
+            if desired_image_coverage_by_split[split_name][class_id] > assigned_image_counts[split_name][class_id]
+        }
+        for split_name in ("train", "val", "test")
+    }
     return assigned_candidates, {
         "target_images_per_split": split_image_targets,
         "assigned_images_per_split": {
@@ -1575,6 +1800,16 @@ def assign_candidates_to_new_splits(
         },
         "desired_boxes_per_split": desired_box_targets_by_split,
         "assigned_boxes_per_split": assigned_box_counts,
+        "desired_image_coverage_by_split": desired_image_coverage_by_split,
+        "desired_images_per_split_by_class": desired_image_targets_by_split,
+        "assigned_image_coverage_by_split": assigned_image_counts,
+        "assigned_images_per_split_by_class": assigned_image_counts,
+        "missing_image_coverage_by_split": missing_image_coverage_by_split,
+        "missing_image_coverage_counts": {
+            split_name: len(missing_image_coverage_by_split[split_name])
+            for split_name in ("train", "val", "test")
+        },
+        "limited_coverage_classes": limited_coverage_classes,
     }
 
 def resolve_destination_rel_path(

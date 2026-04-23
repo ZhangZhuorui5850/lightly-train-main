@@ -41,6 +41,7 @@ InstanceSegmentationTaskMetricArgs = None
 OUT_DIR = ROOT_DIR / "out"
 EXPERIMENT_ROOT_DIR = OUT_DIR
 TEST_OUTPUT_ROOT_DIR = OUT_DIR / "infer"
+EDA_OUTPUT_ROOT_DIR = OUT_DIR / "EDA"
 REPORT_ARCHIVE_ROOT_DIR = OUT_DIR / "test_reports"
 DATASET_DIR = ROOT_DIR / "datasets" / "military_dataset" / "dataset_det"
 EXPERIMENT_DIR = OUT_DIR / "my_experiment_det_0402"
@@ -210,6 +211,7 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global OUT_DIR
     global EXPERIMENT_ROOT_DIR
     global TEST_OUTPUT_ROOT_DIR
+    global EDA_OUTPUT_ROOT_DIR
     global DATASET_DIR
     global EXPERIMENT_DIR
     global REPORT_ARCHIVE_ROOT_DIR
@@ -263,6 +265,7 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
         "infer_output_root_dir",
         _path("test_output_root_dir", TEST_OUTPUT_ROOT_DIR),
     )
+    EDA_OUTPUT_ROOT_DIR = _path("eda_output_root_dir", EDA_OUTPUT_ROOT_DIR)
     REPORT_ARCHIVE_ROOT_DIR = _path("report_archive_root_dir", REPORT_ARCHIVE_ROOT_DIR)
     DATASET_DIR = _path("det_dataset_dir", DATASET_DIR)
     DEFAULT_CLS_THRESHOLD = float(settings.get("cls_threshold", DEFAULT_CLS_THRESHOLD))

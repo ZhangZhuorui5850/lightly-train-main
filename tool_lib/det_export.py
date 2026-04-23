@@ -8,8 +8,11 @@ from __future__ import annotations
 import inspect
 import json
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
+
+from PIL import Image
 
 from . import common as rt
 from .det_analysis import (
@@ -40,6 +43,9 @@ from .det_shared import (
     safe_class_name,
 )
 
+SMALL_OBJECT_AREA_THRESHOLD = 32.0 * 32.0
+MEDIUM_OBJECT_AREA_THRESHOLD = 96.0 * 96.0
+
 
 def _progress_bar(current: int, total: int, width: int = 28) -> str:
     safe_total = max(total, 1)
@@ -53,13 +59,13 @@ def _print_progress_line(label: str, current: int, total: int, detail: str = "",
     print(f"[det/export] {label} {_progress_bar(current, total)}{suffix}", end=end, flush=True)
 
 
-def _make_live_progress_callback(label: str):
+def _make_live_progress_callback(label: str, *, single_line: bool = False):
     last_print_at = 0.0
 
     def _callback(current: int, total: int, detail: str) -> None:
         nonlocal last_print_at
         now = time.monotonic()
-        should_commit_line = current >= total or (now - last_print_at) >= 0.8
+        should_commit_line = current >= total or ((now - last_print_at) >= 0.8 and not single_line)
         _print_progress_line(
             label,
             current,
@@ -146,6 +152,460 @@ def _safe_load_json(path: Path) -> dict[str, Any] | None:
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _empty_size_bucket_counts() -> dict[str, int]:
+    return {
+        "small": 0,
+        "medium": 0,
+        "large": 0,
+    }
+
+
+def _safe_ratio(numerator: int | float, denominator: int | float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(float(numerator) / float(denominator), 6)
+
+
+def _bucket_box_area(area_pixels: float) -> str:
+    if area_pixels < SMALL_OBJECT_AREA_THRESHOLD:
+        return "small"
+    if area_pixels < MEDIUM_OBJECT_AREA_THRESHOLD:
+        return "medium"
+    return "large"
+
+
+def _open_image_size(image_path: Path) -> tuple[int, int]:
+    with Image.open(image_path) as image:
+        width, height = image.size
+    return int(width), int(height)
+
+
+def _analyze_candidate_boxes(candidate, class_id_mapping: dict[int, int]) -> dict[str, Any]:
+    width, height = _open_image_size(candidate.src_image_path)
+    per_class_label_counts: dict[int, int] = defaultdict(int)
+    per_class_size_buckets: dict[int, dict[str, int]] = defaultdict(_empty_size_bucket_counts)
+    size_buckets = _empty_size_bucket_counts()
+
+    for line in candidate.filtered_lines:
+        parts = line.split()
+        if len(parts) != 5:
+            continue
+        old_class_id = int(float(parts[0]))
+        new_class_id = class_id_mapping[old_class_id]
+        box_width = max(float(parts[3]), 0.0) * width
+        box_height = max(float(parts[4]), 0.0) * height
+        bucket = _bucket_box_area(box_width * box_height)
+        per_class_label_counts[new_class_id] += 1
+        per_class_size_buckets[new_class_id][bucket] += 1
+        size_buckets[bucket] += 1
+
+    total_labels = sum(per_class_label_counts.values())
+    return {
+        "image_width": width,
+        "image_height": height,
+        "total_labels": total_labels,
+        "size_buckets": size_buckets,
+        "per_class_label_counts": dict(per_class_label_counts),
+        "per_class_size_buckets": {
+            class_id: dict(bucket_counts)
+            for class_id, bucket_counts in per_class_size_buckets.items()
+        },
+    }
+
+
+def _finalize_split_eda_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    images = int(entry.get("images", 0) or 0)
+    labeled_images = int(entry.get("labeled_images", 0) or 0)
+    labels = int(entry.get("labels", 0) or 0)
+    size_buckets = entry.get("size_buckets", _empty_size_bucket_counts())
+    entry["boxes"] = labels
+    entry["avg_labels_per_image"] = round(labels / images, 4) if images > 0 else 0.0
+    entry["avg_labels_per_labeled_image"] = round(labels / labeled_images, 4) if labeled_images > 0 else 0.0
+    entry["labeled_image_ratio"] = _safe_ratio(labeled_images, images)
+    entry["size_bucket_ratio"] = {
+        bucket_name: _safe_ratio(bucket_value, labels)
+        for bucket_name, bucket_value in size_buckets.items()
+    }
+    classes = list(entry.get("classes", {}).values())
+    classes_by_labels = sorted(
+        classes,
+        key=lambda item: (-item["labels"], -item["images"], item["class_id"]),
+    )
+    classes_by_images = sorted(
+        classes,
+        key=lambda item: (-item["images"], -item["labels"], item["class_id"]),
+    )
+    entry["class_count"] = len(classes)
+    entry["top_classes_by_labels"] = classes_by_labels[: min(10, len(classes_by_labels))]
+    entry["top_classes_by_images"] = classes_by_images[: min(10, len(classes_by_images))]
+    dense_images = sorted(
+        entry.get("top_dense_images", []),
+        key=lambda item: (-item["labels"], -item["class_count"], item["image"]),
+    )
+    entry["top_dense_images"] = dense_images[: min(10, len(dense_images))]
+    entry["classes"] = {
+        str(item["class_id"]): item
+        for item in classes_by_labels
+    }
+    return entry
+
+
+def _build_split_summary_view(split_entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "images": split_entry["images"],
+        "labeled_images": split_entry["labeled_images"],
+        "empty_images": split_entry["empty_images"],
+        "labels": split_entry["labels"],
+        "boxes": split_entry["boxes"],
+        "avg_labels_per_image": split_entry["avg_labels_per_image"],
+        "avg_labels_per_labeled_image": split_entry["avg_labels_per_labeled_image"],
+        "size_buckets": dict(split_entry["size_buckets"]),
+        "size_bucket_ratio": dict(split_entry["size_bucket_ratio"]),
+        "class_count": split_entry["class_count"],
+    }
+
+
+def build_export_dataset_eda(
+    *,
+    selected_candidates_by_split: dict[str, list[Any]],
+    kept_names: dict[int, str],
+    class_id_mapping: dict[int, int],
+) -> dict[str, Any]:
+    split_order = ["train", "val", "test"]
+    split_entries: dict[str, dict[str, Any]] = {}
+    all_entry = {
+        "split": "all",
+        "images": 0,
+        "labeled_images": 0,
+        "empty_images": 0,
+        "labels": 0,
+        "size_buckets": _empty_size_bucket_counts(),
+        "classes": {},
+        "top_dense_images": [],
+    }
+    class_entries = {
+        str(class_id): {
+            "class_id": class_id,
+            "name": class_name,
+            "all": {
+                "images": 0,
+                "labels": 0,
+                "boxes": 0,
+                "size_buckets": _empty_size_bucket_counts(),
+            },
+            "splits": {},
+        }
+        for class_id, class_name in sorted(kept_names.items())
+    }
+
+    for split_name in split_order:
+        candidates = selected_candidates_by_split.get(split_name, [])
+        split_entry = {
+            "split": split_name,
+            "images": len(candidates),
+            "labeled_images": 0,
+            "empty_images": 0,
+            "labels": 0,
+            "size_buckets": _empty_size_bucket_counts(),
+            "classes": {},
+            "top_dense_images": [],
+        }
+        all_entry["images"] += len(candidates)
+
+        for candidate in candidates:
+            candidate_analysis = _analyze_candidate_boxes(candidate, class_id_mapping)
+            total_labels = int(candidate_analysis["total_labels"])
+            size_buckets = cast(dict[str, int], candidate_analysis["size_buckets"])
+            per_class_label_counts = cast(dict[int, int], candidate_analysis["per_class_label_counts"])
+            per_class_size_buckets = cast(dict[int, dict[str, int]], candidate_analysis["per_class_size_buckets"])
+
+            if total_labels > 0:
+                split_entry["labeled_images"] += 1
+                all_entry["labeled_images"] += 1
+            else:
+                split_entry["empty_images"] += 1
+                all_entry["empty_images"] += 1
+            split_entry["labels"] += total_labels
+            all_entry["labels"] += total_labels
+
+            for bucket_name, bucket_value in size_buckets.items():
+                split_entry["size_buckets"][bucket_name] += bucket_value
+                all_entry["size_buckets"][bucket_name] += bucket_value
+
+            dense_image_record = {
+                "split": split_name,
+                "image": candidate.rel_path.as_posix(),
+                "labels": total_labels,
+                "class_count": len(per_class_label_counts),
+                "image_width": candidate_analysis["image_width"],
+                "image_height": candidate_analysis["image_height"],
+            }
+            split_entry["top_dense_images"].append(dense_image_record)
+            all_entry["top_dense_images"].append(dense_image_record)
+
+            for class_id, label_count in per_class_label_counts.items():
+                class_name = kept_names[class_id]
+                split_class_entry = split_entry["classes"].setdefault(
+                    str(class_id),
+                    {
+                        "class_id": class_id,
+                        "name": class_name,
+                        "images": 0,
+                        "labels": 0,
+                        "boxes": 0,
+                        "size_buckets": _empty_size_bucket_counts(),
+                    },
+                )
+                split_class_entry["images"] += 1
+                split_class_entry["labels"] += label_count
+                split_class_entry["boxes"] += label_count
+
+                all_class_entry = all_entry["classes"].setdefault(
+                    str(class_id),
+                    {
+                        "class_id": class_id,
+                        "name": class_name,
+                        "images": 0,
+                        "labels": 0,
+                        "boxes": 0,
+                        "size_buckets": _empty_size_bucket_counts(),
+                    },
+                )
+                all_class_entry["images"] += 1
+                all_class_entry["labels"] += label_count
+                all_class_entry["boxes"] += label_count
+
+                class_split_entry = class_entries[str(class_id)]["splits"].setdefault(
+                    split_name,
+                    {
+                        "images": 0,
+                        "labels": 0,
+                        "boxes": 0,
+                        "size_buckets": _empty_size_bucket_counts(),
+                    },
+                )
+                class_split_entry["images"] += 1
+                class_split_entry["labels"] += label_count
+                class_split_entry["boxes"] += label_count
+
+                class_entries[str(class_id)]["all"]["images"] += 1
+                class_entries[str(class_id)]["all"]["labels"] += label_count
+                class_entries[str(class_id)]["all"]["boxes"] += label_count
+
+                class_size_buckets = per_class_size_buckets.get(class_id, _empty_size_bucket_counts())
+                for bucket_name, bucket_value in class_size_buckets.items():
+                    split_class_entry["size_buckets"][bucket_name] += bucket_value
+                    all_class_entry["size_buckets"][bucket_name] += bucket_value
+                    class_split_entry["size_buckets"][bucket_name] += bucket_value
+                    class_entries[str(class_id)]["all"]["size_buckets"][bucket_name] += bucket_value
+
+        split_entries[split_name] = _finalize_split_eda_entry(split_entry)
+
+    all_entry = _finalize_split_eda_entry(all_entry)
+    all_classes_sorted = sorted(
+        class_entries.values(),
+        key=lambda item: (-item["all"]["labels"], -item["all"]["images"], item["class_id"]),
+    )
+    class_label_counts = [item["all"]["labels"] for item in all_classes_sorted if item["all"]["labels"] > 0]
+    split_summaries = {
+        split_name: _build_split_summary_view(split_entry)
+        for split_name, split_entry in split_entries.items()
+    }
+
+    overview = {
+        "split_order": split_order,
+        "class_count": len(kept_names),
+        "images": all_entry["images"],
+        "labeled_images": all_entry["labeled_images"],
+        "empty_images": all_entry["empty_images"],
+        "labels": all_entry["labels"],
+        "boxes": all_entry["boxes"],
+        "avg_labels_per_image": all_entry["avg_labels_per_image"],
+        "avg_labels_per_labeled_image": all_entry["avg_labels_per_labeled_image"],
+        "size_buckets": dict(all_entry["size_buckets"]),
+        "size_bucket_ratio": dict(all_entry["size_bucket_ratio"]),
+        "class_label_count_stats": {
+            "min": min(class_label_counts, default=0),
+            "max": max(class_label_counts, default=0),
+            "imbalance_ratio": round(max(class_label_counts) / max(min(class_label_counts), 1), 4)
+            if class_label_counts
+            else 0.0,
+        },
+        "object_size_rule": {
+            "small": "area < 32^2 px",
+            "medium": "32^2 px <= area < 96^2 px",
+            "large": "area >= 96^2 px",
+        },
+    }
+
+    insights: list[str] = []
+    if all_classes_sorted:
+        head_class = all_classes_sorted[0]
+        tail_class = min(
+            all_classes_sorted,
+            key=lambda item: (item["all"]["labels"], item["all"]["images"], item["class_id"]),
+        )
+        insights.append(
+            f"标签量最高的类别是 {head_class['name']}，共 {head_class['all']['labels']} 个标签，覆盖 {head_class['all']['images']} 张图。"
+        )
+        insights.append(
+            f"标签量最低的类别是 {tail_class['name']}，共 {tail_class['all']['labels']} 个标签，覆盖 {tail_class['all']['images']} 张图。"
+        )
+    dominant_bucket = max(
+        overview["size_buckets"],
+        key=overview["size_buckets"].get,
+        default="small",
+    )
+    insights.append(
+        f"导出数据集的目标尺寸以 {dominant_bucket} 为主，对应 {overview['size_buckets'][dominant_bucket]} 个标签。"
+    )
+    if split_summaries:
+        densest_split_name = max(
+            split_summaries,
+            key=lambda name: split_summaries[name]["avg_labels_per_image"],
+        )
+        densest_split = split_summaries[densest_split_name]
+        insights.append(
+            f"{densest_split_name} split 的平均每图标签数最高，为 {densest_split['avg_labels_per_image']:.4f}。"
+        )
+
+    return {
+        "overview": overview,
+        "split_summaries": split_summaries,
+        "splits": {
+            **split_entries,
+            "all": all_entry,
+        },
+        "classes": {
+            str(entry["class_id"]): entry
+            for entry in all_classes_sorted
+        },
+        "insights": insights,
+    }
+
+
+def render_export_dataset_eda_markdown(
+    *,
+    export_dataset_eda: dict[str, Any],
+    export_root: Path,
+    source_data_path: Path,
+    report_path: Path | None,
+) -> str:
+    overview = cast(dict[str, Any], export_dataset_eda["overview"])
+    split_order = cast(list[str], overview.get("split_order", ["train", "val", "test"]))
+    split_summaries = cast(dict[str, dict[str, Any]], export_dataset_eda["split_summaries"])
+    insights = cast(list[str], export_dataset_eda.get("insights", []))
+
+    lines = [
+        "# 导出数据集 EDA 报告",
+        "",
+        "## 1. 基本信息",
+        f"- 导出目录：`{export_root}`",
+        f"- 源数据配置：`{source_data_path}`",
+        f"- 评估报告：`{report_path}`" if report_path is not None else "- 评估报告：dataset-only 模式",
+        f"- 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- 类别数：{overview['class_count']}",
+        f"- 图片数：{overview['images']}",
+        f"- 标签数：{overview['labels']}",
+        (
+            f"- 目标尺寸统计规则：small < 32^2 px，medium < 96^2 px，large >= 96^2 px"
+        ),
+        "",
+        "## 2. Split 总览",
+        "",
+        "| split | 图片数 | 标签数 | 平均每图标签 | 小目标 | 中目标 | 大目标 | 类别数 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for split_name in split_order:
+        split_entry = split_summaries.get(split_name, {})
+        if not split_entry:
+            continue
+        size_buckets = cast(dict[str, int], split_entry["size_buckets"])
+        lines.append(
+            f"| {split_name} | {split_entry['images']} | {split_entry['labels']} | "
+            f"{split_entry['avg_labels_per_image']:.4f} | {size_buckets['small']} | "
+            f"{size_buckets['medium']} | {size_buckets['large']} | {split_entry['class_count']} |"
+        )
+
+    all_entry = cast(dict[str, Any], export_dataset_eda["splits"]["all"])
+    all_size_buckets = cast(dict[str, int], all_entry["size_buckets"])
+    lines.extend(
+        [
+            f"| all | {all_entry['images']} | {all_entry['labels']} | {all_entry['avg_labels_per_image']:.4f} | "
+            f"{all_size_buckets['small']} | {all_size_buckets['medium']} | {all_size_buckets['large']} | {all_entry['class_count']} |",
+            "",
+            "## 3. 全量类别分布",
+            "",
+            "| 类别 | 图片数 | 标签数 | 小目标 | 中目标 | 大目标 | 平均每图标签 |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for class_entry in cast(dict[str, Any], export_dataset_eda["classes"]).values():
+        class_all = cast(dict[str, Any], class_entry["all"])
+        size_buckets = cast(dict[str, int], class_all["size_buckets"])
+        avg_labels_per_image = round(
+            class_all["labels"] / class_all["images"], 4
+        ) if class_all["images"] > 0 else 0.0
+        lines.append(
+            f"| {class_entry['name']} | {class_all['images']} | {class_all['labels']} | "
+            f"{size_buckets['small']} | {size_buckets['medium']} | {size_buckets['large']} | {avg_labels_per_image:.4f} |"
+        )
+
+    for split_name in split_order:
+        split_entry = cast(dict[str, Any], export_dataset_eda["splits"].get(split_name, {}))
+        split_classes = cast(dict[str, Any], split_entry.get("classes", {}))
+        lines.extend(
+            [
+                "",
+                f"## 4. {split_name} 类别明细",
+                "",
+                "| 类别 | 图片数 | 标签数 | 小目标 | 中目标 | 大目标 | 平均每图标签 |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for class_entry in split_classes.values():
+            size_buckets = cast(dict[str, int], class_entry["size_buckets"])
+            avg_labels_per_image = round(
+                class_entry["labels"] / class_entry["images"], 4
+            ) if class_entry["images"] > 0 else 0.0
+            lines.append(
+                f"| {class_entry['name']} | {class_entry['images']} | {class_entry['labels']} | "
+                f"{size_buckets['small']} | {size_buckets['medium']} | {size_buckets['large']} | {avg_labels_per_image:.4f} |"
+            )
+
+    lines.extend(
+        [
+            "",
+            "## 5. EDA 观察",
+        ]
+    )
+    for insight in insights:
+        lines.append(f"- {insight}")
+
+    for split_name in split_order:
+        split_entry = cast(dict[str, Any], export_dataset_eda["splits"].get(split_name, {}))
+        dense_images = cast(list[dict[str, Any]], split_entry.get("top_dense_images", []))
+        if not dense_images:
+            continue
+        lines.extend(
+            [
+                "",
+                f"## 6. {split_name} 高密度样本 Top 10",
+                "",
+                "| 图片 | 标签数 | 类别数 | 尺寸 |",
+                "|---|---:|---:|---|",
+            ]
+        )
+        for item in dense_images:
+            lines.append(
+                f"| {item['image']} | {item['labels']} | {item['class_count']} | "
+                f"{item['image_width']}x{item['image_height']} |"
+            )
+
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _report_matches_source_data(report_payload: dict[str, Any], source_data_path: Path) -> bool:
@@ -287,7 +747,7 @@ def export_filtered_dataset(
     max_boxes_per_class_per_image: int,
     box_density_penalty: float,
 ) -> Path:
-    total_stage_count = 10
+    total_stage_count = 11
     stage_idx = 0
     source_cfg = rt.load_data_config(source_data_path)
     source_root = Path(source_cfg["_root_dir"])
@@ -587,7 +1047,7 @@ def export_filtered_dataset(
         balance_ratio=effective_balance_ratio,
         target_images_per_class=effective_target_images_per_class,
         box_density_penalty=effective_box_density_penalty,
-        progress_callback=_make_live_progress_callback("Balanced Selection"),
+        progress_callback=_make_live_progress_callback("Balanced Selection", single_line=True),
     )
     stage_idx += 1
     _log_export_stage(
@@ -615,12 +1075,16 @@ def export_filtered_dataset(
         kept_class_ids=kept_class_ids,
     )
     stage_idx += 1
+    missing_coverage_counts = cast(dict[str, int], repartition_summary.get("missing_image_coverage_counts", {}))
+    limited_coverage_classes = cast(dict[int, int] | dict[str, int], repartition_summary.get("limited_coverage_classes", {}))
     _log_export_stage(
         "Repartition Ready",
         f"split_image_targets={split_image_targets}",
         f"assigned_train={len(selected_candidates_by_split.get('train', []))}",
         f"assigned_val={len(selected_candidates_by_split.get('val', []))}",
         f"assigned_test={len(selected_candidates_by_split.get('test', []))}",
+        f"missing_class_coverage={missing_coverage_counts}",
+        f"limited_coverage_classes={len(limited_coverage_classes)}",
         current=stage_idx,
         total=total_stage_count,
     )
@@ -674,6 +1138,19 @@ def export_filtered_dataset(
 
     source_class_summary = collect_candidate_class_summary(source_infos_by_split, kept_class_ids)
     exported_class_summary = collect_candidate_class_summary(selected_candidates_by_split, kept_class_ids)
+    export_dataset_eda = build_export_dataset_eda(
+        selected_candidates_by_split=selected_candidates_by_split,
+        kept_names=kept_names,
+        class_id_mapping=class_id_mapping,
+    )
+    split_image_targets_compact = {
+        split_name: split_image_targets.get(split_name, 0)
+        for split_name in ("train", "val", "test")
+    }
+    exported_split_stats = {
+        split_name: export_dataset_eda["split_summaries"].get(split_name, {})
+        for split_name in ("train", "val", "test")
+    }
 
     export_cfg = {
         "path": str(export_root),
@@ -686,6 +1163,29 @@ def export_filtered_dataset(
     }
     rt.dump_yaml(export_root / "data.yaml", export_cfg)
     (export_root / "classes.txt").write_text("\n".join(kept_names[idx] for idx in range(len(kept_names))) + "\n", encoding="utf-8")
+    export_dataset_tag = rt.dataset_tag_from_dir(source_root)
+    export_eda_json_path = export_root / f"export_dataset_eda_{export_dataset_tag}.json"
+    export_eda_md_path = export_root / f"export_dataset_eda_{export_dataset_tag}.md"
+    export_eda_markdown = render_export_dataset_eda_markdown(
+        export_dataset_eda=export_dataset_eda,
+        export_root=export_root,
+        source_data_path=source_data_path,
+        report_path=report_path,
+    )
+    export_eda_json_path.write_text(
+        json.dumps(export_dataset_eda, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    export_eda_md_path.write_text(export_eda_markdown + "\n", encoding="utf-8")
+    stage_idx += 1
+    _log_export_stage(
+        "EDA Report",
+        f"eda_json={export_eda_json_path}",
+        f"eda_markdown={export_eda_md_path}",
+        f"overview={export_dataset_eda['overview']['images']} images / {export_dataset_eda['overview']['labels']} labels",
+        current=stage_idx,
+        total=total_stage_count,
+    )
     resolved_report_resolution = report_resolution if report_resolution is not None else {}
     (export_root / "export_summary.json").write_text(
         json.dumps(
@@ -756,6 +1256,9 @@ def export_filtered_dataset(
                 "filter_summary": filter_summary,
                 "selection_summary": selection_summary,
                 "repartition_summary": repartition_summary,
+                "split_image_targets": split_image_targets_compact,
+                "selected_split_stats": exported_split_stats,
+                "exported_split_stats": exported_split_stats,
                 "source_class_summary": {
                     str(class_id): {
                         "name": safe_class_name(class_names, class_id),
@@ -776,6 +1279,9 @@ def export_filtered_dataset(
                     split_name: len(candidates)
                     for split_name, candidates in selected_candidates_by_split.items()
                 },
+                "export_dataset_eda_json": str(export_eda_json_path),
+                "export_dataset_eda_markdown": str(export_eda_md_path),
+                "export_dataset_eda": export_dataset_eda,
                 "copied_images": copied_images,
                 "copied_labels": copied_labels,
                 "export_root": str(export_root),
@@ -793,6 +1299,7 @@ def export_filtered_dataset(
         f"copied_labels={copied_labels}",
         f"export_root={export_root}",
         f"summary_json={export_root / 'export_summary.json'}",
+        f"eda_markdown={export_eda_md_path}",
         current=stage_idx,
         total=total_stage_count,
     )

@@ -2,7 +2,7 @@
 
 这个文件负责两种入口形式：
 - 交互模式：python launcher.py 后进入菜单
-- CLI 模式：python launcher.py infer/export ...
+- CLI 模式：python launcher.py infer/export/eda ...
 
 主要内容包括：
 - 读取用户输入
@@ -101,11 +101,20 @@ def list_recent_experiment_dirs(task: str, limit: int = 5) -> list[Path]:
     return rt.discover_recent_experiment_dirs(task, limit=limit, require_checkpoint=False)
 
 
-def list_experiment_dirs() -> list[Path]:
+def list_experiment_dirs(task: str | None = None) -> list[Path]:
     if not rt.EXPERIMENT_ROOT_DIR.exists():
         return []
     candidates = [path for path in rt.EXPERIMENT_ROOT_DIR.rglob("*") if rt.is_experiment_dir(path)]
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    if task is None:
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates
+    candidates.sort(
+        key=lambda p: (
+            p.stat().st_mtime,
+            1 if rt.is_task_experiment_dir(p, task) else 0,
+        ),
+        reverse=True,
+    )
     return candidates
 
 
@@ -242,12 +251,16 @@ def prompt_dataset_yaml(task: str, default: Path) -> Path:
         print("无效选择，请重新输入。")
 
 
-def prompt_experiment_dir(task: str, default: Path) -> Path:
-    all_dirs = list_experiment_dirs()
+def prompt_experiment_dir(task: str, default: Path, *, initial_keyword: str | None = None) -> Path:
+    all_dirs = list_experiment_dirs(task=task)
+    if not all_dirs:
+        all_dirs = list_experiment_dirs()
     if not all_dirs:
         return Path(prompt_text("实验目录", str(default)) or str(default))
 
-    visible_dirs = all_dirs
+    visible_dirs = filter_dirs_by_keyword(all_dirs, initial_keyword or "")
+    if not visible_dirs:
+        visible_dirs = all_dirs
     while True:
         print(f"\nout/ 下实验目录列表（递归扫描，当前任务: {task}）:")
         for idx, path in enumerate(visible_dirs, start=1):
@@ -371,7 +384,7 @@ def build_det_cli_preview(args: argparse.Namespace) -> str:
         if args.output_dir is not None:
             parts.extend(["--output-dir", str(args.output_dir)])
         parts.extend(["--score-threshold", str(args.score_threshold), "--device", str(args.device)])
-    else:
+    elif args.command == "export":
         if args.report_json is not None:
             parts.extend(["--report-json", str(args.report_json)])
         parts.extend(["--export-source-data", str(args.export_source_data)])
@@ -395,6 +408,12 @@ def build_det_cli_preview(args: argparse.Namespace) -> str:
         parts.extend(["--max-boxes-per-class-per-image", str(args.max_boxes_per_class_per_image)])
         parts.extend(["--box-density-penalty", str(args.box_density_penalty)])
         parts.extend(["--export-suffix", str(args.export_suffix)])
+    elif args.command == "eda":
+        parts.extend(["--data", str(args.data)])
+        if args.output_dir is not None:
+            parts.extend(["--output-dir", str(args.output_dir)])
+        if getattr(args, "overwrite", False):
+            parts.append("--overwrite")
     return " ".join(parts)
 
 
@@ -445,7 +464,9 @@ def build_interactive_args() -> argparse.Namespace | None:
     if task in {"cls", "seg"}:
         action_options.append(("eval", "eval 评估"))
     if task == "det":
+        action_options.append(("eda", "eda 数据集 EDA"))
         action_options.append(("export", "export 导出筛选数据集"))
+        action_options.append(("report", "report 生成实验报告"))
     action = prompt_choice(f"请选择 {task} 功能", action_options)
 
     if action == "train":
@@ -523,6 +544,20 @@ def build_interactive_args() -> argparse.Namespace | None:
             device=rt.DEFAULT_DEVICE,
         )
         return confirm_args("seg/eval", args)
+
+    if task == "det" and action == "eda":
+        output_dir_raw = prompt_text("输出目录 --output-dir，直接回车写入 out/EDA 自动目录", None)
+        args = argparse.Namespace(
+            tool_task="det",
+            tool_action="eda",
+            command="eda",
+            data=prompt_dataset_yaml("det", Path(rt.INFER_DEFAULT_DATA)),
+            output_dir=Path(output_dir_raw).expanduser() if output_dir_raw else None,
+            overwrite=prompt_yes_no("输出目录非空时是否允许覆盖 --overwrite", False) if output_dir_raw else False,
+        )
+        print("\nEDA 内容: split 对照、类别分布、不平衡分析、目标尺寸、框密度、分辨率和逐图清单。")
+        print(f"\n等价命令预览:\n  {build_det_cli_preview(args)}")
+        return confirm_args("det/eda", args)
 
     if task == "det" and action == "export":
         export_source_data = prompt_dataset_yaml("det", Path(rt.EXPORT_DEFAULT_SOURCE_DATA))
@@ -624,6 +659,18 @@ def build_interactive_args() -> argparse.Namespace | None:
         print(f"\n等价命令预览:\n  {build_det_cli_preview(args)}")
         return confirm_args("det/infer", args)
 
+    if task == "det" and action == "report":
+        args = argparse.Namespace(
+            tool_task="det",
+            tool_action="report",
+            command="report",
+            experiment_dir=prompt_experiment_dir("det", rt.INFER_DEFAULT_EXPERIMENT_DIR),
+            search=None,
+            output_dir=None,
+            dry_run=False,
+        )
+        return confirm_args("det/report", args)
+
     return None
 
 
@@ -698,6 +745,17 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     export_parser.add_argument("--box-density-penalty", type=float, default=rt.EXPORT_DEFAULT_BOX_DENSITY_PENALTY)
     export_parser.add_argument("--export-suffix", type=str, default=rt.EXPORT_DEFAULT_EXPORT_SUFFIX)
+
+    eda_parser = subparsers.add_parser("eda")
+    eda_parser.add_argument("--data", type=Path, default=rt.INFER_DEFAULT_DATA)
+    eda_parser.add_argument("--output-dir", type=Path, default=None)
+    eda_parser.add_argument("--overwrite", action="store_true", default=False)
+
+    report_parser = subparsers.add_parser("report")
+    report_parser.add_argument("--experiment-dir", type=Path, default=None)
+    report_parser.add_argument("--search", type=str, default=None)
+    report_parser.add_argument("--output-dir", type=Path, default=None)
+    report_parser.add_argument("--dry-run", action="store_true", default=False)
 
     args = parser.parse_args(argv)
     if args.command == "convert":

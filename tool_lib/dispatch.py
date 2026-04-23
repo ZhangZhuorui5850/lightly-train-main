@@ -23,6 +23,12 @@ def dispatch(args) -> None:
     if args.tool_task == "data" and args.tool_action == "convert":
         convert_tools.run_convert(args)
         return
+    if args.tool_task == "det" and args.tool_action == "report":
+        det_tools.run_report(args)
+        return
+    if args.tool_task == "det" and args.tool_action == "eda":
+        det_tools.run_eda(args)
+        return
     rt.import_runtime_dependencies()
 
     if args.tool_task == "cls":

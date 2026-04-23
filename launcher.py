@@ -15,6 +15,7 @@ COMMON_SETTINGS = {
     "out_dir": "out",
     "experiment_root_dir": "out",
     "infer_output_root_dir": "out/infer",
+    "eda_output_root_dir": "out/EDA",
     "report_archive_root_dir": "out/test_reports",
 }
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from .det_shared import *  # noqa: F401,F403
 from .det_analysis import *  # noqa: F401,F403
+from .det_eda import *  # noqa: F401,F403
 from .det_export import *  # noqa: F401,F403
 from .det_infer import *  # noqa: F401,F403
-
+from .det_report import *  # noqa: F401,F403

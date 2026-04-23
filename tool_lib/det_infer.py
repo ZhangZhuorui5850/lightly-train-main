@@ -20,6 +20,7 @@ from .det_shared import (
     relative_output_path,
     update_legacy_report_state,
 )
+from .det_report import generate_report_for_infer_output
 
 
 def get_input_samples(args) -> tuple[list[rt.ImageSample], dict[int, str], str]:
@@ -355,3 +356,9 @@ def run_infer(args) -> None:
         archive_path = rt.archive_report_copy(report_path)
         print(f"test_report saved to: {report_path}")
         print(f"test_report archived to: {archive_path}")
+        report_markdown_paths = generate_report_for_infer_output(
+            experiment_dir=rt.experiment_dir_from_checkpoint_path(checkpoint_path),
+            output_dir=args.output_dir,
+        )
+        for report_markdown_path in report_markdown_paths:
+            print(f"single_report saved to: {report_markdown_path}")
