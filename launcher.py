@@ -16,6 +16,7 @@ COMMON_SETTINGS = {
     "experiment_root_dir": "out",
     "infer_output_root_dir": "out",
     "eda_output_root_dir": "out/EDA",
+    "all_report_root_dir": "out/all_report",
 }
 
 # 检测配置：保留在一个地方，通过注释和空行分组

@@ -230,12 +230,23 @@ def _infer_data_root_from_run(primary_run: InferRunRecord, train_info: dict[str,
     return None
 
 
-def _build_report_filename(primary_run: InferRunRecord, train_info: dict[str, Any]) -> str:
+def _infer_date_tag_from_run(primary_run: InferRunRecord) -> str:
+    if primary_run.created_at:
+        try:
+            return datetime.fromisoformat(primary_run.created_at).strftime("%m%d")
+        except ValueError:
+            return _sanitize_report_name_fragment(primary_run.created_at[:10]).replace("-", "")[-4:]
+    return datetime.fromtimestamp(primary_run.mtime).strftime("%m%d")
+
+
+def _build_report_filename(primary_run: InferRunRecord, train_info: dict[str, Any], *, split_name: str | None = None) -> str:
     data_root = _infer_data_root_from_run(primary_run, train_info)
     dataset_name = _dataset_name_from_root(data_root)
+    date_tag = _infer_date_tag_from_run(primary_run)
+    split_suffix = f"_{_sanitize_report_name_fragment(split_name)}" if split_name else ""
     if dataset_name:
-        return f"{REPORT_BASENAME}_{dataset_name}.md"
-    return f"{REPORT_BASENAME}.md"
+        return f"{REPORT_BASENAME}_{date_tag}{split_suffix}_{dataset_name}.md"
+    return f"{REPORT_BASENAME}_{date_tag}{split_suffix}.md"
 
 
 def _extract_backbone_name(args_payload: dict[str, Any]) -> str:
@@ -291,7 +302,7 @@ def _build_lr_text(args_payload: dict[str, Any]) -> str:
         parts.append(f"scheduler_start_factor={float(scheduler_start_factor):g}")
     if parts:
         return ", ".join(parts)
-    return "见 `training_curve_lr.png`"
+    return "见 `training_dashboard.png`"
 
 
 def _build_lr_text_from_log(text: str) -> str | None:
@@ -390,9 +401,9 @@ def _parse_train_log(experiment_dir: Path) -> dict[str, Any]:
     if best_result is None:
         best_result = _extract_last_match(text, r"\]\[INFO\] The best validation metric\s+(.+?)\s+was reached\.$")
 
-    total_time_text = _extract_first_match(text, r"\]\[INFO\]\s+Total Time\s+:\s+(.+)$")
-    train_time_text = _extract_first_match(text, r"\]\[INFO\]\s+Train Time\s+:\s+(.+)$")
-    val_time_text = _extract_first_match(text, r"\]\[INFO\]\s+Val Time\s+:\s+(.+)$")
+    total_time_text = _extract_last_match(text, r"\]\[INFO\]\s+Total Time\s+:\s+(.+)$")
+    train_time_text = _extract_last_match(text, r"\]\[INFO\]\s+Train Time\s+:\s+(.+)$")
+    val_time_text = _extract_last_match(text, r"\]\[INFO\]\s+Val Time\s+:\s+(.+)$")
 
     return {
         "path": train_log_path,
@@ -773,8 +784,8 @@ def _build_overall_table(run: InferRunRecord) -> str:
 def _build_per_class_table(run: InferRunRecord) -> str:
     report_payload = run.report_payload or {}
     per_class_ap = report_payload.get("per_class_ap")
-    default_headers = ["类别名称 (Label)", "GT", "Pred", "AP@0.5"]
-    default_align = ["---", "---:", "---:", "---:"]
+    default_headers = ["类别名称 (Label)", "GT", "Pred", "Precision@0.5", "Recall@0.5", "AP@0.5"]
+    default_align = ["---", "---:", "---:", "---:", "---:", "---:"]
     if not isinstance(per_class_ap, dict) or not per_class_ap:
         return (
             f"| {' | '.join(default_headers)} |\n"
@@ -786,6 +797,8 @@ def _build_per_class_table(run: InferRunRecord) -> str:
         ("name", "类别名称 (Label)", lambda value, class_id: str(value) if isinstance(value, str) and value.strip() else f"class_{class_id}", "---"),
         ("gt", "GT", lambda value, _class_id: _format_count(value), "---:"),
         ("pred", "Pred", lambda value, _class_id: _format_count(value), "---:"),
+        ("precision", "Precision@0.5", lambda value, _class_id: _format_metric(value), "---:"),
+        ("recall", "Recall@0.5", lambda value, _class_id: _format_metric(value), "---:"),
         ("ap", "AP@0.5", lambda value, _class_id: _format_metric(value), "---:"),
     ]
 
@@ -999,7 +1012,7 @@ def _render_report(
             _build_overall_table(primary_run),
             "",
             "### 2. 具体类别（Label）准确度",
-            "> 每个类别的指标直接来自对应 split 的 `test_report.per_class_ap`，并按 AP@0.5 从低到高排序。",
+            "> 每个类别的指标直接来自对应 split 的 `test_report.per_class_ap`，其中 Precision@0.5 和 Recall@0.5 由该类别的 TP、Pred、GT 计算，并按 AP@0.5 从低到高排序。",
             "",
         ]
     )
@@ -1026,7 +1039,7 @@ def _render_report(
             "",
             "## 五、附件",
             "",
-            "- 训练曲线文件：`training_curve_loss.png`、`training_curve_map.png`、`training_curve_lr.png`、`training_dashboard.png`",
+            "- 训练总览图：`training_dashboard.png`",
             f"- 当前主结果目录：`{_display_path(primary_run.output_dir)}`",
         ]
     )
@@ -1037,6 +1050,7 @@ def generate_experiment_report(
     *,
     experiment_dir: Path,
     output_dir: Path | None = None,
+    only_output_dir: Path | None = None,
     write_all_infer_dirs: bool = False,
     dry_run: bool = False,
 ) -> list[Path]:
@@ -1050,30 +1064,44 @@ def generate_experiment_report(
             f"No det infer results with run_meta.json were found for experiment: {resolved_experiment_dir}"
         )
 
-    primary_run = _pick_primary_run(infer_runs)
     split_runs = _latest_runs_by_split(infer_runs)
     train_info = _parse_train_log(resolved_experiment_dir)
-    report_text = _render_report(
-        experiment_dir=resolved_experiment_dir,
-        primary_run=primary_run,
-        split_runs=split_runs,
-        train_info=train_info,
-    )
-    report_filename = _build_report_filename(primary_run, train_info)
 
     if output_dir is not None:
         target_dirs = [output_dir.expanduser().resolve()]
     else:
-        target_dirs = [resolved_experiment_dir]
+        target_dirs = [rt.experiment_important_dir(resolved_experiment_dir)]
+
+    if only_output_dir is not None:
+        resolved_only_output_dir = only_output_dir.expanduser().resolve()
+        report_runs = [run for run in infer_runs if run.output_dir.expanduser().resolve() == resolved_only_output_dir]
+    else:
+        report_runs = [run for run in split_runs if run.split in {"test", "val"}]
+    if not report_runs:
+        report_runs = [_pick_primary_run(infer_runs)]
 
     output_paths: list[Path] = []
     for target_dir in target_dirs:
-        report_path = target_dir / report_filename
-        output_paths.append(report_path)
-        if dry_run:
-            continue
-        target_dir.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(report_text, encoding="utf-8")
+        for primary_run in report_runs:
+            report_text = _render_report(
+                experiment_dir=resolved_experiment_dir,
+                primary_run=primary_run,
+                split_runs=split_runs,
+                train_info=train_info,
+            )
+            report_filename = _build_report_filename(
+                primary_run,
+                train_info,
+                split_name=primary_run.split,
+            )
+            report_path = target_dir / report_filename
+            output_paths.append(report_path)
+            if dry_run:
+                continue
+            target_dir.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(report_text, encoding="utf-8")
+    if not dry_run and any(target_dir == rt.experiment_important_dir(resolved_experiment_dir) for target_dir in target_dirs):
+        rt.sync_important_to_all_report(resolved_experiment_dir)
     return output_paths
 
 
@@ -1081,6 +1109,7 @@ def generate_report_for_infer_output(*, experiment_dir: Path, output_dir: Path) 
     return generate_experiment_report(
         experiment_dir=experiment_dir,
         output_dir=output_dir,
+        only_output_dir=output_dir,
         write_all_infer_dirs=False,
         dry_run=False,
     )

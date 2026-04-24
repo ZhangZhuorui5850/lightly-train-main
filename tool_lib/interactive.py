@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from pathlib import Path
 
@@ -157,7 +158,180 @@ def filter_dirs_by_keyword(dirs: list[Path], keyword: str) -> list[Path]:
     ]
 
 
-def list_dataset_yaml_candidates(task: str | None = None) -> list[Path]:
+def _normalize_search_text(text: str) -> str:
+    return re.sub(r"[^0-9a-z]+", " ", text.lower())
+
+
+def _tokenize_path_text(text: str) -> set[str]:
+    stop_words = {
+        "all",
+        "best",
+        "checkpoint",
+        "checkpoints",
+        "data",
+        "dataset",
+        "datasets",
+        "det",
+        "eval",
+        "export",
+        "exported",
+        "image",
+        "images",
+        "important",
+        "infer",
+        "label",
+        "labels",
+        "last",
+        "manual",
+        "models",
+        "out",
+        "report",
+        "results",
+        "run",
+        "runs",
+        "split",
+        "test",
+        "train",
+        "val",
+    }
+    normalized = _normalize_search_text(text)
+    return {
+        token
+        for token in normalized.split()
+        if token and token not in stop_words and (len(token) >= 3 or token.isdigit())
+    }
+
+
+def _load_json_dict(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _extract_json_block(text: str, marker: str) -> dict[str, object]:
+    marker_index = text.find(marker)
+    if marker_index < 0:
+        return {}
+    start = text.find("{", marker_index)
+    if start < 0:
+        return {}
+
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    payload = json.loads(text[start : index + 1])
+                except json.JSONDecodeError:
+                    return {}
+                return payload if isinstance(payload, dict) else {}
+    return {}
+
+
+def _resolve_existing_path(path_text: object) -> Path | None:
+    if not isinstance(path_text, str) or not path_text.strip():
+        return None
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        path = (rt.ROOT_DIR / path).resolve()
+    else:
+        path = path.resolve()
+    return path if path.exists() else None
+
+
+def _dataset_preferences_from_experiment(experiment_dir: Path | None) -> tuple[set[Path], set[Path], set[str]]:
+    preferred_yaml_paths: set[Path] = set()
+    preferred_root_dirs: set[Path] = set()
+    preferred_tokens: set[str] = set()
+
+    if experiment_dir is None:
+        return preferred_yaml_paths, preferred_root_dirs, preferred_tokens
+
+    resolved_experiment_dir = experiment_dir.expanduser().resolve()
+    preferred_tokens |= _tokenize_path_text(resolved_experiment_dir.name)
+    preferred_tokens |= _tokenize_path_text(str(resolved_experiment_dir.relative_to(rt.ROOT_DIR)))
+
+    train_log_path = resolved_experiment_dir / "train.log"
+    if train_log_path.exists():
+        text = train_log_path.read_text(encoding="utf-8", errors="ignore")
+        args_payload = _extract_json_block(text, "Args:")
+        data_payload = args_payload.get("data")
+        if isinstance(data_payload, dict):
+            data_root = _resolve_existing_path(data_payload.get("path"))
+            if data_root is not None:
+                preferred_root_dirs.add(data_root)
+                preferred_yaml_paths.add((data_root / "data.yaml").resolve())
+                preferred_tokens |= _tokenize_path_text(data_root.name)
+                preferred_tokens |= _tokenize_path_text(data_root.parent.name)
+
+    search_roots: list[Path] = [resolved_experiment_dir]
+    if rt.TEST_OUTPUT_ROOT_DIR.exists() and rt.TEST_OUTPUT_ROOT_DIR != resolved_experiment_dir:
+        search_roots.append(rt.TEST_OUTPUT_ROOT_DIR)
+
+    seen_run_meta_paths: set[Path] = set()
+    for search_root in search_roots:
+        for run_meta_path in search_root.rglob("run_meta.json"):
+            resolved_run_meta_path = run_meta_path.resolve()
+            if resolved_run_meta_path in seen_run_meta_paths:
+                continue
+            seen_run_meta_paths.add(resolved_run_meta_path)
+            payload = _load_json_dict(run_meta_path)
+            if payload.get("task") != "det" or payload.get("action") != "infer":
+                continue
+            paths_payload = payload.get("paths")
+            if not isinstance(paths_payload, dict):
+                continue
+            recorded_experiment_dir = _resolve_existing_path(paths_payload.get("experiment_dir"))
+            if recorded_experiment_dir != resolved_experiment_dir:
+                continue
+            data_yaml_path = _resolve_existing_path(paths_payload.get("data_yaml"))
+            if data_yaml_path is not None:
+                preferred_yaml_paths.add(data_yaml_path)
+                preferred_root_dirs.add(data_yaml_path.parent.resolve())
+            data_root = _resolve_existing_path(paths_payload.get("data_root"))
+            if data_root is not None:
+                preferred_root_dirs.add(data_root)
+                preferred_yaml_paths.add((data_root / "data.yaml").resolve())
+                preferred_tokens |= _tokenize_path_text(data_root.name)
+                preferred_tokens |= _tokenize_path_text(data_root.parent.name)
+
+    return preferred_yaml_paths, preferred_root_dirs, preferred_tokens
+
+
+def _dataset_candidate_sort_key(
+    candidate: Path,
+    *,
+    preferred_yaml_paths: set[Path],
+    preferred_root_dirs: set[Path],
+    preferred_tokens: set[str],
+) -> tuple[int, int, str]:
+    resolved_candidate = candidate.resolve()
+    candidate_root = resolved_candidate.parent
+    candidate_tokens = _tokenize_path_text(str(candidate_root.relative_to(rt.ROOT_DIR)))
+    token_overlap = len(candidate_tokens & preferred_tokens)
+
+    relevance_score = 0
+    if resolved_candidate in preferred_yaml_paths:
+        relevance_score += 1000
+    if candidate_root in preferred_root_dirs:
+        relevance_score += 800
+    if token_overlap:
+        relevance_score += token_overlap * 20
+
+    return (relevance_score, int(resolved_candidate.stat().st_mtime), str(resolved_candidate).lower())
+
+
+def list_dataset_yaml_candidates(
+    task: str | None = None,
+    *,
+    preferred_experiment_dir: Path | None = None,
+) -> list[Path]:
     dataset_roots = list(rt.ROOT_DIR.glob("datasets/**/data.yaml"))
     candidates: list[Path] = []
     for path in dataset_roots:
@@ -170,7 +344,19 @@ def list_dataset_yaml_candidates(task: str | None = None) -> list[Path]:
         if task == "seg" and "dataset_seg" not in parent_name and "seg" not in path_text:
             continue
         candidates.append(path.resolve())
-    candidates.sort(key=lambda p: (p.stat().st_mtime, str(p).lower()), reverse=True)
+
+    preferred_yaml_paths, preferred_root_dirs, preferred_tokens = _dataset_preferences_from_experiment(
+        preferred_experiment_dir
+    )
+    candidates.sort(
+        key=lambda path: _dataset_candidate_sort_key(
+            path,
+            preferred_yaml_paths=preferred_yaml_paths,
+            preferred_root_dirs=preferred_root_dirs,
+            preferred_tokens=preferred_tokens,
+        ),
+        reverse=True,
+    )
     return candidates
 
 
@@ -217,8 +403,8 @@ def prompt_directory_name(prompt: str, default: str) -> str:
         return name
 
 
-def prompt_dataset_yaml(task: str, default: Path) -> Path:
-    candidates = list_dataset_yaml_candidates(task=task)
+def prompt_dataset_yaml(task: str, default: Path, *, preferred_experiment_dir: Path | None = None) -> Path:
+    candidates = list_dataset_yaml_candidates(task=task, preferred_experiment_dir=preferred_experiment_dir)
     if not candidates:
         return Path(prompt_text("数据配置 --data", str(default)) or str(default))
 
@@ -317,11 +503,19 @@ def _det_export_strategy_text(label: str, value, *, enabled: bool = True) -> str
 def print_det_export_preview(args: argparse.Namespace) -> None:
     print("\ndet/export 输入确认")
     report_value = "(auto)" if args.report_json is None else compact_display_value(args.report_json)
+    if args.export_suffix == rt.EXPORT_DEFAULT_EXPORT_SUFFIX:
+        if int(args.target_total_images) > 0:
+            export_name_preview = rt.default_det_export_dir_suffix(image_count=int(args.target_total_images))
+        else:
+            export_name_preview = f"{rt.EXPORT_DEFAULT_EXPORT_SUFFIX}_<实际导出图数>"
+    else:
+        export_name_preview = str(args.export_suffix)
     print(f"  export_source_data: {compact_display_value(args.export_source_data)}")
     print(f"  report_json: {report_value}")
     print(f"  target_total_images: {compact_display_value(args.target_total_images)}")
     print(f"  split_ratio: {compact_display_value(args.split_ratio)}")
     print(f"  export_suffix: {compact_display_value(args.export_suffix)}")
+    print(f"  export_dir_name: <dataset>{export_name_preview}")
 
     print("\n自动分析策略")
     print(f"  auto_balance: {'开启' if args.auto_balance else '关闭'}")
@@ -358,7 +552,7 @@ def print_default_det_infer_summary(*, mode: str, data_path: Path | None = None)
     print("  save_visualization: True")
     print("  save_json: False")
     print("  save_txt: False")
-    split_text = "交互选择 test / val / all" if mode == "dataset" else "(not used)"
+    split_text = "交互选择 train / test / val / all" if mode == "dataset" else "(not used)"
     print(f"  split: {split_text}")
     selected_data = data_path if data_path is not None else rt.INFER_DEFAULT_DATA
     default_data = compact_display_path(selected_data) if mode == "dataset" else "(not used)"
@@ -367,30 +561,21 @@ def print_default_det_infer_summary(*, mode: str, data_path: Path | None = None)
     print(f"  report_path: {'(auto)' if mode == 'dataset' else '(not used)'}")
     print(f"  compute_metrics: {'True' if mode == 'dataset' else 'False'}")
     print(f"  save_test_report: {'True' if mode == 'dataset' else 'False'}")
+    print(f"  bad_class_map50_threshold: {rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD}")
     print("  metric_classwise: False")
     print("  overwrite: False")
-
-
-def _guess_det_dataset_dir_from_data_yaml(data_path: Path) -> Path:
-    return data_path.expanduser().resolve().parent
 
 
 def _collect_existing_det_infer_outputs(
     *,
     experiment_dir: Path,
     data_path: Path,
-    splits: tuple[str, ...] = ("test", "val"),
+    splits: tuple[str, ...] = ("train", "test", "val"),
 ) -> dict[str, Path]:
     try:
-        checkpoint_path = rt.resolve_checkpoint_path(None, experiment_dir)
-        dataset_dir = _guess_det_dataset_dir_from_data_yaml(data_path)
         existing: dict[str, Path] = {}
         for split in splits:
-            output_dir = rt.derive_det_run_dir(
-                checkpoint_path=checkpoint_path,
-                dataset_dir=dataset_dir,
-                split=split,
-            )
+            output_dir = experiment_dir.expanduser().resolve() / "infer" / split
             if output_dir.exists() and any(output_dir.iterdir()):
                 existing[split] = output_dir
         return existing
@@ -410,6 +595,7 @@ def prompt_det_infer_split(*, experiment_dir: Path, data_path: Path) -> str:
     return prompt_choice(
         "请选择数据集划分 --split",
         [
+            ("train", "train"),
             ("test", "test"),
             ("val", "val"),
             ("all", "all (test + val)"),
@@ -432,6 +618,12 @@ def build_det_cli_preview(args: argparse.Namespace) -> str:
         if args.output_dir is not None:
             parts.extend(["--output-dir", str(args.output_dir)])
         parts.extend(["--score-threshold", str(args.score_threshold), "--device", str(args.device)])
+        parts.extend(
+            [
+                "--bad-class-map50-threshold",
+                str(getattr(args, "bad_class_map50_threshold", rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD)),
+            ]
+        )
     elif args.command == "export":
         if args.report_json is not None:
             parts.extend(["--report-json", str(args.report_json)])
@@ -655,7 +847,15 @@ def build_interactive_args() -> argparse.Namespace | None:
         experiment_dir = prompt_experiment_dir("det", rt.INFER_DEFAULT_EXPERIMENT_DIR)
         mode = prompt_choice("请选择输入方式", [("dataset", "dataset 数据集评测模式"), ("image", "image 单张图片"), ("image_dir", "image_dir 文件夹批量推理")])
         is_dataset_mode = mode == "dataset"
-        data_path = prompt_dataset_yaml("det", Path(rt.INFER_DEFAULT_DATA)) if is_dataset_mode else None
+        data_path = (
+            prompt_dataset_yaml(
+                "det",
+                Path(rt.INFER_DEFAULT_DATA),
+                preferred_experiment_dir=experiment_dir,
+            )
+            if is_dataset_mode
+            else None
+        )
         config_mode = prompt_choice(
             "请选择 infer 配置方式",
             [
@@ -698,6 +898,12 @@ def build_interactive_args() -> argparse.Namespace | None:
                 prompt_yes_no("是否输出按类指标 --metric-classwise", False) if use_custom else False
             ),
             report_iou_threshold=rt.INFER_DEFAULT_REPORT_IOU_THRESHOLD,
+            bad_class_map50_threshold=prompt_float(
+                "差类别 AP@0.5 阈值 --bad-class-map50-threshold",
+                rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD,
+            )
+            if use_custom
+            else rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD,
             save_test_report=is_dataset_mode,
             report_path=None,
             overwrite=prompt_yes_no("输出目录非空时是否允许覆盖 --overwrite", False)
@@ -752,7 +958,7 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     infer_input.add_argument("--image", type=Path, default=rt.INFER_DEFAULT_IMAGE)
     infer_input.add_argument("--image-dir", type=Path, default=None)
     infer_input.add_argument("--data", type=Path, default=None)
-    infer_parser.add_argument("--split", choices=("val", "test", "all"), default=rt.INFER_DEFAULT_SPLIT)
+    infer_parser.add_argument("--split", choices=("train", "val", "test", "all"), default=rt.INFER_DEFAULT_SPLIT)
     infer_parser.add_argument("--output-dir", type=Path, default=None)
     infer_parser.add_argument("--score-threshold", type=float, default=rt.INFER_DEFAULT_SCORE_THRESHOLD)
     infer_parser.add_argument("--device", type=str, default=rt.INFER_DEFAULT_DEVICE)
@@ -762,6 +968,11 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     infer_parser.add_argument("--save-json", action="store_true", default=rt.INFER_DEFAULT_SAVE_JSON)
     infer_parser.add_argument("--save-txt", action="store_true", default=rt.INFER_DEFAULT_SAVE_TXT)
     infer_parser.add_argument("--report-iou-threshold", type=float, default=rt.INFER_DEFAULT_REPORT_IOU_THRESHOLD)
+    infer_parser.add_argument(
+        "--bad-class-map50-threshold",
+        type=float,
+        default=rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD,
+    )
     infer_parser.add_argument("--compute-metrics", action="store_true", default=rt.INFER_DEFAULT_COMPUTE_METRICS)
     infer_parser.add_argument("--metric-classwise", action="store_true", default=rt.INFER_DEFAULT_METRIC_CLASSWISE)
     infer_parser.add_argument("--save-test-report", action="store_true", default=rt.INFER_DEFAULT_SAVE_TEST_REPORT)

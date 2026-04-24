@@ -754,7 +754,8 @@ def export_filtered_dataset(
     stage_idx = 0
     source_cfg = rt.load_data_config(source_data_path)
     source_root = Path(source_cfg["_root_dir"])
-    export_root = source_root.parent / f"{source_root.name}{export_suffix}"
+    temp_export_root = rt.deduplicate_path(source_root.parent / f"{source_root.name}__export_tmp")
+    export_root = temp_export_root
     export_root.mkdir(parents=True, exist_ok=True)
     stage_idx += 1
     _log_export_stage(
@@ -1138,6 +1139,15 @@ def export_filtered_dataset(
                 f"latest={candidate.rel_path.as_posix()}",
                 end="\r" if copied_images < total_copy_items else "\n",
             )
+
+    resolved_export_suffix = rt.resolve_det_export_dir_suffix(
+        export_suffix=export_suffix,
+        image_count=copied_images,
+    )
+    final_export_root = rt.deduplicate_path(source_root.parent / f"{source_root.name}{resolved_export_suffix}")
+    if final_export_root != export_root:
+        export_root.rename(final_export_root)
+        export_root = final_export_root
 
     source_class_summary = collect_candidate_class_summary(source_infos_by_split, kept_class_ids)
     exported_class_summary = collect_candidate_class_summary(selected_candidates_by_split, kept_class_ids)

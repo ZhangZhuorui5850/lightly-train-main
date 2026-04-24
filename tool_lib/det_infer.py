@@ -23,6 +23,7 @@ from .det_shared import (
     gt_records,
     load_ground_truth,
     prediction_records,
+    read_yolo_label_lines,
     relative_output_path,
     update_legacy_report_state,
 )
@@ -59,6 +60,34 @@ def get_input_samples(args) -> tuple[list[rt.ImageSample], dict[int, str], str]:
     samples, class_names = rt.list_dataset_samples(data_cfg=data_cfg, split=args.split)
     return filter_samples_for_shard(samples, args), class_names, "dataset"
 
+
+def important_dir_from_checkpoint(checkpoint_path: Path) -> Path:
+    experiment_dir = rt.experiment_dir_from_checkpoint_path(checkpoint_path)
+    return rt.experiment_important_dir(experiment_dir)
+
+
+def build_important_dashboard_path(checkpoint_path: Path) -> Path:
+    return important_dir_from_checkpoint(checkpoint_path) / rt.TRAINING_CURVE_FILENAMES["dashboard"]
+
+
+def sync_important_artifacts(checkpoint_path: Path) -> Path | None:
+    experiment_dir = rt.experiment_dir_from_checkpoint_path(checkpoint_path)
+    _, _, dashboard_path = rt.sync_training_summary_artifacts(experiment_dir)
+    return dashboard_path
+
+
+def copy_infer_artifacts_to_important(checkpoint_path: Path, artifact_paths: list[Path]) -> list[Path]:
+    experiment_dir = rt.experiment_dir_from_checkpoint_path(checkpoint_path)
+    important_dir = rt.experiment_important_dir(experiment_dir)
+    copied_paths: list[Path] = []
+    for artifact_path in artifact_paths:
+        copied_path = rt.copy_file_if_exists(artifact_path, important_dir / artifact_path.name)
+        if copied_path is not None:
+            copied_paths.append(copied_path)
+    if copied_paths:
+        rt.sync_important_to_all_report(experiment_dir)
+    return copied_paths
+
 def ensure_object_detection_model(model: Any) -> None:
     class_name = model.__class__.__name__.lower()
     if "objectdetection" not in class_name:
@@ -79,6 +108,156 @@ def save_prediction_txt(txt_path: Path, records: list[dict[str, Any]]) -> None:
         )
     txt_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
+
+def sanitize_bad_image_class_name(value: str) -> str:
+    cleaned = []
+    for ch in str(value).strip():
+        if ch.isalnum() or ch in {"-", "_"}:
+            cleaned.append(ch)
+        else:
+            cleaned.append("-")
+    text = "".join(cleaned).strip("-_")
+    while "--" in text:
+        text = text.replace("--", "-")
+    return text or "class"
+
+
+def select_bad_classes_from_report(
+    report_payload: dict[str, Any],
+    *,
+    threshold: float,
+) -> dict[int, dict[str, Any]]:
+    per_class_ap = report_payload.get("per_class_ap", {})
+    if not isinstance(per_class_ap, dict):
+        return {}
+
+    bad_classes: dict[int, dict[str, Any]] = {}
+    for class_id_raw, info in per_class_ap.items():
+        if not isinstance(info, dict):
+            continue
+        try:
+            class_id = int(class_id_raw)
+            ap = float(info.get("ap", 0.0))
+            gt_count = int(info.get("gt", 0))
+        except (TypeError, ValueError):
+            continue
+        if gt_count > 0 and ap < threshold:
+            bad_classes[class_id] = {
+                "class_id": class_id,
+                "class_name": str(info.get("name") or f"class_{class_id}"),
+                "ap": ap,
+                "gt": gt_count,
+                "pred": int(info.get("pred", 0) or 0),
+                "tp": int(info.get("tp", 0) or 0),
+            }
+    return bad_classes
+
+
+def export_bad_class_images(
+    *,
+    args,
+    output_dir: Path,
+    report_path: Path,
+    data_cfg: dict[str, Any] | None,
+    split: str,
+    samples: list[rt.ImageSample] | None = None,
+) -> dict[str, Any]:
+    threshold = float(getattr(args, "bad_class_map50_threshold", rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD))
+    bad_images_dir = output_dir / "bad_images"
+    manifest_csv_path = bad_images_dir / "manifest.csv"
+    manifest_json_path = bad_images_dir / "manifest.json"
+    bad_images_dir.mkdir(parents=True, exist_ok=True)
+
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    bad_classes = select_bad_classes_from_report(report_payload, threshold=threshold)
+
+    if samples is None and data_cfg is not None:
+        samples, _ = rt.list_dataset_samples(data_cfg=data_cfg, split=split)
+    samples = samples or []
+
+    exported_rows: list[dict[str, Any]] = []
+    skipped_visualizations = 0
+    counters: dict[int, int] = defaultdict(int)
+    for sample in samples:
+        if sample.label_path is None:
+            continue
+        _, class_box_counts = read_yolo_label_lines(sample.label_path)
+        matching_class_ids = [class_id for class_id in sorted(class_box_counts) if class_id in bad_classes]
+        if not matching_class_ids:
+            continue
+
+        source_visualization_path = output_dir / "images" / relative_output_path(
+            sample,
+            rt.visualization_suffix(sample.image_path),
+        )
+        if not source_visualization_path.exists():
+            skipped_visualizations += len(matching_class_ids)
+            continue
+
+        for class_id in matching_class_ids:
+            info = bad_classes[class_id]
+            counters[class_id] += 1
+            class_name = str(info["class_name"])
+            safe_class_name = sanitize_bad_image_class_name(class_name)
+            suffix = source_visualization_path.suffix or rt.visualization_suffix(sample.image_path)
+            export_image_path = bad_images_dir / f"{safe_class_name}_{counters[class_id]}{suffix}"
+            while export_image_path.exists():
+                counters[class_id] += 1
+                export_image_path = bad_images_dir / f"{safe_class_name}_{counters[class_id]}{suffix}"
+            shutil.copy2(source_visualization_path, export_image_path)
+            exported_rows.append(
+                {
+                    "split": split,
+                    "image": sample.relative_path.as_posix(),
+                    "class_id": class_id,
+                    "class_name": class_name,
+                    "ap": info["ap"],
+                    "gt": info["gt"],
+                    "pred": info["pred"],
+                    "tp": info["tp"],
+                    "source_image_path": str(sample.image_path),
+                    "source_label_path": str(sample.label_path),
+                    "source_visualization_path": str(source_visualization_path),
+                    "export_image_path": str(export_image_path),
+                }
+            )
+
+    summary = {
+        "directory": str(bad_images_dir),
+        "threshold": threshold,
+        "split": split,
+        "bad_class_count": len(bad_classes),
+        "exported_count": len(exported_rows),
+        "skipped_visualizations": skipped_visualizations,
+        "bad_classes": list(bad_classes.values()),
+        "manifest_csv": str(manifest_csv_path),
+        "manifest_json": str(manifest_json_path),
+    }
+    rt.save_records_csv(
+        manifest_csv_path,
+        exported_rows,
+        [
+            "split",
+            "image",
+            "class_id",
+            "class_name",
+            "ap",
+            "gt",
+            "pred",
+            "tp",
+            "source_image_path",
+            "source_label_path",
+            "source_visualization_path",
+            "export_image_path",
+        ],
+    )
+    manifest_json_path.write_text(
+        json.dumps({"summary": summary, "samples": exported_rows}, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    print(f"bad_images saved to: {bad_images_dir}")
+    return summary
+
 def write_run_meta(
     meta_path: Path,
     *,
@@ -89,9 +268,11 @@ def write_run_meta(
     args,
     data_cfg: dict[str, Any] | None,
     num_images: int,
-    copied_curve_paths: list[Path],
+    dashboard_path: Path | None,
 ) -> None:
     experiment_dir = rt.experiment_dir_from_checkpoint_path(checkpoint_path)
+    important_dir = important_dir_from_checkpoint(checkpoint_path)
+    temp_dir = rt.infer_temp_dir(output_dir)
     payload = {
         "task": "det",
         "action": "infer",
@@ -105,6 +286,8 @@ def write_run_meta(
             "report_path": str(report_path),
             "checkpoint_path": str(checkpoint_path),
             "experiment_dir": str(experiment_dir),
+            "important_dir": str(important_dir),
+            "temp_dir": str(temp_dir),
             "data_yaml": str(args.data.expanduser().resolve()) if args.data is not None else None,
             "data_root": str(data_cfg["_root_dir"]) if data_cfg is not None else None,
             "image": str(args.image.expanduser().resolve()) if args.image is not None else None,
@@ -114,6 +297,11 @@ def write_run_meta(
             "device": args.device,
             "score_threshold": args.score_threshold,
             "report_iou_threshold": args.report_iou_threshold,
+            "bad_class_map50_threshold": getattr(
+                args,
+                "bad_class_map50_threshold",
+                rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD,
+            ),
             "save_visualization": args.save_visualization,
             "save_json": args.save_json,
             "save_txt": args.save_txt,
@@ -124,7 +312,8 @@ def write_run_meta(
         },
         "artifacts": {
             "metrics_summary": str(output_dir / "metrics_summary.json") if args.data is not None else None,
-            "training_curves": [str(path) for path in copied_curve_paths],
+            "bad_images": str(output_dir / "bad_images") if args.data is not None and args.save_visualization else None,
+            "training_dashboard": str(dashboard_path) if dashboard_path is not None else None,
         },
     }
     meta_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -141,24 +330,32 @@ def print_dry_run_summary(
     num_images: int,
 ) -> None:
     experiment_dir = rt.experiment_dir_from_checkpoint_path(checkpoint_path)
+    important_dir = important_dir_from_checkpoint(checkpoint_path)
+    temp_dir = rt.infer_temp_dir(output_dir)
+    report_target = build_split_report_path(
+        args=args,
+        output_dir=output_dir,
+        split=getattr(args, "split", None),
+        checkpoint_path=checkpoint_path,
+    )
     planned_artifacts = [
         run_meta_path,
-        output_dir / "training_curve_loss.png",
-        output_dir / "training_curve_map.png",
-        output_dir / "training_curve_lr.png",
-        output_dir / "training_dashboard.png",
+        important_dir / "train.log",
+        build_important_dashboard_path(checkpoint_path),
     ]
     if args.save_visualization:
         planned_artifacts.append(output_dir / "images")
     if args.save_json:
-        planned_artifacts.append(output_dir / "json")
+        planned_artifacts.append(temp_dir / "json")
     if args.save_txt:
-        planned_artifacts.append(output_dir / "txt")
+        planned_artifacts.append(temp_dir / "txt")
     if args.data is not None:
         planned_artifacts.append(output_dir / "metrics_summary.json")
     if args.save_test_report:
-        planned_artifacts.append(report_path)
-        planned_artifacts.append(rt.experiment_dir_from_checkpoint_path(checkpoint_path) / "single_report.md")
+        planned_artifacts.append(report_target)
+        planned_artifacts.append(important_dir / report_target.name)
+        if args.save_visualization:
+            planned_artifacts.append(output_dir / "bad_images")
 
     print("[dry-run] detection infer plan")
     print(f"  checkpoint: {checkpoint_path}")
@@ -174,7 +371,7 @@ def print_dry_run_summary(
     if args.image_dir is not None:
         print(f"  image_dir: {args.image_dir.expanduser().resolve()}")
     print(f"  output_dir: {output_dir}")
-    print(f"  report_path: {report_path}")
+    print(f"  report_path: {report_target}")
     print(f"  run_meta: {run_meta_path}")
     print("  planned_artifacts:")
     for artifact in planned_artifacts:
@@ -233,15 +430,19 @@ def build_split_output_dir(
     if args.output_dir is not None:
         return args.output_dir / split if split_mode == "all" else args.output_dir
 
-    dataset_dir = rt.DATASET_DIR if data_cfg is None else data_cfg["_root_dir"]
-    return rt.derive_det_run_dir(
-        checkpoint_path=checkpoint_path,
-        dataset_dir=Path(dataset_dir),
-        split=split,
-    )
+    experiment_dir = rt.experiment_dir_from_checkpoint_path(checkpoint_path)
+    if data_cfg is None:
+        return experiment_dir / "infer"
+    return experiment_dir / "infer" / split
 
 
-def build_split_report_path(*, args, output_dir: Path, split: str) -> Path:
+def build_split_report_path(
+    *,
+    args,
+    output_dir: Path,
+    split: str,
+    checkpoint_path: Path | None = None,
+) -> Path:
     split_mode = getattr(args, "requested_split", getattr(args, "split", None))
     if args.report_path is None:
         return rt.build_det_report_path(output_dir)
@@ -388,6 +589,8 @@ def build_parallel_child_command(
             str(args.score_threshold),
             "--report-iou-threshold",
             str(args.report_iou_threshold),
+            "--bad-class-map50-threshold",
+            str(getattr(args, "bad_class_map50_threshold", rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD)),
             "--device",
             device,
         ]
@@ -492,15 +695,7 @@ def write_shard_result(
 
 
 def copy_tree_contents(source_dir: Path, target_dir: Path) -> None:
-    if not source_dir.exists():
-        return
-    for path in source_dir.rglob("*"):
-        if not path.is_file():
-            continue
-        rel_path = path.relative_to(source_dir)
-        destination = target_dir / rel_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, destination)
+    rt.copy_tree_contents(source_dir, target_dir)
 
 
 def aggregate_metric_entries(metric, label_mapping: dict[int, int], metric_entries: list[dict[str, Any]]) -> None:
@@ -559,12 +754,15 @@ def merge_shard_results(
         shard_metrics_meta = shard_payload.get("metrics_meta", {})
         metrics_meta["images_with_labels"] += int(shard_metrics_meta.get("images_with_labels", 0))
         metrics_meta["images_without_labels"] += int(shard_metrics_meta.get("images_without_labels", 0))
+        final_temp_dir = rt.infer_temp_dir(final_output_dir)
         if args.save_visualization:
             copy_tree_contents(shard_output_dir / "images", final_output_dir / "images")
+        if args.save_json or args.save_txt:
+            shard_temp_dir = rt.infer_temp_dir(shard_output_dir)
         if args.save_json:
-            copy_tree_contents(shard_output_dir / "json", final_output_dir / "json")
+            copy_tree_contents(shard_temp_dir / "json", final_temp_dir / "json")
         if args.save_txt:
-            copy_tree_contents(shard_output_dir / "txt", final_output_dir / "txt")
+            copy_tree_contents(shard_temp_dir / "txt", final_temp_dir / "txt")
 
     aggregated_metric_values: dict[str, float] | None = None
     compute_full_metrics = data_cfg is not None and (args.compute_metrics or args.save_test_report)
@@ -585,7 +783,12 @@ def merge_shard_results(
         print(f"Metrics saved to: {metrics_path}")
 
     if data_cfg is not None and args.save_test_report:
-        report_path = build_split_report_path(args=args, output_dir=final_output_dir, split=split)
+        report_path = build_split_report_path(
+            args=args,
+            output_dir=final_output_dir,
+            split=split,
+            checkpoint_path=checkpoint_path,
+        )
         report_payload = build_legacy_report(
             checkpoint_path=checkpoint_path,
             data_cfg=data_cfg,
@@ -606,6 +809,14 @@ def merge_shard_results(
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report_payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"test_report saved to: {report_path}")
+        if args.save_visualization:
+            export_bad_class_images(
+                args=args,
+                output_dir=final_output_dir,
+                report_path=report_path,
+                data_cfg=data_cfg,
+                split=split,
+            )
 
 
 def finalize_parallel_infer_output(
@@ -618,14 +829,16 @@ def finalize_parallel_infer_output(
     input_mode: str,
     num_images: int,
 ) -> None:
-    copied_curve_paths = rt.copy_training_curve_artifacts(
-        checkpoint_path=checkpoint_path,
-        output_dir=final_output_dir,
-    )
-    for curve_path in copied_curve_paths:
-        print(f"training_curve copied to: {curve_path}")
+    dashboard_path = sync_important_artifacts(checkpoint_path)
+    if dashboard_path is not None:
+        print(f"training_dashboard copied to: {dashboard_path}")
 
-    report_path = build_split_report_path(args=args, output_dir=final_output_dir, split=split)
+    report_path = build_split_report_path(
+        args=args,
+        output_dir=final_output_dir,
+        split=split,
+        checkpoint_path=checkpoint_path,
+    )
     run_meta_path = final_output_dir / "run_meta.json"
     args.output_dir = final_output_dir
     args.report_path = report_path
@@ -638,7 +851,7 @@ def finalize_parallel_infer_output(
         args=args,
         data_cfg=data_cfg,
         num_images=num_images,
-        copied_curve_paths=copied_curve_paths,
+        dashboard_path=dashboard_path,
     )
     print(f"run_meta saved to: {run_meta_path}")
 
@@ -649,6 +862,8 @@ def finalize_parallel_infer_output(
         )
         for report_markdown_path in report_markdown_paths:
             print(f"single_report saved to: {report_markdown_path}")
+        for copied_path in copy_infer_artifacts_to_important(checkpoint_path, [report_path, *report_markdown_paths]):
+            print(f"infer artifact copied to important: {copied_path}")
 
 
 def run_parallel_split_infer(args) -> bool:
@@ -674,6 +889,7 @@ def run_parallel_split_infer(args) -> bool:
         return False
 
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
+    args._resolved_checkpoint_path = checkpoint_path
     data_cfg = rt.load_data_config(args.data)
     final_output_dir = build_split_output_dir(
         args=args,
@@ -692,9 +908,14 @@ def run_parallel_split_infer(args) -> bool:
 
     shard_output_dirs: list[Path] = []
     shard_processes: list[tuple[int, str, subprocess.Popen[str]]] = []
-    report_path = build_split_report_path(args=args, output_dir=final_output_dir, split=args.split)
+    report_path = build_split_report_path(
+        args=args,
+        output_dir=final_output_dir,
+        split=args.split,
+        checkpoint_path=checkpoint_path,
+    )
     for shard_index, gpu in enumerate(eligible_gpus[:num_shards]):
-        shard_output_dir = final_output_dir / "_shards" / f"shard_{shard_index:02d}"
+        shard_output_dir = rt.infer_temp_dir(final_output_dir) / "_shards" / f"shard_{shard_index:02d}"
         shard_output_dirs.append(shard_output_dir)
         command = build_parallel_child_command(
             args=args,
@@ -828,6 +1049,7 @@ def run_single_infer(args) -> None:
     compute_full_metrics = use_dataset and (args.compute_metrics or args.save_test_report)
     shard_child = is_shard_child(args)
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
+    args._resolved_checkpoint_path = checkpoint_path
     data_cfg = rt.load_data_config(args.data) if use_dataset else None
     output_dir = build_split_output_dir(
         args=args,
@@ -835,11 +1057,17 @@ def run_single_infer(args) -> None:
         data_cfg=data_cfg,
         split=args.split,
     )
-    report_path = build_split_report_path(args=args, output_dir=output_dir, split=args.split)
+    report_path = build_split_report_path(
+        args=args,
+        output_dir=output_dir,
+        split=args.split,
+        checkpoint_path=checkpoint_path,
+    )
     run_meta_path = output_dir / "run_meta.json"
+    temp_dir = rt.infer_temp_dir(output_dir)
     images_dir = output_dir / "images"
-    json_dir = output_dir / "json"
-    txt_dir = output_dir / "txt"
+    json_dir = temp_dir / "json"
+    txt_dir = temp_dir / "txt"
 
     args.output_dir = output_dir
     args.report_path = report_path
@@ -860,12 +1088,9 @@ def run_single_infer(args) -> None:
         return
 
     rt.prepare_output_dir(args.output_dir, args.overwrite)
-    copied_curve_paths: list[Path] = []
+    dashboard_path: Path | None = None
     if not shard_child:
-        copied_curve_paths = rt.copy_training_curve_artifacts(
-            checkpoint_path=checkpoint_path,
-            output_dir=args.output_dir,
-        )
+        dashboard_path = sync_important_artifacts(checkpoint_path)
 
     model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
     model.eval()
@@ -879,8 +1104,8 @@ def run_single_infer(args) -> None:
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Input mode: {input_mode}")
     print(f"Images to process: {len(samples)}")
-    for curve_path in copied_curve_paths:
-        print(f"training_curve copied to: {curve_path}")
+    if dashboard_path is not None:
+        print(f"training_dashboard copied to: {dashboard_path}")
 
     if not shard_child:
         write_run_meta(
@@ -892,7 +1117,7 @@ def run_single_infer(args) -> None:
             args=args,
             data_cfg=data_cfg,
             num_images=len(samples),
-            copied_curve_paths=copied_curve_paths,
+            dashboard_path=dashboard_path,
         )
         print(f"run_meta saved to: {run_meta_path}")
 
@@ -908,7 +1133,7 @@ def run_single_infer(args) -> None:
             image_size = image.size
             predict_path = sample.image_path
             if image.mode != "RGB":
-                tmp_dir = args.output_dir / "_tmp_rgb"
+                tmp_dir = temp_dir / "_tmp_rgb"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 predict_path = tmp_dir / relative_output_path(sample, ".jpg")
                 predict_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1013,12 +1238,23 @@ def run_single_infer(args) -> None:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report_payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"test_report saved to: {report_path}")
+        if args.save_visualization:
+            export_bad_class_images(
+                args=args,
+                output_dir=args.output_dir,
+                report_path=report_path,
+                data_cfg=data_cfg,
+                split=args.split,
+                samples=samples,
+            )
         report_markdown_paths = generate_report_for_infer_output(
             experiment_dir=rt.experiment_dir_from_checkpoint_path(checkpoint_path),
             output_dir=args.output_dir,
         )
         for report_markdown_path in report_markdown_paths:
             print(f"single_report saved to: {report_markdown_path}")
+        for copied_path in copy_infer_artifacts_to_important(checkpoint_path, [report_path, *report_markdown_paths]):
+            print(f"infer artifact copied to important: {copied_path}")
 
 
 def run_infer(args) -> None:

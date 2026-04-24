@@ -40,14 +40,14 @@
 | 大目标 (Large) |  |
 
 ### 2. 具体类别（Label）准确度
-> 按 `test_report.per_class_ap` 里的 AP@0.5 从低到高排序。
+> 按 `test_report.per_class_ap` 里的 AP@0.5 从低到高排序；`Precision@0.5` 和 `Recall@0.5` 可由每类 TP、Pred、GT 直接计算。
 
-| 类别名称 (Label) | GT | Pred | AP@0.5 |
-|---|---:|---:|---:|
-|  |  |  |  |
-|  |  |  |  |
-|  |  |  |  |
-|  |  |  |  |
+| 类别名称 (Label) | GT | Pred | Precision@0.5 | Recall@0.5 | AP@0.5 |
+|---|---:|---:|---:|---:|---:|
+|  |  |  |  |  |  |
+|  |  |  |  |  |  |
+|  |  |  |  |  |  |
+|  |  |  |  |  |  |
 
 ## 四、结论与后续建议
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import shutil
 import sys
 from datetime import datetime
@@ -42,6 +43,7 @@ OUT_DIR = ROOT_DIR / "out"
 EXPERIMENT_ROOT_DIR = OUT_DIR
 TEST_OUTPUT_ROOT_DIR = OUT_DIR
 EDA_OUTPUT_ROOT_DIR = OUT_DIR / "EDA"
+ALL_REPORT_ROOT_DIR = OUT_DIR / "all_report"
 REPORT_ARCHIVE_ROOT_DIR = OUT_DIR / "test_reports"
 DATASET_DIR = ROOT_DIR / "datasets" / "military_dataset" / "dataset_det"
 EXPERIMENT_DIR = OUT_DIR / "my_experiment_det_0402"
@@ -71,6 +73,7 @@ INFER_DEFAULT_SAVE_VISUALIZATION = True
 INFER_DEFAULT_SAVE_JSON = False
 INFER_DEFAULT_SAVE_TXT = False
 INFER_DEFAULT_REPORT_IOU_THRESHOLD = 0.5
+INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD = 0.3
 INFER_DEFAULT_COMPUTE_METRICS = False
 INFER_DEFAULT_METRIC_CLASSWISE = False
 INFER_DEFAULT_SAVE_TEST_REPORT = True
@@ -115,7 +118,9 @@ TRAINING_CURVE_FILENAMES = {
     "lr": "training_curve_lr.png",
     "dashboard": "training_dashboard.png",
 }
+IMPORTANT_ARTIFACT_DIRNAME = "important"
 TRAINING_TEMP_DIRNAME = "_temp"
+INFER_TEMP_DIRNAME = "_tempfile"
 TENSORBOARD_EVENT_GLOB = "events.out.tfevents.*"
 
 
@@ -214,6 +219,7 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global EXPERIMENT_ROOT_DIR
     global TEST_OUTPUT_ROOT_DIR
     global EDA_OUTPUT_ROOT_DIR
+    global ALL_REPORT_ROOT_DIR
     global DATASET_DIR
     global EXPERIMENT_DIR
     global REPORT_ARCHIVE_ROOT_DIR
@@ -268,6 +274,7 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
         _path("test_output_root_dir", TEST_OUTPUT_ROOT_DIR),
     )
     EDA_OUTPUT_ROOT_DIR = _path("eda_output_root_dir", EDA_OUTPUT_ROOT_DIR)
+    ALL_REPORT_ROOT_DIR = _path("all_report_root_dir", ALL_REPORT_ROOT_DIR)
     REPORT_ARCHIVE_ROOT_DIR = _path("report_archive_root_dir", REPORT_ARCHIVE_ROOT_DIR)
     DATASET_DIR = _path("det_dataset_dir", DATASET_DIR)
     DEFAULT_CLS_THRESHOLD = float(settings.get("cls_threshold", DEFAULT_CLS_THRESHOLD))
@@ -477,7 +484,15 @@ def load_data_config(data_path: Path) -> dict[str, Any]:
     root_dir = base_dir if root is None else resolve_data_yaml_path(Path(root), base_dir=base_dir)
     cfg["_data_yaml_path"] = data_path
     cfg["_base_dir"] = base_dir
-    cfg["_root_dir"] = root_dir
+    cfg["_root_dir"] = resolve_dataset_root_dir(
+        configured_root_dir=root_dir,
+        data_yaml_dir=base_dir,
+        split_values={
+            "train": cfg.get("train"),
+            "val": cfg.get("val"),
+            "test": cfg.get("test"),
+        },
+    )
     return cfg
 
 
@@ -526,6 +541,42 @@ def resolve_data_yaml_path(path_value: Path, *, base_dir: Path) -> Path:
     if base_relative.exists():
         return base_relative
     return root_relative
+
+
+def resolve_dataset_root_dir(
+    *,
+    configured_root_dir: Path,
+    data_yaml_dir: Path,
+    split_values: dict[str, Any] | None = None,
+) -> Path:
+    """Resolve the effective dataset root.
+
+    When a dataset directory is renamed manually, `data.yaml` may still contain an
+    absolute `path:` pointing to the old directory. In that case, prefer the
+    directory that currently contains `data.yaml` if it already looks like a valid
+    dataset root for the declared split paths.
+    """
+    resolved_root_dir = configured_root_dir.expanduser().resolve()
+    resolved_data_yaml_dir = data_yaml_dir.expanduser().resolve()
+    if resolved_root_dir.exists():
+        return resolved_root_dir
+    if not resolved_data_yaml_dir.exists():
+        return resolved_root_dir
+
+    declared_splits = split_values or {}
+    for split_name in ("train", "val", "test"):
+        split_value = declared_splits.get(split_name)
+        if split_value in {None, ""}:
+            continue
+        split_path = Path(str(split_value))
+        candidate_dir = resolve_split_dir_path(
+            split_path=split_path,
+            root_dir=resolved_data_yaml_dir,
+            base_dir=resolved_data_yaml_dir,
+        )
+        if candidate_dir.exists():
+            return resolved_data_yaml_dir
+    return resolved_root_dir
 
 
 def resolve_dataset_split_paths(data_cfg: dict[str, Any], split: str) -> tuple[Path, Path | None, dict[int, str]]:
@@ -805,7 +856,79 @@ def build_det_run_name(*, checkpoint_path: Path, dataset_dir: Path, split: str) 
 
 
 def build_det_report_path(output_dir: Path) -> Path:
-    return output_dir / f"{output_dir.name}-test_report.json"
+    date_tag = date_tag_now()
+    output_name = output_dir.name
+    if output_name.startswith(f"{date_tag}-"):
+        report_name = f"{output_name}-test_report.json"
+    else:
+        report_name = f"{date_tag}-{output_name}-test_report.json"
+    return output_dir / report_name
+
+
+def experiment_important_dir(experiment_dir: Path) -> Path:
+    return experiment_dir / IMPORTANT_ARTIFACT_DIRNAME
+
+
+def all_report_experiment_dir(experiment_dir: Path) -> Path:
+    return ALL_REPORT_ROOT_DIR / experiment_dir.name
+
+
+def infer_temp_dir(output_dir: Path) -> Path:
+    return output_dir / INFER_TEMP_DIRNAME
+
+
+def copy_file_if_exists(source_path: Path, destination_path: Path) -> Path | None:
+    if not source_path.exists() or not source_path.is_file():
+        return None
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_path, destination_path)
+    return destination_path
+
+
+def copy_tree_contents(source_dir: Path, target_dir: Path) -> list[Path]:
+    if not source_dir.exists():
+        return []
+    copied_paths: list[Path] = []
+    for path in sorted(source_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel_path = path.relative_to(source_dir)
+        destination_path = target_dir / rel_path
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination_path)
+        copied_paths.append(destination_path)
+    return copied_paths
+
+
+def sync_important_to_all_report(experiment_dir: Path) -> Path:
+    resolved_experiment_dir = experiment_dir.expanduser().resolve()
+    important_dir = experiment_important_dir(resolved_experiment_dir)
+    archive_dir = all_report_experiment_dir(resolved_experiment_dir)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    copy_tree_contents(important_dir, archive_dir)
+    return archive_dir
+
+
+def sync_training_summary_artifacts(experiment_dir: Path) -> tuple[Path, Path, Path | None]:
+    resolved_experiment_dir = experiment_dir.expanduser().resolve()
+    important_dir = experiment_important_dir(resolved_experiment_dir)
+    important_dir.mkdir(parents=True, exist_ok=True)
+
+    copy_file_if_exists(resolved_experiment_dir / "train.log", important_dir / "train.log")
+    curve_paths = generate_training_curve_artifacts(resolved_experiment_dir)
+    dashboard_source = next(
+        (path for path in curve_paths if path.name == TRAINING_CURVE_FILENAMES["dashboard"]),
+        None,
+    )
+    dashboard_path = None
+    if dashboard_source is not None:
+        dashboard_path = copy_file_if_exists(
+            dashboard_source,
+            important_dir / TRAINING_CURVE_FILENAMES["dashboard"],
+        )
+
+    archive_dir = sync_important_to_all_report(resolved_experiment_dir)
+    return important_dir, archive_dir, dashboard_path
 
 
 def build_report_archive_path(report_path: Path, archive_root: Path | None = None) -> Path:
@@ -824,6 +947,18 @@ def deduplicate_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         counter += 1
+
+
+def default_det_export_dir_suffix(*, image_count: int) -> str:
+    safe_count = max(int(image_count), 0)
+    return f"{EXPORT_DEFAULT_EXPORT_SUFFIX}_{safe_count}"
+
+
+def resolve_det_export_dir_suffix(*, export_suffix: str, image_count: int) -> str:
+    normalized_suffix = str(export_suffix).strip() or EXPORT_DEFAULT_EXPORT_SUFFIX
+    if normalized_suffix == EXPORT_DEFAULT_EXPORT_SUFFIX:
+        return default_det_export_dir_suffix(image_count=image_count)
+    return normalized_suffix
 
 
 def archive_report_copy(report_path: Path, archive_root: Path | None = None) -> Path:
@@ -961,6 +1096,32 @@ def _safe_text_size(draw, text: str, font) -> tuple[int, int]:
     return max(0, right - left), max(0, bottom - top)
 
 
+def _temporary_image_output_path(output_path: Path) -> Path:
+    return output_path.with_name(f".{output_path.stem}.{os.getpid()}.tmp{output_path.suffix}")
+
+
+def _is_valid_image_file(path: Path) -> bool:
+    if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+        return False
+    if not ensure_plot_dependencies():
+        return False
+    try:
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except OSError:
+        return False
+
+
+def _finalize_image_output(temp_path: Path, output_path: Path) -> bool:
+    if not _is_valid_image_file(temp_path):
+        temp_path.unlink(missing_ok=True)
+        return False
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path.replace(output_path)
+    return True
+
+
 def render_scalar_plot_matplotlib(
     output_path: Path,
     *,
@@ -973,6 +1134,7 @@ def render_scalar_plot_matplotlib(
         return False
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = _temporary_image_output_path(output_path)
 
     fig, ax = plt.subplots(figsize=(12.8, 7.2), dpi=120)
     fig.patch.set_facecolor("#fafbfc")
@@ -997,10 +1159,12 @@ def render_scalar_plot_matplotlib(
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.legend(loc="best", frameon=False, fontsize=10)
-    fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight")
-    plt.close(fig)
-    return True
+    try:
+        fig.tight_layout()
+        fig.savefig(temp_path, bbox_inches="tight")
+    finally:
+        plt.close(fig)
+    return _finalize_image_output(temp_path, output_path)
 
 
 def render_scalar_plot_pillow(
@@ -1103,8 +1267,9 @@ def render_scalar_plot_pillow(
     draw.text((18, plot_top - 8), "value", fill=(80, 87, 96), font=small_font)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path)
-    return True
+    temp_path = _temporary_image_output_path(output_path)
+    image.save(temp_path)
+    return _finalize_image_output(temp_path, output_path)
 
 
 def render_scalar_plot(
@@ -1134,15 +1299,22 @@ def compose_training_dashboard(
     source_paths: list[Path],
     title: str = "Training Dashboard",
 ) -> bool:
-    valid_paths = [path for path in source_paths if path.exists()]
-    if not valid_paths or not ensure_plot_dependencies():
+    existing_paths = [path for path in source_paths if path.exists()]
+    if not existing_paths or not ensure_plot_dependencies():
         return False
 
     opened_images = []
     try:
-        for path in valid_paths:
-            with Image.open(path) as img:
-                opened_images.append((path, img.convert("RGB")))
+        for path in existing_paths:
+            if not _is_valid_image_file(path):
+                continue
+            try:
+                with Image.open(path) as img:
+                    opened_images.append((path, img.convert("RGB")))
+            except OSError:
+                continue
+        if not opened_images:
+            return False
 
         card_width = max(image.width for _, image in opened_images)
         gap = 28
@@ -1195,8 +1367,9 @@ def compose_training_dashboard(
             cursor_y += image.height + gap
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        canvas.save(output_path)
-        return True
+        temp_path = _temporary_image_output_path(output_path)
+        canvas.save(temp_path)
+        return _finalize_image_output(temp_path, output_path)
     finally:
         for _, image in opened_images:
             image.close()

@@ -26,6 +26,15 @@ from .det_shared import safe_class_name
 SMALL_OBJECT_AREA_THRESHOLD = 32.0 * 32.0
 MEDIUM_OBJECT_AREA_THRESHOLD = 96.0 * 96.0
 SPLIT_ORDER = ("train", "val", "test")
+BAD_IMAGE_EXPORT_PER_SPLIT_LIMIT = 24
+BAD_IMAGE_EXPORT_PER_ISSUE_LIMIT = 8
+BAD_IMAGE_ISSUE_ORDER = (
+    "image_open_error",
+    "missing_label_file",
+    "invalid_label_lines",
+    "empty_label_file",
+    "coord_anomaly_lines",
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +43,223 @@ class _LightSourceImageInfo:
     rel_path: Path
     src_image_path: Path
     src_label_path: Path
+
+
+def _summarize_bad_image_issues(row: dict[str, Any]) -> tuple[list[str], str, float]:
+    issue_tags: list[str] = []
+    score = 0.0
+    if str(row.get("image_open_error") or "").strip():
+        issue_tags.append("image_open_error")
+        score += 1000.0
+    if not bool(row.get("label_file_exists", False)):
+        issue_tags.append("missing_label_file")
+        score += 800.0
+    if int(row.get("invalid_label_lines", 0)) > 0:
+        issue_tags.append("invalid_label_lines")
+        score += 200.0 + (int(row.get("invalid_label_lines", 0)) * 100.0)
+    if bool(row.get("label_file_exists", False)) and int(row.get("raw_nonempty_label_lines", 0)) == 0:
+        issue_tags.append("empty_label_file")
+        score += 180.0
+    if int(row.get("coord_anomaly_lines", 0)) > 0:
+        issue_tags.append("coord_anomaly_lines")
+        score += 80.0 + (int(row.get("coord_anomaly_lines", 0)) * 20.0)
+    primary_issue = next((name for name in BAD_IMAGE_ISSUE_ORDER if name in issue_tags), "")
+    return issue_tags, primary_issue, round(score, 2)
+
+
+def _sort_key_for_bad_image(row: dict[str, Any]) -> tuple[float, int, int, int, str]:
+    return (
+        -float(row.get("bad_image_score", 0.0)),
+        -int(row.get("invalid_label_lines", 0)),
+        -int(row.get("coord_anomaly_lines", 0)),
+        -int(row.get("valid_boxes", 0)),
+        str(row.get("image", "")),
+    )
+
+
+def _attach_bad_image_flags(row: dict[str, Any]) -> dict[str, Any]:
+    issue_tags, primary_issue, bad_image_score = _summarize_bad_image_issues(row)
+    row["bad_image_candidate"] = bool(issue_tags)
+    row["bad_image_issue_tags"] = ",".join(issue_tags)
+    row["bad_image_primary_issue"] = primary_issue
+    row["bad_image_score"] = bad_image_score
+    row["bad_image_issue_count"] = len(issue_tags)
+    return row
+
+
+def _select_representative_bad_images(per_image_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected_rows: list[dict[str, Any]] = []
+    selected_keys: set[tuple[str, str]] = set()
+    candidate_rows_by_split: dict[str, list[dict[str, Any]]] = {}
+    for row in per_image_rows:
+        if not bool(row.get("bad_image_candidate", False)):
+            continue
+        candidate_rows_by_split.setdefault(str(row.get("split", "")), []).append(row)
+
+    for split_name in SPLIT_ORDER:
+        split_rows = candidate_rows_by_split.get(split_name, [])
+        if not split_rows:
+            continue
+        split_selected: list[dict[str, Any]] = []
+        for issue_name in BAD_IMAGE_ISSUE_ORDER:
+            issue_rows = [row for row in split_rows if issue_name in str(row.get("bad_image_issue_tags", "")).split(",")]
+            issue_rows.sort(key=_sort_key_for_bad_image)
+            for row in issue_rows[:BAD_IMAGE_EXPORT_PER_ISSUE_LIMIT]:
+                row_key = (str(row.get("split", "")), str(row.get("image", "")))
+                if row_key in selected_keys or len(split_selected) >= BAD_IMAGE_EXPORT_PER_SPLIT_LIMIT:
+                    continue
+                split_selected.append(row)
+                selected_keys.add(row_key)
+        if len(split_selected) < BAD_IMAGE_EXPORT_PER_SPLIT_LIMIT:
+            remaining_rows = sorted(split_rows, key=_sort_key_for_bad_image)
+            for row in remaining_rows:
+                row_key = (str(row.get("split", "")), str(row.get("image", "")))
+                if row_key in selected_keys:
+                    continue
+                split_selected.append(row)
+                selected_keys.add(row_key)
+                if len(split_selected) >= BAD_IMAGE_EXPORT_PER_SPLIT_LIMIT:
+                    break
+        selected_rows.extend(split_selected)
+    return selected_rows
+
+
+def _build_bad_image_export_summary(
+    *,
+    bad_images_dir: Path,
+    per_image_rows: list[dict[str, Any]],
+    exported_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    candidate_rows = [row for row in per_image_rows if bool(row.get("bad_image_candidate", False))]
+    summary: dict[str, Any] = {
+        "directory": str(bad_images_dir),
+        "per_split_limit": BAD_IMAGE_EXPORT_PER_SPLIT_LIMIT,
+        "per_issue_limit": BAD_IMAGE_EXPORT_PER_ISSUE_LIMIT,
+        "issue_order": list(BAD_IMAGE_ISSUE_ORDER),
+        "candidate_count": len(candidate_rows),
+        "exported_count": len(exported_rows),
+        "splits": {},
+    }
+    for split_name in sorted({str(row.get("split", "")) for row in candidate_rows + exported_rows}):
+        split_candidate_rows = [row for row in candidate_rows if str(row.get("split", "")) == split_name]
+        split_exported_rows = [row for row in exported_rows if str(row.get("split", "")) == split_name]
+        issue_counts = {
+            issue_name: sum(
+                1 for row in split_candidate_rows if issue_name in str(row.get("bad_image_issue_tags", "")).split(",")
+            )
+            for issue_name in BAD_IMAGE_ISSUE_ORDER
+        }
+        exported_issue_counts = {
+            issue_name: sum(
+                1 for row in split_exported_rows if issue_name in str(row.get("bad_image_issue_tags", "")).split(",")
+            )
+            for issue_name in BAD_IMAGE_ISSUE_ORDER
+        }
+        summary["splits"][split_name] = {
+            "candidate_count": len(split_candidate_rows),
+            "exported_count": len(split_exported_rows),
+            "issue_counts": issue_counts,
+            "exported_issue_counts": exported_issue_counts,
+        }
+    return summary
+
+
+def _export_bad_image_bundle(
+    *,
+    output_dir: Path,
+    per_image_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    bad_images_dir = output_dir / "bad_images"
+    selected_rows = _select_representative_bad_images(per_image_rows)
+    exported_rows: list[dict[str, Any]] = []
+
+    for row in selected_rows:
+        split_name = str(row.get("split", "unknown"))
+        image_rel_path = Path(str(row.get("image", "")))
+        image_export_path = bad_images_dir / split_name / "images" / image_rel_path
+        label_export_path = bad_images_dir / split_name / "labels" / image_rel_path.with_suffix(".txt")
+        meta_export_path = bad_images_dir / split_name / "meta" / image_rel_path.with_suffix(".json")
+
+        copied_image_path = rt.copy_file_if_exists(Path(str(row.get("image_path", ""))), image_export_path)
+        copied_label_path = rt.copy_file_if_exists(Path(str(row.get("label_path", ""))), label_export_path)
+        export_row = dict(row)
+        export_row["export_image_path"] = str(copied_image_path) if copied_image_path is not None else ""
+        export_row["export_label_path"] = str(copied_label_path) if copied_label_path is not None else ""
+        export_row["export_meta_path"] = str(meta_export_path)
+
+        meta_export_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_export_path.write_text(json.dumps(export_row, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        exported_rows.append(export_row)
+
+    manifest_csv_path = bad_images_dir / "manifest.csv"
+    manifest_json_path = bad_images_dir / "manifest.json"
+    summary = _build_bad_image_export_summary(
+        bad_images_dir=bad_images_dir,
+        per_image_rows=per_image_rows,
+        exported_rows=exported_rows,
+    )
+    summary["manifest_csv"] = str(manifest_csv_path)
+    summary["manifest_json"] = str(manifest_json_path)
+
+    manifest_rows = [
+        {
+            "split": row.get("split", ""),
+            "image": row.get("image", ""),
+            "image_path": row.get("image_path", ""),
+            "label_path": row.get("label_path", ""),
+            "export_image_path": row.get("export_image_path", ""),
+            "export_label_path": row.get("export_label_path", ""),
+            "export_meta_path": row.get("export_meta_path", ""),
+            "label_file_exists": row.get("label_file_exists", False),
+            "raw_nonempty_label_lines": row.get("raw_nonempty_label_lines", 0),
+            "valid_boxes": row.get("valid_boxes", 0),
+            "invalid_label_lines": row.get("invalid_label_lines", 0),
+            "coord_anomaly_lines": row.get("coord_anomaly_lines", 0),
+            "bad_image_candidate": row.get("bad_image_candidate", False),
+            "bad_image_issue_tags": row.get("bad_image_issue_tags", ""),
+            "bad_image_primary_issue": row.get("bad_image_primary_issue", ""),
+            "bad_image_score": row.get("bad_image_score", 0.0),
+            "image_open_error": row.get("image_open_error", ""),
+        }
+        for row in exported_rows
+    ]
+
+    rt.save_records_csv(
+        manifest_csv_path,
+        manifest_rows,
+        [
+            "split",
+            "image",
+            "image_path",
+            "label_path",
+            "export_image_path",
+            "export_label_path",
+            "export_meta_path",
+            "label_file_exists",
+            "raw_nonempty_label_lines",
+            "valid_boxes",
+            "invalid_label_lines",
+            "coord_anomaly_lines",
+            "bad_image_candidate",
+            "bad_image_issue_tags",
+            "bad_image_primary_issue",
+            "bad_image_score",
+            "image_open_error",
+        ],
+    )
+    manifest_json_path.write_text(
+        json.dumps(
+            {
+                "summary": summary,
+                "samples": exported_rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return summary
 
 
 def _strip_yaml_comment(text: str) -> str:
@@ -141,14 +367,22 @@ def _load_data_config_light(data_path: Path) -> dict[str, Any]:
 
     base_dir = resolved_path.parent
     root_value = payload.get("path")
-    root_dir = (
+    configured_root_dir = (
         base_dir
         if root_value is None
         else rt.resolve_data_yaml_path(Path(root_value), base_dir=base_dir)
     )
     payload["_data_yaml_path"] = resolved_path
     payload["_base_dir"] = base_dir
-    payload["_root_dir"] = root_dir
+    payload["_root_dir"] = rt.resolve_dataset_root_dir(
+        configured_root_dir=configured_root_dir,
+        data_yaml_dir=base_dir,
+        split_values={
+            "train": payload.get("train"),
+            "val": payload.get("val"),
+            "test": payload.get("test"),
+        },
+    )
     return payload
 
 
@@ -684,38 +918,40 @@ def _collect_dataset_eda(source_data_path: Path) -> tuple[dict[str, Any], list[d
                     )
 
             per_image_rows.append(
-                {
-                    "split": split_name,
-                    "image": info.rel_path.as_posix(),
-                    "image_path": str(info.src_image_path),
-                    "label_path": str(info.src_label_path),
-                    "image_width": image_width,
-                    "image_height": image_height,
-                    "image_area_pixels": image_area,
-                    "image_aspect_ratio": _round_or_zero(image_aspect_ratio, 4),
-                    "label_file_exists": bool(label_payload["exists"]),
-                    "raw_nonempty_label_lines": int(label_payload["raw_nonempty_lines"]),
-                    "valid_boxes": valid_box_count,
-                    "invalid_label_lines": int(label_payload["invalid_label_lines"]),
-                    "coord_anomaly_lines": int(label_payload["coord_anomaly_lines"]),
-                    "labeled": valid_box_count > 0,
-                    "empty_image": valid_box_count == 0,
-                    "class_count": len(class_box_counts),
-                    "dominant_class": safe_class_name(class_names, class_box_counts.most_common(1)[0][0]) if class_box_counts else "",
-                    "dominant_class_boxes": int(class_box_counts.most_common(1)[0][1]) if class_box_counts else 0,
-                    "small_boxes": int(sum(1 for box in valid_boxes if image_width > 0 and image_height > 0 and _bucket_box_area(float(box["width"]) * image_width * float(box["height"]) * image_height) == "small")),
-                    "medium_boxes": int(sum(1 for box in valid_boxes if image_width > 0 and image_height > 0 and _bucket_box_area(float(box["width"]) * image_width * float(box["height"]) * image_height) == "medium")),
-                    "large_boxes": int(sum(1 for box in valid_boxes if image_width > 0 and image_height > 0 and _bucket_box_area(float(box["width"]) * image_width * float(box["height"]) * image_height) == "large")),
-                    "mean_box_area_ratio": _round_or_zero(
-                        sum(float(box["area_ratio"]) for box in valid_boxes) / valid_box_count,
-                        6,
-                    ) if valid_box_count > 0 else 0.0,
-                    "mean_box_aspect_ratio": _round_or_zero(
-                        sum(float(box["aspect_ratio"]) for box in valid_boxes) / valid_box_count,
-                        4,
-                    ) if valid_box_count > 0 else 0.0,
-                    "image_open_error": image_open_error,
-                }
+                _attach_bad_image_flags(
+                    {
+                        "split": split_name,
+                        "image": info.rel_path.as_posix(),
+                        "image_path": str(info.src_image_path),
+                        "label_path": str(info.src_label_path),
+                        "image_width": image_width,
+                        "image_height": image_height,
+                        "image_area_pixels": image_area,
+                        "image_aspect_ratio": _round_or_zero(image_aspect_ratio, 4),
+                        "label_file_exists": bool(label_payload["exists"]),
+                        "raw_nonempty_label_lines": int(label_payload["raw_nonempty_lines"]),
+                        "valid_boxes": valid_box_count,
+                        "invalid_label_lines": int(label_payload["invalid_label_lines"]),
+                        "coord_anomaly_lines": int(label_payload["coord_anomaly_lines"]),
+                        "labeled": valid_box_count > 0,
+                        "empty_image": valid_box_count == 0,
+                        "class_count": len(class_box_counts),
+                        "dominant_class": safe_class_name(class_names, class_box_counts.most_common(1)[0][0]) if class_box_counts else "",
+                        "dominant_class_boxes": int(class_box_counts.most_common(1)[0][1]) if class_box_counts else 0,
+                        "small_boxes": int(sum(1 for box in valid_boxes if image_width > 0 and image_height > 0 and _bucket_box_area(float(box["width"]) * image_width * float(box["height"]) * image_height) == "small")),
+                        "medium_boxes": int(sum(1 for box in valid_boxes if image_width > 0 and image_height > 0 and _bucket_box_area(float(box["width"]) * image_width * float(box["height"]) * image_height) == "medium")),
+                        "large_boxes": int(sum(1 for box in valid_boxes if image_width > 0 and image_height > 0 and _bucket_box_area(float(box["width"]) * image_width * float(box["height"]) * image_height) == "large")),
+                        "mean_box_area_ratio": _round_or_zero(
+                            sum(float(box["area_ratio"]) for box in valid_boxes) / valid_box_count,
+                            6,
+                        ) if valid_box_count > 0 else 0.0,
+                        "mean_box_aspect_ratio": _round_or_zero(
+                            sum(float(box["aspect_ratio"]) for box in valid_boxes) / valid_box_count,
+                            4,
+                        ) if valid_box_count > 0 else 0.0,
+                        "image_open_error": image_open_error,
+                    }
+                )
             )
 
     finalized_splits = {
@@ -1065,6 +1301,33 @@ def _render_markdown(report: dict[str, Any], output_dir: Path) -> str:
                 f"| {item['image']} | {item['boxes']} | {item['class_count']} | "
                 f"{item['image_width']}x{item['image_height']} |"
             )
+    bad_image_export = report.get("bad_image_export", {})
+    if bad_image_export:
+        lines.extend(
+            [
+                "",
+                "## 8. 问题样本导出",
+                "",
+                f"- 导出目录：`{bad_image_export.get('directory', output_dir / 'bad_images')}`",
+                f"- 候选问题样本数：{bad_image_export.get('candidate_count', 0)}",
+                f"- 已导出代表性样本数：{bad_image_export.get('exported_count', 0)}",
+                f"- 清单文件：`{bad_image_export.get('manifest_csv', '')}`",
+                "",
+                "| split | 候选数 | 导出数 | 读图失败 | 缺失标注 | 非法标注行 | 空标注文件 | 坐标异常 |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for split_name in split_order:
+            split_export = bad_image_export.get("splits", {}).get(split_name)
+            if not split_export:
+                continue
+            issue_counts = split_export.get("issue_counts", {})
+            lines.append(
+                f"| {split_name} | {split_export.get('candidate_count', 0)} | {split_export.get('exported_count', 0)} | "
+                f"{issue_counts.get('image_open_error', 0)} | {issue_counts.get('missing_label_file', 0)} | "
+                f"{issue_counts.get('invalid_label_lines', 0)} | {issue_counts.get('empty_label_file', 0)} | "
+                f"{issue_counts.get('coord_anomaly_lines', 0)} |"
+            )
     lines.append("")
     return "\n".join(lines)
 
@@ -1083,6 +1346,10 @@ def generate_eda_report(*, source_data_path: Path, output_dir: Path | None, over
     rt.prepare_output_dir(final_output_dir, overwrite=overwrite)
 
     report, per_image_rows = _collect_dataset_eda(source_data_path)
+    report["bad_image_export"] = _export_bad_image_bundle(
+        output_dir=final_output_dir,
+        per_image_rows=per_image_rows,
+    )
     markdown = _render_markdown(report, final_output_dir)
     dataset_tag = str(report.get("overview", {}).get("dataset_tag") or "dataset")
 
@@ -1175,6 +1442,11 @@ def generate_eda_report(*, source_data_path: Path, output_dir: Path | None, over
             "mean_box_area_ratio",
             "mean_box_aspect_ratio",
             "image_open_error",
+            "bad_image_candidate",
+            "bad_image_issue_tags",
+            "bad_image_primary_issue",
+            "bad_image_score",
+            "bad_image_issue_count",
         ],
     )
 
@@ -1184,6 +1456,7 @@ def generate_eda_report(*, source_data_path: Path, output_dir: Path | None, over
     print(f"  - {split_csv_path}")
     print(f"  - {class_csv_path}")
     print(f"  - {image_csv_path}")
+    print(f"  - {final_output_dir / 'bad_images'}")
     return final_output_dir
 
 

@@ -118,6 +118,14 @@ def compute_ap(pred_pairs: list[tuple[float, int]], total_gt: int) -> float:
     return ap
 
 
+def compute_precision_recall(pred_pairs: list[tuple[float, int]], total_gt: int) -> tuple[int, float, float]:
+    tp = sum(int(is_tp) for _, is_tp in pred_pairs)
+    total_pred = len(pred_pairs)
+    precision = tp / total_pred if total_pred > 0 else 0.0
+    recall = tp / total_gt if total_gt > 0 else 0.0
+    return tp, precision, recall
+
+
 def update_legacy_report_state(class_data: dict[int, dict[str, Any]], gts: list[dict[str, Any]], preds: list[dict[str, Any]], iou_threshold: float) -> tuple[int, int, int]:
     total_gt = 0
     total_pred = 0
@@ -215,6 +223,21 @@ def build_legacy_report(
             if raw_key in metric_values:
                 merged_summary[summary_key] = metric_values[raw_key]
 
+    per_class_summary = {}
+    for class_id, ap in ap_per_class.items():
+        pred_pairs = class_data[class_id]["pairs"]
+        gt_count = class_data[class_id]["gt"]
+        tp_count, class_precision, class_recall = compute_precision_recall(pred_pairs, gt_count)
+        per_class_summary[str(class_id)] = {
+            "name": legacy_class_name(class_names, class_id),
+            "ap": ap,
+            "gt": gt_count,
+            "pred": len(pred_pairs),
+            "tp": tp_count,
+            "precision": class_precision,
+            "recall": class_recall,
+        }
+
     return {
         "config": {
             "model_path": str(checkpoint_path),
@@ -239,15 +262,7 @@ def build_legacy_report(
             "negative_images": 0,
         },
         "class_names": {str(k): v for k, v in class_names.items()},
-        "per_class_ap": {
-            str(class_id): {
-                "name": legacy_class_name(class_names, class_id),
-                "ap": ap,
-                "gt": class_data[class_id]["gt"],
-                "pred": len(class_data[class_id]["pairs"]),
-            }
-            for class_id, ap in ap_per_class.items()
-        },
+        "per_class_ap": per_class_summary,
         "bad_cases": [],
     }
 
