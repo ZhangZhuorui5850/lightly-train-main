@@ -1,2 +1,0 @@
-# Wrap lines at 88 characters to match ruff's default line length
-wrap = 88
