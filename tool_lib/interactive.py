@@ -17,7 +17,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
+import tempfile
 from pathlib import Path
+from typing import Any
 
 from . import common as rt
 from . import convert_tools
@@ -550,9 +553,9 @@ def print_default_det_infer_summary(*, mode: str, data_path: Path | None = None)
     print(f"  score_threshold: {rt.INFER_DEFAULT_SCORE_THRESHOLD}")
     print(f"  device: {rt.INFER_DEFAULT_DEVICE}")
     print("  save_visualization: True")
-    print("  save_json: False")
+    print("  save_json: True")
     print("  save_txt: False")
-    split_text = "交互选择 train / test / val / all" if mode == "dataset" else "(not used)"
+    split_text = "交互选择 train / test / val / test+val / all" if mode == "dataset" else "(not used)"
     print(f"  split: {split_text}")
     selected_data = data_path if data_path is not None else rt.INFER_DEFAULT_DATA
     default_data = compact_display_path(selected_data) if mode == "dataset" else "(not used)"
@@ -598,7 +601,8 @@ def prompt_det_infer_split(*, experiment_dir: Path, data_path: Path) -> str:
             ("train", "train"),
             ("test", "test"),
             ("val", "val"),
-            ("all", "all (test + val)"),
+            ("test+val", "test+val"),
+            ("all", "all (train + test + val)"),
         ],
     )
 
@@ -678,6 +682,1134 @@ def build_convert_cli_preview(args: argparse.Namespace) -> str:
     return " ".join(parts)
 
 
+def _find_recent_test_reports(
+    source_data_yaml: Path | None = None,
+) -> list[Path]:
+    """在 out/ 下搜索 test_report.json，按数据集关系排序。"""
+    patterns = ["*-test_report.json", "test_report.json"]
+    roots = [rt.EXPERIMENT_ROOT_DIR, rt.TEST_OUTPUT_ROOT_DIR]
+    all_report_root = rt.ALL_REPORT_ROOT_DIR.resolve()
+    seen: dict[str, Path] = {}
+    for root in roots:
+        if not root.exists():
+            continue
+        for pattern in patterns:
+            for path in root.rglob(pattern):
+                if not path.is_file():
+                    continue
+                resolved = path.resolve()
+                try:
+                    resolved.relative_to(all_report_root)
+                    continue  # 在 all_report 目录内，跳过（是副本）
+                except ValueError:
+                    pass
+                if rt.IMPORTANT_ARTIFACT_DIRNAME in resolved.parts:
+                    continue  # 在 important 目录内，跳过（是副本）
+                if "old" in resolved.parts:
+                    continue
+                seen[str(resolved)] = resolved
+
+    candidates = list(seen.values())
+    if source_data_yaml is not None:
+        candidates.sort(
+            key=lambda p: (
+                -_report_dataset_relation_score(p, source_data_yaml),
+                -int(p.stat().st_mtime),
+            )
+        )
+    else:
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates
+
+
+def _path_is_inside(path: Path, parent: Path) -> bool:
+    try:
+        path.expanduser().resolve().relative_to(parent.expanduser().resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _read_report_data_paths(report_json: Path) -> tuple[Path | None, Path | None]:
+    payload = _load_json_dict(report_json)
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        config = {}
+    data_root = _resolve_existing_path(config.get("data_root"))
+    split_image_dir = _resolve_existing_path(config.get("test_images"))
+    if data_root is not None:
+        data_yaml = data_root / "data.yaml"
+        return (data_yaml.resolve() if data_yaml.exists() else None), data_root.resolve()
+    if split_image_dir is not None:
+        for parent in split_image_dir.parents:
+            data_yaml = parent / "data.yaml"
+            if data_yaml.exists():
+                return data_yaml.resolve(), parent.resolve()
+    return None, None
+
+
+def _metadata_data_paths_for_output_dir(output_dir: Path) -> tuple[Path | None, Path | None]:
+    run_meta_path = output_dir.expanduser().resolve() / "run_meta.json"
+    payload = _load_json_dict(run_meta_path) if run_meta_path.exists() else {}
+    paths_payload = payload.get("paths")
+    if not isinstance(paths_payload, dict):
+        return None, None
+    data_yaml = _resolve_existing_path(paths_payload.get("data_yaml"))
+    data_root = _resolve_existing_path(paths_payload.get("data_root"))
+    if data_yaml is not None:
+        data_yaml = data_yaml.resolve()
+    if data_root is not None:
+        data_root = data_root.resolve()
+    return data_yaml, data_root
+
+
+def _confusion_index_data_paths(index_path: Path) -> tuple[Path | None, Path | None]:
+    payload = _load_json_dict(index_path)
+    paths_payload = payload.get("paths")
+    if not isinstance(paths_payload, dict):
+        return None, None
+    data_yaml = _resolve_existing_path(paths_payload.get("data_yaml"))
+    data_root = _resolve_existing_path(paths_payload.get("data_root"))
+    if data_yaml is not None:
+        data_yaml = data_yaml.resolve()
+    if data_root is not None:
+        data_root = data_root.resolve()
+    return data_yaml, data_root
+
+
+def _add_dataset_path_score(
+    *,
+    data_yaml: Path | None,
+    data_root: Path | None,
+    source_yaml: Path,
+    source_root: Path,
+) -> int:
+    score = 0
+    if data_yaml == source_yaml:
+        score += 5000
+    if data_root == source_root:
+        score += 3000
+    if data_root is not None and (_path_is_inside(source_root, data_root) or _path_is_inside(data_root, source_root)):
+        score += 1200
+    return score
+
+
+def _report_dataset_relation_score(report_json: Path, source_data_yaml: Path) -> int:
+    source_yaml = source_data_yaml.expanduser().resolve()
+    source_root = source_yaml.parent
+    source_tokens = _tokenize_path_text(source_root.name) | _tokenize_path_text(source_root.parent.name)
+    score = 0
+
+    report_data_yaml, report_data_root = _read_report_data_paths(report_json)
+    score += _add_dataset_path_score(
+        data_yaml=report_data_yaml,
+        data_root=report_data_root,
+        source_yaml=source_yaml,
+        source_root=source_root,
+    )
+
+    output_dir = report_json.expanduser().resolve().parent
+    meta_data_yaml, meta_data_root = _metadata_data_paths_for_output_dir(output_dir)
+    score += _add_dataset_path_score(
+        data_yaml=meta_data_yaml,
+        data_root=meta_data_root,
+        source_yaml=source_yaml,
+        source_root=source_root,
+    )
+
+    for index_path in (output_dir / "confusion_inputs.json", output_dir.parent / "confusion_inputs.json"):
+        if not index_path.exists():
+            continue
+        index_data_yaml, index_data_root = _confusion_index_data_paths(index_path)
+        score += _add_dataset_path_score(
+            data_yaml=index_data_yaml,
+            data_root=index_data_root,
+            source_yaml=source_yaml,
+            source_root=source_root,
+        )
+
+    path_tokens = _tokenize_path_text(str(report_json))
+    score += len(path_tokens & source_tokens) * 40
+    return score
+
+
+def _optimize_candidate_display_name(candidate: dict[str, Any]) -> str:
+    display_name = candidate.get("display_name")
+    if isinstance(display_name, str) and display_name.strip():
+        return display_name
+    report_path = candidate.get("report_json")
+    if isinstance(report_path, Path):
+        return compact_display_path(report_path)
+    infer_output_dir = candidate.get("infer_output_dir")
+    if isinstance(infer_output_dir, Path):
+        return compact_display_path(infer_output_dir)
+    return "unknown"
+
+
+def _build_combined_optimize_candidates(
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    grouped: dict[Path, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        infer_output_dir = candidate.get("infer_output_dir")
+        experiment_dir = candidate.get("experiment_dir")
+        report_json = candidate.get("report_json")
+        if not isinstance(infer_output_dir, Path) or not isinstance(experiment_dir, Path) or not isinstance(report_json, Path):
+            continue
+        split_name = str(candidate.get("split_name") or infer_output_dir.name)
+        if split_name not in {"train", "test", "val"}:
+            continue
+        grouped.setdefault(experiment_dir, []).append(candidate)
+
+    combined_candidates: list[dict[str, Any]] = []
+    supplemental_candidates: list[dict[str, Any]] = []
+    preferred_report_order = {"test": 0, "val": 1, "train": 2}
+    for experiment_dir, group in grouped.items():
+        infer_root = group[0]["infer_output_dir"].parent
+        if not isinstance(infer_root, Path) or not infer_root.exists():
+            continue
+        original_group_len = len(group)
+        _append_available_split_candidates(
+            group,
+            experiment_dir=experiment_dir,
+            infer_root=infer_root,
+        )
+        supplemental_candidates.extend(group[original_group_len:])
+        if len(group) < 2:
+            continue
+        if not _infer_output_has_prediction_json(infer_root):
+            continue
+        split_names = sorted(
+            {
+                str(item.get("split_name") or item["infer_output_dir"].name)
+                for item in group
+                if isinstance(item.get("infer_output_dir"), Path)
+            },
+            key=lambda name: preferred_report_order.get(name, 99),
+        )
+        best_report_candidate = sorted(
+            group,
+            key=lambda item: (
+                preferred_report_order.get(str(item.get("split_name") or item["infer_output_dir"].name), 99)
+                if isinstance(item.get("infer_output_dir"), Path)
+                else 99,
+                -int(item["report_json"].stat().st_mtime) if isinstance(item.get("report_json"), Path) else 0,
+            ),
+        )[0]
+        dataset_tag = compact_display_path(experiment_dir)
+        all_report_jsons = [
+            item["report_json"] for item in group
+            if isinstance(item.get("report_json"), Path)
+        ]
+        combined_candidates.append(
+            {
+                "report_json": best_report_candidate["report_json"],
+                "report_jsons": all_report_jsons if len(all_report_jsons) > 1 else None,
+                "infer_output_dir": infer_root,
+                "experiment_dir": experiment_dir,
+                "has_prediction_json": True,
+                "display_name": f"{dataset_tag}  [联合: {' + '.join(split_names)}]",
+                "candidate_kind": "combined",
+                "split_names": split_names,
+                "relation_score": max(int(item.get("relation_score") or 0) for item in group),
+                "mtime": max(int(item.get("mtime") or 0) for item in group),
+            }
+        )
+    return [*combined_candidates, *supplemental_candidates]
+
+
+def _split_name_from_output_dir(output_dir: Path) -> str | None:
+    run_meta_path = output_dir.expanduser().resolve() / "run_meta.json"
+    payload = _load_json_dict(run_meta_path) if run_meta_path.exists() else {}
+    split_value = payload.get("split")
+    if isinstance(split_value, str) and split_value in {"train", "test", "val"}:
+        return split_value
+    if output_dir.name in {"train", "test", "val"}:
+        return output_dir.name
+    lowered = output_dir.name.lower()
+    for split in ("train", "test", "val"):
+        if lowered.endswith(f"-{split}") or lowered.endswith(f"_{split}"):
+            return split
+    return None
+
+
+def _append_available_split_candidates(
+    group: list[dict[str, Any]],
+    *,
+    experiment_dir: Path,
+    infer_root: Path,
+) -> None:
+    existing_splits = {
+        str(item.get("split_name"))
+        for item in group
+        if item.get("split_name") in {"train", "test", "val"}
+    }
+    relation_score = max((int(item.get("relation_score") or 0) for item in group), default=0)
+    mtime = max((int(item.get("mtime") or 0) for item in group), default=0)
+    for split in ("test", "val", "train"):
+        if split in existing_splits:
+            continue
+        output_dir = infer_root / split
+        if not output_dir.exists() or not _infer_output_has_prediction_json(output_dir):
+            continue
+        group.append(
+            {
+                "report_json": None,
+                "infer_output_dir": output_dir,
+                "experiment_dir": experiment_dir,
+                "has_prediction_json": True,
+                "display_name": f"{compact_display_path(output_dir)}  [单 split: {split}]",
+                "candidate_kind": "single",
+                "split_name": split,
+                "relation_score": relation_score,
+                "mtime": mtime,
+            }
+        )
+
+
+def _dedupe_single_optimize_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    best_by_key: dict[tuple[Path | None, str, Path], dict[str, Any]] = {}
+    for candidate in candidates:
+        infer_output_dir = candidate.get("infer_output_dir")
+        report_json = candidate.get("report_json")
+        if not isinstance(infer_output_dir, Path):
+            if isinstance(report_json, Path):
+                infer_output_dir = report_json.parent
+            else:
+                continue
+        split_name = str(candidate.get("split_name") or _split_name_from_output_dir(infer_output_dir) or infer_output_dir.name)
+        experiment_dir = candidate.get("experiment_dir")
+        key = (
+            experiment_dir if isinstance(experiment_dir, Path) else None,
+            split_name,
+            infer_output_dir.expanduser().resolve(),
+        )
+        current = best_by_key.get(key)
+        if current is None:
+            best_by_key[key] = candidate
+            continue
+        current_mtime = int(current.get("mtime") or 0)
+        candidate_mtime = int(candidate.get("mtime") or 0)
+        if candidate_mtime > current_mtime:
+            best_by_key[key] = candidate
+    return list(best_by_key.values())
+
+
+def _sort_optimize_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    split_order = {"test": 0, "val": 1, "train": 2}
+    kind_order = {"combined": 0, "single": 1, "custom": 2}
+
+    def _key(candidate: dict[str, Any]) -> tuple[int, int, str, int, int, str]:
+        experiment_dir = candidate.get("experiment_dir")
+        experiment_text = str(experiment_dir) if isinstance(experiment_dir, Path) else ""
+        split_name = str(candidate.get("split_name") or "")
+        split_count = len(candidate.get("split_names") or [])
+        return (
+            -int(candidate.get("relation_score") or 0),
+            -int(candidate.get("mtime") or 0),
+            experiment_text.lower(),
+            kind_order.get(str(candidate.get("candidate_kind")), 9),
+            split_order.get(split_name, 9) if split_count <= 1 else -split_count,
+            _optimize_candidate_display_name(candidate).lower(),
+        )
+
+    return sorted(candidates, key=_key)
+
+
+def _collect_optimize_analysis_candidates(source_data_yaml: Path) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for report_path in _find_recent_test_reports(source_data_yaml):
+        infer_output_dir = _infer_output_dir_from_report(report_path)
+        output_dir = infer_output_dir if infer_output_dir is not None else report_path.parent
+        split_name = _split_name_from_output_dir(report_path.parent) or _split_name_from_output_dir(output_dir)
+        relation_score = _report_dataset_relation_score(report_path, source_data_yaml)
+        mtime = int(report_path.stat().st_mtime)
+        candidates.append(
+            {
+                "report_json": report_path,
+                "infer_output_dir": infer_output_dir,
+                "experiment_dir": _experiment_dir_from_report(report_path),
+                "has_prediction_json": infer_output_dir is not None,
+                "display_name": f"{compact_display_path(report_path)}  [单 split: {split_name or '?'}]",
+                "candidate_kind": "single",
+                "split_name": split_name,
+                "relation_score": relation_score,
+                "mtime": mtime,
+            }
+        )
+    candidates = _dedupe_single_optimize_candidates(candidates)
+    combined_candidates = _build_combined_optimize_candidates(candidates)
+    return _sort_optimize_candidates([*combined_candidates, *candidates])
+
+
+def _pick_best_optimize_analysis_candidate(
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for candidate in candidates:
+        if candidate["has_prediction_json"] and int(candidate.get("relation_score") or 0) > 0:
+            return candidate
+    return None
+
+
+def _prompt_optimize_report_json(
+    source_data_yaml: Path,
+    candidates: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """让用户选择一个 optimize 分析候选，或跳过。"""
+    if candidates is None:
+        candidate_items = _collect_optimize_analysis_candidates(source_data_yaml)
+    else:
+        candidate_items = candidates
+    print("\n[可选] 选择已有分析候选以复用 report 和混淆矩阵输入。")
+    if not candidate_items:
+        print("  当前列表为空，直接回车将自动运行 infer。")
+        return None
+
+    print("  可用候选（按数据集关系排序）：")
+    for idx, candidate in enumerate(candidate_items, start=1):
+        report_status = "含 report" if isinstance(candidate.get("report_json"), Path) else "仅预测 JSON"
+        cm_status = "可直接构建混淆矩阵" if candidate["has_prediction_json"] else "需要补预测 JSON"
+        print(f"    {idx}. {_optimize_candidate_display_name(candidate)}  [{cm_status}]")
+        print(f"       {report_status}")
+    print("  直接回车自动运行 infer，输入编号选择，输入 custom 手动输入 report")
+
+    while True:
+        raw = read_input("请选择: ").strip()
+        if not raw:
+            return None
+        if raw.lower() == "custom":
+            val = prompt_text("test_report.json 路径", None)
+            if val:
+                p = Path(val).expanduser().resolve()
+                if p.exists():
+                    infer_output_dir = _infer_output_dir_from_report(p)
+                    return {
+                        "report_json": p,
+                        "infer_output_dir": infer_output_dir,
+                        "experiment_dir": _experiment_dir_from_report(p),
+                        "has_prediction_json": infer_output_dir is not None,
+                        "display_name": compact_display_path(p),
+                        "candidate_kind": "custom",
+                    }
+                print(f"  文件不存在: {p}")
+            return None
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(candidate_items):
+                return candidate_items[idx]
+        print("  无效选择，请重新输入。")
+
+
+def _prompt_optimize_infer_output_dir() -> Path | None:
+    """让用户选择 infer 输出目录用于混淆矩阵分析，或跳过。"""
+    print("\n[可选] 选择推理输出目录以构建混淆矩阵（需要推理时开启了 --save-json）。")
+    print("  直接回车跳过（跳过后仅根据 AP/F1 分析劣质类别，不分析合并候选）")
+
+    raw = read_input("infer 输出目录路径（回车跳过）: ").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (rt.ROOT_DIR / p).resolve()
+    else:
+        p = p.resolve()
+    if not p.exists():
+        print(f"  目录不存在，已跳过: {p}")
+        return None
+    return p
+
+
+def _is_prediction_json(path: Path) -> bool:
+    payload = _load_json_dict(path)
+    return isinstance(payload.get("predictions"), list)
+
+
+def _infer_output_has_prediction_json(output_dir: Path) -> bool:
+    output_dir = output_dir.expanduser().resolve()
+    search_dirs = [output_dir / rt.INFER_TEMP_DIRNAME / "json", output_dir]
+    seen: set[Path] = set()
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+        for json_path in search_dir.rglob("*.json"):
+            resolved = json_path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if json_path.name in {"run_meta.json", "metrics_summary.json"}:
+                continue
+            if "report" in json_path.name or "summary" in json_path.name or "manifest" in json_path.name:
+                continue
+            if _is_prediction_json(json_path):
+                return True
+    return False
+
+
+def _confusion_input_dirs_from_index(index_path: Path) -> list[Path]:
+    payload = _load_json_dict(index_path)
+    paths_payload = payload.get("paths")
+    dirs: list[Path] = []
+    if not isinstance(paths_payload, dict):
+        paths_payload = {}
+    for key in ("output_dir", "prediction_json_dir"):
+        path = _resolve_existing_path(paths_payload.get(key))
+        if path is not None:
+            dirs.append(path)
+    split_outputs = payload.get("split_outputs")
+    if isinstance(split_outputs, list):
+        for item in split_outputs:
+            if not isinstance(item, dict):
+                continue
+            for key in ("output_dir", "prediction_json_dir"):
+                path = _resolve_existing_path(item.get(key))
+                if path is not None:
+                    dirs.append(path)
+    return dirs
+
+
+def _infer_output_dir_from_report(report_json: Path) -> Path | None:
+    """从 test_report 附近自动推断可用于混淆矩阵的 infer 输出目录。"""
+    report_json = report_json.expanduser().resolve()
+    candidates: list[Path] = []
+
+    confusion_inputs_path = report_json.parent / "confusion_inputs.json"
+    if confusion_inputs_path.exists():
+        candidates.extend(_confusion_input_dirs_from_index(confusion_inputs_path))
+
+    run_meta_path = report_json.parent / "run_meta.json"
+    run_meta = _load_json_dict(run_meta_path) if run_meta_path.exists() else {}
+    artifacts_payload = run_meta.get("artifacts")
+    if isinstance(artifacts_payload, dict):
+        confusion_inputs = _resolve_existing_path(artifacts_payload.get("confusion_inputs"))
+        if confusion_inputs is not None:
+            candidates.extend(_confusion_input_dirs_from_index(confusion_inputs))
+    paths_payload = run_meta.get("paths")
+    if isinstance(paths_payload, dict):
+        for key in ("output_dir", "temp_dir"):
+            path = _resolve_existing_path(paths_payload.get(key))
+            if path is None:
+                continue
+            candidates.append(path.parent if path.name == rt.INFER_TEMP_DIRNAME else path)
+
+    candidates.append(report_json.parent)
+
+    root_confusion_inputs_path = report_json.parent.parent / "confusion_inputs.json"
+    if root_confusion_inputs_path.exists():
+        candidates.extend(_confusion_input_dirs_from_index(root_confusion_inputs_path))
+
+    candidates.append(report_json.parent.parent)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if _infer_output_has_prediction_json(resolved):
+            return resolved
+    return None
+
+
+def _experiment_dir_from_report(report_json: Path) -> Path | None:
+    run_meta_path = report_json.expanduser().resolve().parent / "run_meta.json"
+    run_meta = _load_json_dict(run_meta_path) if run_meta_path.exists() else {}
+    paths_payload = run_meta.get("paths")
+    if not isinstance(paths_payload, dict):
+        return None
+    return _resolve_existing_path(paths_payload.get("experiment_dir"))
+
+
+def _cleanup_optimize_temp_dir(temp_dir: Path | None) -> None:
+    if temp_dir is not None and temp_dir.exists():
+        shutil.rmtree(temp_dir)
+
+
+def _prompt_optimize_infer_split() -> str:
+    return prompt_choice(
+        "请选择用于混淆矩阵的推理范围",
+        [
+            ("train", "train"),
+            ("test", "test"),
+            ("val", "val"),
+            ("test+val", "test+val"),
+            ("all", "all (train + test + val)"),
+        ],
+    )
+
+
+def _find_auto_infer_report(temp_dir: Path, splits: list[str]) -> Path | None:
+    preferred_splits = [split for split in ("test", "val", "train") if split in splits]
+    for split in preferred_splits:
+        split_dir = temp_dir / split
+        for pattern in ("*-test_report.json", "test_report.json"):
+            candidates = sorted(
+                split_dir.rglob(pattern),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                return candidates[0]
+    for pattern in ("*-test_report.json", "test_report.json"):
+        candidates = sorted(
+            temp_dir.rglob(pattern),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def _run_auto_infer_for_optimize(
+    source_data_yaml: Path,
+    *,
+    report_json_for_quality: Path | None = None,
+    experiment_dir: Path | None = None,
+) -> tuple[Path | None, Path | None, Path | None, Path | None]:
+    """为 optimize 自动运行推理，返回 (test_report_path, infer_output_dir, experiment_dir, temp_dir)。
+
+    infer 输出统一写入系统临时目录，optimize 完成后由调用方负责清理。
+    """
+    from . import det_infer  # 延迟导入，避免循环
+
+    print("\n[auto-infer] 自动运行推理以生成 test_report.json 和预测 JSON（用于混淆矩阵分析）。")
+    if experiment_dir is None:
+        experiment_dir = prompt_experiment_dir("det", rt.INFER_DEFAULT_EXPERIMENT_DIR)
+
+    split_choice = _prompt_optimize_infer_split()
+    rt.import_runtime_dependencies()
+    data_cfg = rt.load_data_config(source_data_yaml)
+    splits = det_infer.resolve_dataset_infer_splits(data_cfg, split_choice)
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="lightly-train-optimize-", dir="/tmp"))
+    save_test_report = report_json_for_quality is None
+
+    print("\n[auto-infer] 配置摘要")
+    print(f"  experiment_dir : {compact_display_path(experiment_dir)}")
+    print(f"  data           : {compact_display_path(source_data_yaml)}")
+    print(f"  split          : {split_choice} -> {', '.join(splits)}")
+    print(f"  output_dir     : {compact_display_path(temp_dir)}  （临时目录，分析后自动清理）")
+    print(f"  score_threshold: {rt.INFER_DEFAULT_SCORE_THRESHOLD}")
+    print(f"  save_json      : True （用于混淆矩阵分析）")
+    print(f"  save_test_report: {save_test_report}")
+
+    if not prompt_yes_no("确认运行推理", True):
+        _cleanup_optimize_temp_dir(temp_dir)
+        return None, None, None, None
+
+    infer_args = argparse.Namespace(
+        tool_task="det",
+        tool_action="infer",
+        command="infer",
+        experiment_dir=experiment_dir,
+        checkpoint=None,
+        image=None,
+        image_dir=None,
+        data=source_data_yaml,
+        split=split_choice,
+        output_dir=temp_dir,
+        score_threshold=rt.INFER_DEFAULT_SCORE_THRESHOLD,
+        device=rt.INFER_DEFAULT_DEVICE,
+        save_visualization=False,
+        save_json=True,
+        save_txt=False,
+        compute_metrics=save_test_report,
+        metric_classwise=False,
+        report_iou_threshold=rt.INFER_DEFAULT_REPORT_IOU_THRESHOLD,
+        bad_class_map50_threshold=rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD,
+        save_test_report=save_test_report,
+        report_path=None,
+        overwrite=True,
+        infer_config_mode="default",
+        shard_index=None,
+        num_shards=1,
+        dry_run=False,
+        skip_important_artifacts=True,
+        selected_splits=None,
+        multi_output_root=None,
+    )
+    try:
+        det_infer.run_infer(infer_args)
+    except Exception:
+        _cleanup_optimize_temp_dir(temp_dir)
+        raise
+
+    # 在 temp_dir 下找最新生成的 test_report
+    report_json: Path | None = report_json_for_quality
+    infer_output_dir: Path | None = None
+    if save_test_report and temp_dir.exists():
+        report_json = _find_auto_infer_report(temp_dir, splits)
+        if report_json is not None:
+            infer_output_dir = temp_dir
+    elif _infer_output_has_prediction_json(temp_dir):
+        infer_output_dir = temp_dir
+
+    if report_json is None and save_test_report:
+        print("\n[auto-infer] 警告：未找到 test_report.json，请手动指定路径。")
+    if infer_output_dir is None:
+        print("\n[auto-infer] 警告：未找到预测 JSON。")
+    else:
+        print(f"\n[auto-infer] 完成！")
+        if report_json is not None:
+            print(f"  test_report    : {compact_display_path(report_json)}")
+        print(f"  infer_output_dir: {compact_display_path(infer_output_dir)}")
+        print("  临时目录将在 optimize 完成后自动清理")
+
+    return report_json, infer_output_dir, experiment_dir, temp_dir
+
+
+def _prompt_gpu_selection(available_gpus: list[tuple[int, str]]) -> list[int] | str:
+    """让用户选择使用哪几张 GPU，返回 list[int] 或 "auto"。"""
+    if not available_gpus:
+        print("\n未检测到可用 GPU，将使用 CPU 训练。")
+        return "auto"
+
+    print("\n检测到以下 GPU：")
+    for idx, name in available_gpus:
+        print(f"  {idx}: {name}")
+
+    if len(available_gpus) == 1:
+        use_it = prompt_yes_no(f"使用 GPU 0 ({available_gpus[0][1]}) 训练", True)
+        return [0] if use_it else "auto"
+
+    print("  输入编号（逗号分隔，如 0,1）选择指定 GPU，直接回车使用全部 GPU")
+    while True:
+        raw = read_input("请选择 GPU: ").strip()
+        if not raw:
+            return "auto"
+        parts = [p.strip() for p in raw.split(",")]
+        try:
+            indices = [int(p) for p in parts if p]
+        except ValueError:
+            print("  请输入数字编号，例如 0 或 0,1")
+            continue
+        valid_indices = {idx for idx, _ in available_gpus}
+        invalid = [i for i in indices if i not in valid_indices]
+        if invalid:
+            print(f"  无效编号: {invalid}，请重新输入。")
+            continue
+        if not indices:
+            return "auto"
+        return indices
+
+
+def _prompt_train_duration(
+    data_yaml: Path,
+) -> tuple[int | str, int | str]:
+    """询问训练时长（epoch 模式或 step 模式），返回 (steps, batch_size)。
+
+    epoch 模式：由用户输入 epochs + batch_size → 自动换算 steps。
+    step 模式 ：由用户直接输入 steps（可为 "auto"）。
+
+    epoch 模式下若数据集图片数读取失败，会显式降级到 step 输入而不是错误地把
+    epochs 当 steps 用（之前的兜底会让 10 epochs 跑成 10 steps）。
+    """
+    from . import train_tools
+
+    def _prompt_step_input(prompt: str = "训练步数 --steps [auto]: ") -> int | str:
+        raw = read_input(prompt).strip()
+        if not raw or raw.lower() == "auto":
+            return "auto"
+        try:
+            return int(raw)
+        except ValueError:
+            print("  请输入整数或 auto，默认改为 auto。")
+            return "auto"
+
+    mode = prompt_choice(
+        "请选择训练时长输入方式",
+        [
+            ("epoch", "epoch  输入轮数，自动换算 steps"),
+            ("step",  "step   直接输入 steps（可输入 auto）"),
+        ],
+    )
+
+    if mode == "step":
+        return _prompt_step_input(), "auto"
+
+    # epoch 模式
+    epochs = prompt_int("训练轮数 --epochs", 10)
+    batch_size = prompt_int("批大小 --batch-size（epoch 换算需要，不可为 auto）", 32)
+
+    try:
+        steps_calc, num_train = train_tools.estimate_steps_from_epochs(data_yaml, epochs, batch_size)
+    except Exception as exc:
+        steps_calc, num_train = None, 0
+        print(f"  ⚠ 换算出错：{exc}")
+
+    if steps_calc is None:
+        print(f"  ⚠ 无法从 {compact_display_path(data_yaml)} 读取 train 图片数，epoch→steps 失败。")
+        print( "    请确认 data.yaml 的 train 路径正确，或直接输入步数。")
+        return _prompt_step_input("退回 step 模式，请输入 --steps [auto]: "), batch_size
+
+    print(
+        f"  换算结果: {epochs} epochs × ⌈{num_train} 图 ÷ batch {batch_size}⌉"
+        f" = {steps_calc} steps"
+    )
+    return steps_calc, batch_size
+
+
+def _prompt_train_model(recent_models: list[str], default: str) -> str:
+    """让用户选择或输入模型字符串。"""
+    if recent_models:
+        print("\n最近使用过的模型：")
+        for idx, m in enumerate(recent_models, start=1):
+            print(f"  {idx}. {m}")
+        print("  输入编号选择，回车使用默认，或直接输入新模型名称")
+    else:
+        print(f"\n模型名称示例: dinov3/vits16-ltdetr, dinov3/vitl16-ltdetr")
+
+    while True:
+        raw = read_input(f"模型 [{default}]: ").strip()
+        if not raw:
+            return default
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(recent_models):
+                return recent_models[idx]
+            print("  编号超出范围，请重新输入。")
+            continue
+        return raw
+
+
+def _prompt_backbone_weights(weight_files: list[Path]) -> Path | None:
+    """让用户选择骨干预训练权重文件，或跳过。"""
+    print("\n[可选] 选择骨干预训练权重文件（回车跳过）：")
+    if not weight_files:
+        print("  未在 weights/ 目录下发现权重文件。")
+    else:
+        for idx, p in enumerate(weight_files, start=1):
+            print(f"  {idx}. {compact_display_path(p)}")
+    print("  输入编号选择，回车跳过，输入 custom 手动输入路径")
+
+    while True:
+        raw = read_input("请选择: ").strip()
+        if not raw:
+            return None
+        if raw.lower() == "custom":
+            path_raw = read_input("权重文件路径: ").strip()
+            if not path_raw:
+                return None
+            p = Path(path_raw).expanduser()
+            return p.resolve() if p.is_absolute() else (rt.ROOT_DIR / p).resolve()
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(weight_files):
+                return weight_files[idx]
+        print("  无效选择，请重新输入。")
+
+
+def _build_train_args(task: str) -> argparse.Namespace | None:
+    """交互收集训练参数，返回 Namespace 或 None（用户取消）。"""
+    from . import train_tools
+
+    print(f"\n{task}/train 训练参数配置")
+
+    # 检测 GPU（供后续选择使用）
+    available_gpus = train_tools.detect_available_gpus()
+
+    # 先选模式：新训练 or 续跑
+    train_mode = prompt_choice(
+        "请选择训练模式",
+        [
+            ("new",    "new    新建训练"),
+            ("resume", "resume 续跑（从已有实验继续）"),
+        ],
+    )
+
+    # ------------------------------------------------------------------ #
+    # 路径 A：新训练
+    # ------------------------------------------------------------------ #
+    if train_mode == "new":
+        # A1. 数据集
+        data_yaml = prompt_dataset_yaml(task, Path(rt.INFER_DEFAULT_DATA))
+
+        # A2. 模型
+        recent_models = train_tools.discover_recent_models(task)
+        default_model = recent_models[0] if recent_models else "dinov3/vits16-ltdetr"
+        model = _prompt_train_model(recent_models, default_model)
+
+        # A3. 骨干权重（可选）
+        weight_files = train_tools.discover_weight_files()
+        backbone_weights = _prompt_backbone_weights(weight_files)
+
+        # A4. 训练时长
+        steps, batch_size = _prompt_train_duration(data_yaml)
+
+        # A5. GPU 选择
+        devices = _prompt_gpu_selection(available_gpus)
+
+        # A6. 输出目录（循环：若存在且非空，允许覆盖 / 输入新路径 / 取消）
+        default_out = train_tools.build_default_out_dir(data_yaml, model)
+        overwrite = False
+        out_dir: Path | None = None
+        while out_dir is None:
+            try:
+                default_out_display = str(default_out.relative_to(rt.ROOT_DIR))
+            except ValueError:
+                default_out_display = str(default_out)
+            out_raw = read_input(f"\n训练输出目录 [{default_out_display}]: ").strip()
+            if not out_raw:
+                candidate = default_out
+            else:
+                p = Path(out_raw).expanduser()
+                candidate = p.resolve() if p.is_absolute() else (rt.ROOT_DIR / p).resolve()
+
+            if candidate.exists() and any(candidate.iterdir()):
+                choice = prompt_choice(
+                    f"输出目录已存在且非空：{compact_display_path(candidate)}",
+                    [
+                        ("overwrite", "overwrite 覆盖（清空后重新训练）"),
+                        ("rename",    "rename    输入另一个目录名"),
+                        ("cancel",    "cancel    取消本次训练"),
+                    ],
+                )
+                if choice == "overwrite":
+                    overwrite = True
+                    out_dir = candidate
+                elif choice == "cancel":
+                    print("已取消。")
+                    return None
+                else:
+                    default_out = candidate  # 把当前选择作为下一次默认，方便手动加后缀
+                    continue
+            else:
+                out_dir = candidate
+
+        args = argparse.Namespace(
+            tool_task=task,
+            tool_action="train",
+            data_yaml=data_yaml,
+            model=model,
+            backbone_weights=backbone_weights,
+            out_dir=out_dir,
+            steps=steps,
+            batch_size=batch_size,
+            num_workers="auto",
+            devices=devices,
+            checkpoint=None,
+            overwrite=overwrite,
+            resume_interrupted=False,
+        )
+
+        # A7. 确认
+        gpu_display = (
+            ", ".join(f"{i}:{name}" for i, name in available_gpus if i in devices)
+            if isinstance(devices, list) else "auto (全部)"
+        )
+        print(f"\n{task}/train 新训练配置确认")
+        print(f"  data_yaml       : {compact_display_path(data_yaml)}")
+        print(f"  model           : {model}")
+        print(f"  backbone_weights: {compact_display_path(backbone_weights) if backbone_weights else '(无)'}")
+        print(f"  steps           : {steps}")
+        print(f"  batch_size      : {batch_size}")
+        print(f"  devices         : {devices}  ({gpu_display})")
+        print(f"  out_dir         : {compact_display_path(out_dir)}")
+        if overwrite:
+            print(f"  overwrite       : True")
+
+        if prompt_yes_no("确认开始训练吗", True):
+            return args
+        print("已取消。")
+        return None
+
+    # ------------------------------------------------------------------ #
+    # 路径 B：续跑
+    # ------------------------------------------------------------------ #
+    # B1. 选择实验目录（要求有 checkpoint）
+    all_dirs = list_experiment_dirs(task=task)
+    checkpoint_dirs = [d for d in all_dirs if rt.is_experiment_dir(d, require_checkpoint=True)]
+    if not checkpoint_dirs:
+        checkpoint_dirs = [d for d in list_experiment_dirs() if rt.is_experiment_dir(d, require_checkpoint=True)]
+
+    if not checkpoint_dirs:
+        print("未找到含 checkpoint 的实验目录，请先完成至少一次训练。")
+        return None
+
+    src_experiment_dir = prompt_experiment_dir(task, checkpoint_dirs[0])
+
+    # 读取原始训练参数并回显
+    orig_params = train_tools.read_original_train_params(src_experiment_dir)
+    if orig_params:
+        print("\n原始训练参数摘要：")
+        for k in ("model", "steps", "batch_size", "devices", "data"):
+            if k in orig_params:
+                print(f"  {k}: {orig_params[k]}")
+    else:
+        print("\n⚠ 未能从 train.log 解析到原始训练参数；续跑可能缺少 model/data 字段。")
+
+    # 解析原始 data 路径：可能是相对路径，针对 ROOT_DIR 还原
+    orig_data_raw = orig_params.get("data")
+    orig_data_path: Path | None = None
+    if isinstance(orig_data_raw, str) and orig_data_raw.strip():
+        cand = Path(orig_data_raw).expanduser()
+        orig_data_path = cand.resolve() if cand.is_absolute() else (rt.ROOT_DIR / cand).resolve()
+
+    # B2. 是否修改参数
+    keep_params = prompt_yes_no("是否保持原参数不变（resume_interrupted 模式）", True)
+
+    if keep_params:
+        if not orig_params.get("model"):
+            print("无法续跑：原 train.log 没有 model 字段，请改用「修改参数」从 checkpoint 微调。")
+            return None
+        if orig_data_path is None or not orig_data_path.exists():
+            print(f"无法续跑：原数据集路径无效或不存在 ({orig_data_raw})。请改用「修改参数」并重新指定数据集。")
+            return None
+
+        # B2a. 仅选 GPU
+        devices = _prompt_gpu_selection(available_gpus)
+
+        args = argparse.Namespace(
+            tool_task=task,
+            tool_action="train",
+            data_yaml=orig_data_path,
+            model=orig_params["model"],
+            backbone_weights=None,
+            out_dir=src_experiment_dir,
+            steps=orig_params.get("steps", "auto"),
+            batch_size=orig_params.get("batch_size", "auto"),
+            num_workers="auto",
+            devices=devices,
+            checkpoint=None,
+            overwrite=False,
+            resume_interrupted=True,
+        )
+
+        gpu_display = (
+            ", ".join(f"{i}:{name}" for i, name in available_gpus if i in devices)
+            if isinstance(devices, list) else "auto (全部)"
+        )
+        print(f"\n{task}/train 续跑（保持原参数）配置确认")
+        print(f"  mode            : resume_interrupted")
+        print(f"  out_dir         : {compact_display_path(src_experiment_dir)}")
+        print(f"  model           : {args.model}")
+        print(f"  steps           : {args.steps}")
+        print(f"  devices         : {devices}  ({gpu_display})")
+
+        if prompt_yes_no("确认开始训练吗", True):
+            return args
+        print("已取消。")
+        return None
+
+    # 修改参数：fine-tune from checkpoint
+    # 找到 last.ckpt
+    ckpt_candidates = rt.experiment_checkpoint_candidates(src_experiment_dir)
+    # 优先 last.ckpt，然后 last.pt，然后 best
+    last_ckpt: Path | None = None
+    for cand in ckpt_candidates:
+        if "last" in cand.name and cand.exists():
+            last_ckpt = cand
+            break
+    if last_ckpt is None:
+        for cand in ckpt_candidates:
+            if cand.exists():
+                last_ckpt = cand
+                break
+    if last_ckpt is None:
+        print("未找到可用 checkpoint 文件，无法续跑。")
+        return None
+
+    # 数据集（默认复用原实验的；若原路径无效则强制重选）
+    if orig_data_path is None:
+        orig_data_path = Path(rt.INFER_DEFAULT_DATA)
+        if not orig_data_path.is_absolute():
+            orig_data_path = (rt.ROOT_DIR / orig_data_path).resolve()
+    if not orig_data_path.exists():
+        print(f"原数据集不存在: {compact_display_path(orig_data_path)}，请重新指定。")
+        data_yaml = prompt_dataset_yaml(task, orig_data_path)
+    else:
+        reuse_data = prompt_yes_no(f"复用原数据集 [{compact_display_path(orig_data_path)}]", True)
+        data_yaml = orig_data_path if reuse_data else prompt_dataset_yaml(task, orig_data_path)
+
+    # B2c. 训练时长
+    steps, batch_size = _prompt_train_duration(data_yaml)
+
+    # B2d. GPU 选择
+    devices = _prompt_gpu_selection(available_gpus)
+
+    # B2e. 模型字符串（原 train.log 缺失时让用户补）
+    orig_model = (orig_params.get("model") or "").strip()
+    if not orig_model:
+        print("\n原 train.log 没有 model 字段，请手动输入要使用的模型。")
+        recent_models = train_tools.discover_recent_models(task)
+        default_model = recent_models[0] if recent_models else "dinov3/vits16-ltdetr"
+        orig_model = _prompt_train_model(recent_models, default_model)
+
+    # B2f. 新输出目录（与 path A 一致：存在且非空时给覆盖 / 改名 / 取消三选项）
+    default_out = train_tools.build_default_out_dir(data_yaml, orig_model or "ft")
+    overwrite = False
+    out_dir: Path | None = None
+    while out_dir is None:
+        try:
+            default_out_display = str(default_out.relative_to(rt.ROOT_DIR))
+        except ValueError:
+            default_out_display = str(default_out)
+        out_raw = read_input(f"\n新训练输出目录 [{default_out_display}]: ").strip()
+        if not out_raw:
+            candidate = default_out
+        else:
+            p = Path(out_raw).expanduser()
+            candidate = p.resolve() if p.is_absolute() else (rt.ROOT_DIR / p).resolve()
+
+        if candidate.exists() and any(candidate.iterdir()):
+            choice = prompt_choice(
+                f"输出目录已存在且非空：{compact_display_path(candidate)}",
+                [
+                    ("overwrite", "overwrite 覆盖（清空后重新训练）"),
+                    ("rename",    "rename    输入另一个目录名"),
+                    ("cancel",    "cancel    取消本次训练"),
+                ],
+            )
+            if choice == "overwrite":
+                overwrite = True
+                out_dir = candidate
+            elif choice == "cancel":
+                print("已取消。")
+                return None
+            else:
+                default_out = candidate
+                continue
+        else:
+            out_dir = candidate
+
+    args = argparse.Namespace(
+        tool_task=task,
+        tool_action="train",
+        data_yaml=data_yaml,
+        model=orig_model,
+        backbone_weights=None,
+        out_dir=out_dir,
+        steps=steps,
+        batch_size=batch_size,
+        num_workers="auto",
+        devices=devices,
+        checkpoint=last_ckpt,
+        overwrite=overwrite,
+        resume_interrupted=False,
+    )
+
+    gpu_display = (
+        ", ".join(f"{i}:{name}" for i, name in available_gpus if i in devices)
+        if isinstance(devices, list) else "auto (全部)"
+    )
+    print(f"\n{task}/train 续跑（修改参数）配置确认")
+    print(f"  mode            : finetune from checkpoint")
+    print(f"  checkpoint      : {compact_display_path(last_ckpt)}")
+    print(f"  data_yaml       : {compact_display_path(data_yaml)}")
+    print(f"  model           : {orig_model}")
+    print(f"  steps           : {steps}")
+    print(f"  batch_size      : {batch_size}")
+    print(f"  devices         : {devices}  ({gpu_display})")
+    print(f"  out_dir         : {compact_display_path(out_dir)}")
+    if overwrite:
+        print(f"  overwrite       : True")
+
+    if prompt_yes_no("确认开始训练吗", True):
+        return args
+    print("已取消。")
+    return None
+
+
 def build_interactive_args() -> argparse.Namespace | None:
     task = prompt_choice(
         "请选择任务类型",
@@ -717,22 +1849,12 @@ def build_interactive_args() -> argparse.Namespace | None:
     if task == "det":
         action_options.append(("eda", "EDA 数据集分析"))
         action_options.append(("export", "export 数据集筛选"))
+        action_options.append(("optimize", "optimize 训练后数据集优化（合并/删除类别）"))
         action_options.append(("report", "report 生成实验报告"))
     action = prompt_choice(f"请选择 {task} 功能", action_options)
 
     if action == "train":
-        return confirm_args(
-            f"{task}/train",
-            argparse.Namespace(
-                tool_task=task,
-                tool_action=action,
-                script_path={
-                    "cls": rt.TRAIN_CLS_SCRIPT,
-                    "det": rt.TRAIN_DET_SCRIPT,
-                    "seg": rt.TRAIN_SEG_SCRIPT,
-                }[task],
-            ),
-        )
+        return _build_train_args(task)
 
     if task == "cls" and action == "eval":
         return confirm_args(
@@ -887,9 +2009,9 @@ def build_interactive_args() -> argparse.Namespace | None:
             save_visualization=prompt_yes_no("是否保存可视化结果 --save-visualization", True)
             if use_custom
             else True,
-            save_json=prompt_yes_no("是否保存 JSON 预测结果 --save-json", False)
+            save_json=prompt_yes_no("是否保存 JSON 预测结果 --save-json", rt.INFER_DEFAULT_SAVE_JSON)
             if use_custom
-            else False,
+            else rt.INFER_DEFAULT_SAVE_JSON,
             save_txt=prompt_yes_no("是否保存 TXT 预测结果 --save-txt", False)
             if use_custom
             else False,
@@ -922,6 +2044,86 @@ def build_interactive_args() -> argparse.Namespace | None:
             args.image_dir = prompt_required_path("图片目录 --image-dir", str(rt.INFER_DEFAULT_IMAGE_DIR))
         print(f"\n等价命令预览:\n  {build_det_cli_preview(args)}")
         return confirm_args("det/infer", args)
+
+    if task == "det" and action == "optimize":
+        print("\n训练后数据集优化：分析混淆矩阵和劣质类别，生成新数据集目录（原数据集不变）。")
+        source_data_yaml = prompt_dataset_yaml("det", Path(rt.EXPORT_DEFAULT_SOURCE_DATA))
+        optimize_candidates = _collect_optimize_analysis_candidates(source_data_yaml)
+        selected_candidate = _prompt_optimize_report_json(source_data_yaml, optimize_candidates)
+        report_json: Path | None = None
+        infer_output_dir: Path | None = None
+
+        optimize_experiment_dir: Path | None = None
+        auto_infer_temp_dir: Path | None = None
+
+        if selected_candidate is None:
+            report_json, infer_output_dir, optimize_experiment_dir, auto_infer_temp_dir = (
+                _run_auto_infer_for_optimize(source_data_yaml)
+            )
+        else:
+            selected_report_json = selected_candidate.get("report_json")
+            if isinstance(selected_report_json, Path):
+                report_json = selected_report_json
+            report_jsons = selected_candidate.get("report_jsons")
+            selected_infer_output_dir = selected_candidate.get("infer_output_dir")
+            if isinstance(selected_infer_output_dir, Path):
+                infer_output_dir = selected_infer_output_dir
+            selected_experiment_dir = selected_candidate.get("experiment_dir")
+            if isinstance(selected_experiment_dir, Path):
+                optimize_experiment_dir = selected_experiment_dir
+            if infer_output_dir is None and report_json is not None:
+                infer_output_dir = _infer_output_dir_from_report(report_json)
+            if infer_output_dir is not None:
+                print("\n[det/optimize] 已从 test_report 对应的推理输出中找到预测 JSON。")
+                print(f"  infer_output_dir : {compact_display_path(infer_output_dir)}")
+            else:
+                print("\n[det/optimize] 已选择 test_report；当前缺少可用于混淆矩阵的预测 JSON。")
+                choice = prompt_choice(
+                    "请选择处理方式",
+                    [
+                        ("auto_infer", "自动推理一次，生成混淆矩阵所需 JSON"),
+                        ("cancel", "取消本次 optimize"),
+                    ],
+                )
+                if choice == "cancel":
+                    print("已取消本次执行。")
+                    return None
+                report_json, infer_output_dir, optimize_experiment_dir, auto_infer_temp_dir = (
+                    _run_auto_infer_for_optimize(
+                        source_data_yaml,
+                        report_json_for_quality=report_json,
+                        experiment_dir=optimize_experiment_dir or _experiment_dir_from_report(report_json),  # type: ignore[arg-type]
+                    )
+                )
+                if infer_output_dir is None:
+                    _cleanup_optimize_temp_dir(auto_infer_temp_dir)
+                    print("自动推理完成后未找到预测 JSON，已取消本次执行。")
+                    return None
+
+        args = argparse.Namespace(
+            tool_task="det",
+            tool_action="optimize",
+            source_data_yaml=source_data_yaml,
+            report_json=report_json,
+            report_jsons=report_jsons,
+            infer_output_dir=infer_output_dir,
+            confusion_threshold=0.15,
+            optimize_experiment_dir=optimize_experiment_dir,
+            auto_infer_temp_dir=auto_infer_temp_dir,
+        )
+        print("\ndet/optimize 配置确认")
+        print(f"  source_data_yaml : {compact_display_path(source_data_yaml)}")
+        if report_jsons:
+            print(f"  report_json      : {len(report_jsons)} 份报告合并（{', '.join(r.stem for r in report_jsons)}）")
+        else:
+            print(f"  report_json      : {compact_display_path(report_json) if report_json else '(无)'}")
+        print(f"  infer_output_dir : {compact_display_path(infer_output_dir) if infer_output_dir else '(无)'}")
+        print(f"  confusion_threshold: 0.15 (强单向/双向混淆 >= 15% 建议合并)")
+        if prompt_yes_no("确认执行以上配置吗", True):
+            return args
+        _cleanup_optimize_temp_dir(auto_infer_temp_dir)
+        print("已取消本次执行。")
+        return None
 
     if task == "det" and action == "report":
         args = argparse.Namespace(
@@ -958,14 +2160,20 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     infer_input.add_argument("--image", type=Path, default=rt.INFER_DEFAULT_IMAGE)
     infer_input.add_argument("--image-dir", type=Path, default=None)
     infer_input.add_argument("--data", type=Path, default=None)
-    infer_parser.add_argument("--split", choices=("train", "val", "test", "all"), default=rt.INFER_DEFAULT_SPLIT)
+    infer_parser.add_argument(
+        "--split",
+        choices=("train", "val", "test", "test+val", "all"),
+        default=rt.INFER_DEFAULT_SPLIT,
+    )
     infer_parser.add_argument("--output-dir", type=Path, default=None)
     infer_parser.add_argument("--score-threshold", type=float, default=rt.INFER_DEFAULT_SCORE_THRESHOLD)
     infer_parser.add_argument("--device", type=str, default=rt.INFER_DEFAULT_DEVICE)
     infer_parser.add_argument("--save-visualization", dest="save_visualization", action="store_true")
     infer_parser.add_argument("--skip-visualization", dest="save_visualization", action="store_false")
     infer_parser.set_defaults(save_visualization=rt.INFER_DEFAULT_SAVE_VISUALIZATION)
-    infer_parser.add_argument("--save-json", action="store_true", default=rt.INFER_DEFAULT_SAVE_JSON)
+    infer_parser.add_argument("--save-json", dest="save_json", action="store_true")
+    infer_parser.add_argument("--skip-json", dest="save_json", action="store_false")
+    infer_parser.set_defaults(save_json=rt.INFER_DEFAULT_SAVE_JSON)
     infer_parser.add_argument("--save-txt", action="store_true", default=rt.INFER_DEFAULT_SAVE_TXT)
     infer_parser.add_argument("--report-iou-threshold", type=float, default=rt.INFER_DEFAULT_REPORT_IOU_THRESHOLD)
     infer_parser.add_argument(
@@ -979,6 +2187,9 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     infer_parser.add_argument("--report-path", type=Path, default=None)
     infer_parser.add_argument("--overwrite", action="store_true", default=rt.INFER_DEFAULT_OVERWRITE)
     infer_parser.add_argument("--dry-run", action="store_true", default=False)
+    infer_parser.add_argument("--skip-important-artifacts", action="store_true", default=False, help=argparse.SUPPRESS)
+    infer_parser.add_argument("--selected-splits", type=str, default=None, help=argparse.SUPPRESS)
+    infer_parser.add_argument("--multi-output-root", type=Path, default=None, help=argparse.SUPPRESS)
     infer_parser.add_argument("--shard-index", type=int, default=None, help=argparse.SUPPRESS)
     infer_parser.add_argument("--num-shards", type=int, default=1, help=argparse.SUPPRESS)
 

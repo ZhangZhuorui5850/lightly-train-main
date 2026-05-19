@@ -25,7 +25,7 @@ def test_resolve_dataset_infer_splits_supports_train_and_all() -> None:
     data_cfg = {"train": "images/train", "val": "images/val", "test": "images/test"}
 
     assert resolve_dataset_infer_splits(data_cfg, "train") == ["train"]
-    assert resolve_dataset_infer_splits(data_cfg, "all") == ["test", "val"]
+    assert resolve_dataset_infer_splits(data_cfg, "all") == ["train", "test", "val"]
 
 
 def test_build_split_output_dir_defaults_to_experiment_infer_split(tmp_path: Path) -> None:

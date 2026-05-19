@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -32,13 +33,19 @@ from .det_report import generate_report_for_infer_output
 GPU_HIGH_MEMORY_RATIO_THRESHOLD = 0.75
 
 
+@dataclass
+class SplitSample:
+    split: str
+    sample: rt.ImageSample
+
+
 def is_shard_child(args) -> bool:
     shard_index = getattr(args, "shard_index", None)
     num_shards = int(getattr(args, "num_shards", 1) or 1)
     return shard_index is not None and num_shards > 1
 
 
-def filter_samples_for_shard(samples: list[rt.ImageSample], args) -> list[rt.ImageSample]:
+def filter_samples_for_shard(samples: list[Any], args) -> list[Any]:
     if not is_shard_child(args):
         return samples
     shard_index = int(args.shard_index)
@@ -59,6 +66,19 @@ def get_input_samples(args) -> tuple[list[rt.ImageSample], dict[int, str], str]:
     data_cfg = rt.load_data_config(args.data)
     samples, class_names = rt.list_dataset_samples(data_cfg=data_cfg, split=args.split)
     return filter_samples_for_shard(samples, args), class_names, "dataset"
+
+
+def get_multi_split_input_samples(
+    args,
+    splits: list[str],
+) -> tuple[list[SplitSample], dict[int, str], dict[str, Any]]:
+    data_cfg = rt.load_data_config(args.data)
+    class_names = rt.normalize_names(data_cfg.get("names"))
+    split_samples: list[SplitSample] = []
+    for split in splits:
+        samples, _ = rt.list_dataset_samples(data_cfg=data_cfg, split=split)
+        split_samples.extend(SplitSample(split=split, sample=sample) for sample in samples)
+    return filter_samples_for_shard(split_samples, args), class_names, data_cfg
 
 
 def important_dir_from_checkpoint(checkpoint_path: Path) -> Path:
@@ -120,6 +140,34 @@ def sanitize_bad_image_class_name(value: str) -> str:
     while "--" in text:
         text = text.replace("--", "-")
     return text or "class"
+
+
+def primary_prediction_class_name(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return "no_pred"
+    best_record = max(records, key=lambda item: float(item.get("score", 0.0) or 0.0))
+    return sanitize_bad_image_class_name(str(best_record.get("class_name") or best_record.get("class_id") or "unknown"))
+
+
+def visualization_output_path(
+    images_dir: Path,
+    sample: rt.ImageSample,
+    suffix: str,
+    records: list[dict[str, Any]],
+) -> Path:
+    rel_path = relative_output_path(sample, suffix)
+    class_name = primary_prediction_class_name(records)
+    return images_dir / rel_path.with_name(f"{class_name}_{rel_path.name}")
+
+
+def find_saved_visualization_path(output_dir: Path, sample: rt.ImageSample) -> Path | None:
+    rel_path = relative_output_path(sample, rt.visualization_suffix(sample.image_path))
+    image_dir = output_dir / "images" / rel_path.parent
+    old_path = image_dir / rel_path.name
+    if old_path.exists():
+        return old_path
+    candidates = sorted(image_dir.glob(f"*_{rel_path.name}")) if image_dir.exists() else []
+    return candidates[0] if candidates else None
 
 
 def select_bad_classes_from_report(
@@ -186,11 +234,8 @@ def export_bad_class_images(
         if not matching_class_ids:
             continue
 
-        source_visualization_path = output_dir / "images" / relative_output_path(
-            sample,
-            rt.visualization_suffix(sample.image_path),
-        )
-        if not source_visualization_path.exists():
+        source_visualization_path = find_saved_visualization_path(output_dir, sample)
+        if source_visualization_path is None:
             skipped_visualizations += len(matching_class_ids)
             continue
 
@@ -258,6 +303,97 @@ def export_bad_class_images(
     print(f"bad_images saved to: {bad_images_dir}")
     return summary
 
+
+def write_confusion_inputs_index(
+    *,
+    output_dir: Path,
+    report_path: Path,
+    args,
+    data_cfg: dict[str, Any] | None,
+    split: str,
+    num_images: int,
+) -> Path | None:
+    if data_cfg is None:
+        return None
+    temp_dir = rt.infer_temp_dir(output_dir)
+    json_dir = temp_dir / "json"
+    prediction_json_count = len(list(json_dir.rglob("*.json"))) if json_dir.exists() else 0
+    payload = {
+        "task": "det",
+        "artifact": "confusion_inputs",
+        "created_at": rt.timestamp_now_iso(),
+        "split": split,
+        "num_images": num_images,
+        "prediction_json_count": prediction_json_count,
+        "paths": {
+            "output_dir": str(output_dir),
+            "prediction_json_dir": str(json_dir),
+            "report_path": str(report_path),
+            "data_yaml": str(args.data.expanduser().resolve()) if args.data is not None else None,
+            "data_root": str(data_cfg["_root_dir"]),
+        },
+        "settings": {
+            "save_json": args.save_json,
+            "score_threshold": args.score_threshold,
+            "report_iou_threshold": args.report_iou_threshold,
+        },
+    }
+    index_path = output_dir / "confusion_inputs.json"
+    index_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"confusion_inputs saved to: {index_path}")
+    return index_path
+
+
+def write_multi_split_confusion_inputs_index(
+    *,
+    output_root: Path,
+    args,
+    data_cfg: dict[str, Any] | None,
+    splits: list[str],
+) -> Path | None:
+    if data_cfg is None:
+        return None
+    split_entries: list[dict[str, Any]] = []
+    total_prediction_json_count = 0
+    for split in splits:
+        output_dir = output_root / split
+        json_dir = rt.infer_temp_dir(output_dir) / "json"
+        prediction_json_count = len(list(json_dir.rglob("*.json"))) if json_dir.exists() else 0
+        total_prediction_json_count += prediction_json_count
+        split_entries.append(
+            {
+                "split": split,
+                "output_dir": str(output_dir),
+                "prediction_json_dir": str(json_dir),
+                "prediction_json_count": prediction_json_count,
+                "report_candidates": [str(path) for path in sorted(output_dir.glob("*test_report.json"))],
+            }
+        )
+    payload = {
+        "task": "det",
+        "artifact": "confusion_inputs",
+        "created_at": rt.timestamp_now_iso(),
+        "split": getattr(args, "split", None),
+        "splits": splits,
+        "prediction_json_count": total_prediction_json_count,
+        "paths": {
+            "output_dir": str(output_root),
+            "data_yaml": str(args.data.expanduser().resolve()) if args.data is not None else None,
+            "data_root": str(data_cfg["_root_dir"]),
+        },
+        "split_outputs": split_entries,
+        "settings": {
+            "save_json": args.save_json,
+            "score_threshold": args.score_threshold,
+            "report_iou_threshold": args.report_iou_threshold,
+        },
+    }
+    index_path = output_root / "confusion_inputs.json"
+    index_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"confusion_inputs saved to: {index_path}")
+    return index_path
+
+
 def write_run_meta(
     meta_path: Path,
     *,
@@ -313,6 +449,7 @@ def write_run_meta(
         "artifacts": {
             "metrics_summary": str(output_dir / "metrics_summary.json") if args.data is not None else None,
             "bad_images": str(output_dir / "bad_images") if args.data is not None and args.save_visualization else None,
+            "confusion_inputs": str(output_dir / "confusion_inputs.json") if args.data is not None else None,
             "training_dashboard": str(dashboard_path) if dashboard_path is not None else None,
         },
     }
@@ -409,13 +546,23 @@ def update_metric(metric, label_mapping: dict[int, int], prediction, gt_boxes, g
     )
 
 
-def resolve_dataset_infer_splits(data_cfg: dict[str, Any], requested_split: str) -> list[str]:
-    if requested_split != "all":
-        return [requested_split]
+MULTI_SPLIT_MODES = {"test+val", "all"}
 
-    splits = [split for split in ("test", "val") if data_cfg.get(split)]
+
+def resolve_dataset_infer_splits(data_cfg: dict[str, Any], requested_split: str) -> list[str]:
+    split_groups = {
+        "train": ("train",),
+        "test": ("test",),
+        "val": ("val",),
+        "test+val": ("test", "val"),
+        "all": ("train", "test", "val"),
+    }
+    if requested_split not in split_groups:
+        raise ValueError(f"Unsupported split: {requested_split}")
+
+    splits = [split for split in split_groups[requested_split] if data_cfg.get(split)]
     if not splits:
-        raise ValueError("data.yaml 中未找到可用于 infer 的 test 或 val 配置。")
+        raise ValueError(f"data.yaml 中未找到可用于 infer 的 split 配置: {requested_split}")
     return splits
 
 
@@ -428,7 +575,7 @@ def build_split_output_dir(
 ) -> Path:
     split_mode = getattr(args, "requested_split", getattr(args, "split", None))
     if args.output_dir is not None:
-        return args.output_dir / split if split_mode == "all" else args.output_dir
+        return args.output_dir / split if split_mode in MULTI_SPLIT_MODES else args.output_dir
 
     experiment_dir = rt.experiment_dir_from_checkpoint_path(checkpoint_path)
     if data_cfg is None:
@@ -446,7 +593,7 @@ def build_split_report_path(
     split_mode = getattr(args, "requested_split", getattr(args, "split", None))
     if args.report_path is None:
         return rt.build_det_report_path(output_dir)
-    if split_mode != "all":
+    if split_mode not in MULTI_SPLIT_MODES:
         return args.report_path
     stem = args.report_path.stem
     suffix = args.report_path.suffix or ".json"
@@ -597,8 +744,7 @@ def build_parallel_child_command(
     )
 
     command.append("--save-visualization" if args.save_visualization else "--skip-visualization")
-    if args.save_json:
-        command.append("--save-json")
+    command.append("--save-json" if args.save_json else "--skip-json")
     if args.save_txt:
         command.append("--save-txt")
     if args.compute_metrics:
@@ -611,6 +757,12 @@ def build_parallel_child_command(
         command.append("--overwrite")
     if getattr(args, "dry_run", False):
         command.append("--dry-run")
+    if getattr(args, "skip_important_artifacts", False):
+        command.append("--skip-important-artifacts")
+    if getattr(args, "selected_splits", None):
+        command.extend(["--selected-splits", str(args.selected_splits)])
+    if getattr(args, "multi_output_root", None) is not None:
+        command.extend(["--multi-output-root", str(args.multi_output_root)])
     if shard_index is not None:
         command.extend(["--shard-index", str(shard_index), "--num-shards", str(num_shards)])
     return command
@@ -817,6 +969,145 @@ def merge_shard_results(
                 data_cfg=data_cfg,
                 split=split,
             )
+    write_confusion_inputs_index(
+        output_dir=final_output_dir,
+        report_path=build_split_report_path(
+            args=args,
+            output_dir=final_output_dir,
+            split=split,
+            checkpoint_path=checkpoint_path,
+        ),
+        args=args,
+        data_cfg=data_cfg,
+        split=split,
+        num_images=num_images,
+    )
+
+
+def run_multi_split_shard_infer(args) -> None:
+    selected_splits_raw = str(getattr(args, "selected_splits", "") or "")
+    splits = [split.strip() for split in selected_splits_raw.split(",") if split.strip()]
+    if not splits:
+        raise ValueError("Multi-split shard infer requires selected_splits.")
+
+    checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
+    args._resolved_checkpoint_path = checkpoint_path
+    split_samples, input_class_names, data_cfg = get_multi_split_input_samples(args, splits)
+    rt.ensure_image_samples(split_samples)
+
+    shard_workspace_dir = Path(args.output_dir).expanduser().resolve()
+    final_output_root = Path(getattr(args, "multi_output_root", "")).expanduser().resolve()
+    output_dirs = {split: final_output_root / split for split in splits}
+
+    model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
+    model.eval()
+    ensure_object_detection_model(model)
+    class_names = rt.merge_class_names(rt.get_model_class_names(model), input_class_names)
+
+    split_states: dict[str, dict[str, Any]] = {}
+    for split in splits:
+        split_states[split] = {
+            "num_images": 0,
+            "processed_images": 0,
+            "infer_time_sum_ms": 0.0,
+            "metrics_meta": {"images_with_labels": 0, "images_without_labels": 0},
+            "legacy_class_data": {},
+            "total_gt": 0,
+            "total_pred": 0,
+            "total_tp": 0,
+            "metric_entries": [],
+        }
+
+    print(f"Loaded checkpoint: {checkpoint_path}")
+    print(f"Input mode: dataset")
+    print(f"Images to process: {len(split_samples)}")
+    print(f"Selected splits: {', '.join(splits)}")
+
+    for idx, split_sample in enumerate(split_samples, start=1):
+        split = split_sample.split
+        sample = split_sample.sample
+        state = split_states[split]
+        state["num_images"] += 1
+
+        output_dir = output_dirs[split]
+        temp_dir = rt.infer_temp_dir(output_dir)
+        images_dir = output_dir / "images"
+        json_dir = temp_dir / "json"
+        txt_dir = temp_dir / "txt"
+
+        with rt.Image.open(sample.image_path) as image:
+            image_size = image.size
+            predict_path = sample.image_path
+            if image.mode != "RGB":
+                tmp_dir = temp_dir / "_tmp_rgb"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                predict_path = tmp_dir / relative_output_path(sample, ".jpg")
+                predict_path.parent.mkdir(parents=True, exist_ok=True)
+                image.convert("RGB").save(predict_path)
+
+        infer_start = time.perf_counter()
+        prediction = model.predict(predict_path, threshold=args.score_threshold)
+        state["infer_time_sum_ms"] += (time.perf_counter() - infer_start) * 1000.0
+        records = prediction_records(prediction, class_names, image_size)
+
+        gt_boxes, gt_labels, has_label = load_ground_truth(sample.label_path, image_size)
+
+        if args.save_visualization:
+            vis_path = visualization_output_path(
+                images_dir,
+                sample,
+                rt.visualization_suffix(sample.image_path),
+                records,
+            )
+            gt_items_vis = gt_records(gt_boxes, gt_labels) if has_label else []
+            draw_predictions(sample.image_path, vis_path, records, gt_items_vis, class_names)
+        if args.save_json:
+            save_prediction_json(json_dir / relative_output_path(sample, ".json"), sample, image_size, records)
+        if args.save_txt:
+            save_prediction_txt(txt_dir / relative_output_path(sample, ".txt"), records)
+
+        if has_label:
+            state["metrics_meta"]["images_with_labels"] += 1
+        else:
+            state["metrics_meta"]["images_without_labels"] += 1
+        state["metric_entries"].append(build_metric_entry(prediction, gt_boxes, gt_labels))
+        if args.save_test_report:
+            gt_items = gt_records(gt_boxes, gt_labels)
+            image_total_gt, image_total_pred, image_total_tp = update_legacy_report_state(
+                state["legacy_class_data"],
+                gt_items,
+                records,
+                args.report_iou_threshold,
+            )
+            state["total_gt"] += image_total_gt
+            state["total_pred"] += image_total_pred
+            state["total_tp"] += image_total_tp
+
+        state["processed_images"] += 1
+        if idx == 1 or idx % 20 == 0 or idx == len(split_samples):
+            print(f"[{idx}/{len(split_samples)}] processed ({split}): {sample.image_path}")
+
+    for split in splits:
+        state = split_states[split]
+        if state["num_images"] == 0:
+            continue
+        shard_split_dir = shard_workspace_dir / split
+        shard_split_dir.mkdir(parents=True, exist_ok=True)
+        shard_result_path = write_shard_result(
+            shard_split_dir,
+            split=split,
+            class_names=class_names,
+            num_images=state["num_images"],
+            processed_images=state["processed_images"],
+            infer_time_sum_ms=state["infer_time_sum_ms"],
+            metrics_meta=state["metrics_meta"],
+            legacy_class_data=state["legacy_class_data"],
+            total_gt=state["total_gt"],
+            total_pred=state["total_pred"],
+            total_tp=state["total_tp"],
+            metric_entries=state["metric_entries"],
+        )
+        print(f"shard_result saved to: {shard_result_path}")
 
 
 def finalize_parallel_infer_output(
@@ -829,7 +1120,9 @@ def finalize_parallel_infer_output(
     input_mode: str,
     num_images: int,
 ) -> None:
-    dashboard_path = sync_important_artifacts(checkpoint_path)
+    dashboard_path = None
+    if not getattr(args, "skip_important_artifacts", False):
+        dashboard_path = sync_important_artifacts(checkpoint_path)
     if dashboard_path is not None:
         print(f"training_dashboard copied to: {dashboard_path}")
 
@@ -855,7 +1148,7 @@ def finalize_parallel_infer_output(
     )
     print(f"run_meta saved to: {run_meta_path}")
 
-    if args.save_test_report:
+    if args.save_test_report and not getattr(args, "skip_important_artifacts", False):
         report_markdown_paths = generate_report_for_infer_output(
             experiment_dir=rt.experiment_dir_from_checkpoint_path(checkpoint_path),
             output_dir=final_output_dir,
@@ -872,7 +1165,7 @@ def run_parallel_split_infer(args) -> bool:
         return False
     if is_shard_child(args):
         return False
-    if args.data is None or args.split == "all":
+    if args.data is None or args.split in MULTI_SPLIT_MODES:
         return False
     if args.device != "auto":
         return False
@@ -982,65 +1275,116 @@ def run_parallel_all_infer(args, splits: list[str]) -> bool:
         print(f"[det/infer] {inventory_message}")
         return False
     eligible_gpus = filter_high_memory_gpus(all_gpus)
-    gpu_groups = split_gpu_groups_for_parallel(eligible_gpus, len(splits))
-    if len(gpu_groups) < len(splits):
+    checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
+    data_cfg = rt.load_data_config(args.data) if args.data is not None else None
+    base_samples, _, _ = get_multi_split_input_samples(
+        SimpleNamespace(**{**vars(args), "shard_index": None, "num_shards": 1}),
+        splits,
+    )
+    rt.ensure_image_samples(base_samples)
+    num_shards = min(len(eligible_gpus), len(base_samples))
+    if num_shards < 2:
         print(
-            f"[det/infer] 检测到 {len(all_gpus)} 张 GPU，剔除高显存占用后剩余 {len(eligible_gpus)} 张，进入单卡顺序模式。"
+            f"[det/infer] 可用于并行的 GPU 数量为 {len(eligible_gpus)}，样本数为 {len(base_samples)}，进入单卡顺序模式。"
         )
         return False
 
-    checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
-    data_cfg = rt.load_data_config(args.data) if args.data is not None else None
-    launch_specs: list[tuple[str, str, Path, Path, list[str], str]] = []
-    for split, gpu_group in zip(splits, gpu_groups):
-        child_args = SimpleNamespace(**vars(args))
-        child_args.requested_split = args.split
-        child_args.split = split
+    final_output_root = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None
+        else rt.experiment_dir_from_checkpoint_path(checkpoint_path) / "infer"
+    )
+    split_num_images: dict[str, int] = {}
+    for split in splits:
+        split_args = SimpleNamespace(**vars(args))
+        split_args.requested_split = args.split
+        split_args.split = split
         output_dir = build_split_output_dir(
-            args=child_args,
+            args=split_args,
             checkpoint_path=checkpoint_path,
             data_cfg=data_cfg,
             split=split,
         )
-        report_path = build_split_report_path(
-            args=child_args,
-            output_dir=output_dir,
-            split=split,
-        )
-        visible_devices = ",".join(str(int(gpu["index"])) for gpu in gpu_group)
+        rt.prepare_output_dir(output_dir, args.overwrite)
+        split_num_images[split] = sum(1 for item in base_samples if item.split == split)
+
+    shard_root = rt.infer_temp_dir(final_output_root) / "_multi_shards" / str(args.split)
+    shard_output_dirs: list[Path] = []
+    shard_processes: list[tuple[int, str, subprocess.Popen[str]]] = []
+    for shard_index, gpu in enumerate(eligible_gpus[:num_shards]):
+        shard_output_dir = shard_root / f"shard_{shard_index:02d}"
+        shard_output_dirs.append(shard_output_dir)
+        child_args = SimpleNamespace(**vars(args))
+        child_args.selected_splits = ",".join(splits)
+        child_args.multi_output_root = final_output_root
         command = build_parallel_child_command(
-            args=args,
-            split=split,
+            args=child_args,
+            split=args.split,
             device="auto",
-            output_dir=output_dir,
-            report_path=report_path,
+            output_dir=shard_output_dir,
+            report_path=shard_output_dir / "shard_report.json",
+            shard_index=shard_index,
+            num_shards=num_shards,
         )
-        launch_specs.append((split, visible_devices, output_dir, report_path, command, visible_devices))
+        child_env = os.environ.copy()
+        child_env["CUDA_VISIBLE_DEVICES"] = str(int(gpu["index"]))
+        process = subprocess.Popen(command, cwd=str(rt.ROOT_DIR), env=child_env)
+        shard_processes.append((shard_index, str(int(gpu["index"])), process))
 
     print("[det/infer] 已进入自动多卡并行模式。")
     print(
-        f"[det/infer] 共检测到 {len(all_gpus)} 张 GPU，剔除高显存占用后保留 {len(eligible_gpus)} 张，按 split 分组。"
+        f"[det/infer] 共检测到 {len(all_gpus)} 张 GPU，剔除高显存占用后保留 {len(eligible_gpus)} 张，按样本平铺到所有卡。"
     )
     for gpu in eligible_gpus:
         print(f"[det/infer] 保留 {format_gpu_summary(gpu)}")
-    for split, visible_devices, output_dir, _, _, _ in launch_specs:
-        print(f"[det/infer] split={split} -> CUDA_VISIBLE_DEVICES={visible_devices} -> {output_dir}")
+    for shard_index, visible_device, _ in shard_processes:
+        print(f"[det/infer] shard={shard_index}/{num_shards} -> CUDA_VISIBLE_DEVICES={visible_device}")
 
-    processes: list[tuple[str, subprocess.Popen[str]]] = []
-    for split, _, _, _, command, visible_devices in launch_specs:
-        child_env = os.environ.copy()
-        child_env["CUDA_VISIBLE_DEVICES"] = visible_devices
-        process = subprocess.Popen(command, cwd=str(rt.ROOT_DIR), env=child_env)
-        processes.append((split, process))
-
-    failed_splits: list[str] = []
-    for split, process in processes:
+    failed_shards: list[str] = []
+    for shard_index, _, process in shard_processes:
         return_code = process.wait()
         if return_code != 0:
-            failed_splits.append(f"{split}(exit={return_code})")
+            failed_shards.append(f"shard_{shard_index:02d}(exit={return_code})")
 
-    if failed_splits:
-        raise RuntimeError(f"并行 infer 失败: {', '.join(failed_splits)}")
+    if failed_shards:
+        raise RuntimeError(f"并行 infer 失败: {', '.join(failed_shards)}")
+
+    for split in splits:
+        shard_split_dirs = [shard_output_dir / split for shard_output_dir in shard_output_dirs if (shard_output_dir / split / "shard_result.json").exists()]
+        if not shard_split_dirs:
+            continue
+        split_args = SimpleNamespace(**vars(args))
+        split_args.requested_split = args.split
+        split_args.split = split
+        final_output_dir = build_split_output_dir(
+            args=split_args,
+            checkpoint_path=checkpoint_path,
+            data_cfg=data_cfg,
+            split=split,
+        )
+        merge_shard_results(
+            shard_output_dirs=shard_split_dirs,
+            final_output_dir=final_output_dir,
+            checkpoint_path=checkpoint_path,
+            data_cfg=data_cfg,
+            split=split,
+            args=split_args,
+        )
+        finalize_parallel_infer_output(
+            args=split_args,
+            checkpoint_path=checkpoint_path,
+            data_cfg=data_cfg,
+            final_output_dir=final_output_dir,
+            split=split,
+            input_mode="dataset",
+            num_images=split_num_images.get(split, 0),
+        )
+    write_multi_split_confusion_inputs_index(
+        output_root=final_output_root,
+        args=args,
+        data_cfg=data_cfg,
+        splits=splits,
+    )
     return True
 
 
@@ -1089,7 +1433,7 @@ def run_single_infer(args) -> None:
 
     rt.prepare_output_dir(args.output_dir, args.overwrite)
     dashboard_path: Path | None = None
-    if not shard_child:
+    if not shard_child and not getattr(args, "skip_important_artifacts", False):
         dashboard_path = sync_important_artifacts(checkpoint_path)
 
     model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
@@ -1154,7 +1498,12 @@ def run_single_infer(args) -> None:
         gt_boxes, gt_labels, has_label = load_ground_truth(label_path_cur, image_size)
 
         if args.save_visualization:
-            vis_path = images_dir / relative_output_path(sample, rt.visualization_suffix(sample.image_path))
+            vis_path = visualization_output_path(
+                images_dir,
+                sample,
+                rt.visualization_suffix(sample.image_path),
+                records,
+            )
             gt_items_vis = gt_records(gt_boxes, gt_labels) if has_label else []
             draw_predictions(sample.image_path, vis_path, records, gt_items_vis, class_names)
         if args.save_json:
@@ -1247,17 +1596,31 @@ def run_single_infer(args) -> None:
                 split=args.split,
                 samples=samples,
             )
-        report_markdown_paths = generate_report_for_infer_output(
-            experiment_dir=rt.experiment_dir_from_checkpoint_path(checkpoint_path),
+        if not getattr(args, "skip_important_artifacts", False):
+            report_markdown_paths = generate_report_for_infer_output(
+                experiment_dir=rt.experiment_dir_from_checkpoint_path(checkpoint_path),
+                output_dir=args.output_dir,
+            )
+            for report_markdown_path in report_markdown_paths:
+                print(f"single_report saved to: {report_markdown_path}")
+            for copied_path in copy_infer_artifacts_to_important(checkpoint_path, [report_path, *report_markdown_paths]):
+                print(f"infer artifact copied to important: {copied_path}")
+    if use_dataset and not shard_child:
+        write_confusion_inputs_index(
             output_dir=args.output_dir,
+            report_path=report_path,
+            args=args,
+            data_cfg=data_cfg,
+            split=args.split,
+            num_images=len(samples),
         )
-        for report_markdown_path in report_markdown_paths:
-            print(f"single_report saved to: {report_markdown_path}")
-        for copied_path in copy_infer_artifacts_to_important(checkpoint_path, [report_path, *report_markdown_paths]):
-            print(f"infer artifact copied to important: {copied_path}")
 
 
 def run_infer(args) -> None:
+    if is_shard_child(args) and getattr(args, "selected_splits", None):
+        run_multi_split_shard_infer(args)
+        return
+
     if is_shard_child(args):
         run_single_infer(args)
         return
@@ -1266,7 +1629,7 @@ def run_infer(args) -> None:
         run_single_infer(args)
         return
 
-    if getattr(args, "split", None) != "all":
+    if getattr(args, "split", None) not in MULTI_SPLIT_MODES:
         if run_parallel_split_infer(args):
             return
         run_single_infer(args)
@@ -1297,3 +1660,15 @@ def run_infer(args) -> None:
         if run_parallel_split_infer(single_args):
             continue
         run_single_infer(single_args)
+    checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
+    output_root = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None
+        else rt.experiment_dir_from_checkpoint_path(checkpoint_path) / "infer"
+    )
+    write_multi_split_confusion_inputs_index(
+        output_root=output_root,
+        args=args,
+        data_cfg=data_cfg,
+        splits=splits,
+    )

@@ -13,21 +13,29 @@ from __future__ import annotations
 from . import common as rt
 from . import cls_tools, det_tools, seg_tools
 from . import convert_tools
-from .script_runner import run_script
+from . import det_optimize
+from . import train_tools
 
 
 def dispatch(args) -> None:
-    if hasattr(args, "script_path"):
-        run_script(args.script_path)
+    # 训练：所有任务统一走 train_tools（不再依赖外部脚本）
+    if args.tool_action == "train" and args.tool_task in {"det", "cls", "seg"}:
+        train_tools.run_train(args)
         return
+
     if args.tool_task == "data" and args.tool_action == "convert":
         convert_tools.run_convert(args)
         return
+    if args.tool_task == "det" and args.tool_action in {"report", "eda", "optimize"}:
+        rt.import_runtime_dependencies()
     if args.tool_task == "det" and args.tool_action == "report":
         det_tools.run_report(args)
         return
     if args.tool_task == "det" and args.tool_action == "eda":
         det_tools.run_eda(args)
+        return
+    if args.tool_task == "det" and args.tool_action == "optimize":
+        det_optimize.run_optimize(args)
         return
     rt.import_runtime_dependencies()
 

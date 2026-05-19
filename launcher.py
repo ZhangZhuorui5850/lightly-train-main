@@ -121,16 +121,6 @@ SEG_SETTINGS = {
     "seg_threshold": 0.8,
 }
 
-# 脚本配置：菜单中的 train / eval 会优先调用这些现成脚本
-SCRIPT_SETTINGS = {
-    "train_cls_script": "train_cls.py",
-    "train_det_script": "train_det.py",
-    "train_seg_script": "train_seg.py",
-    "test_cls_script": "test_cls.py",
-    "test_det_script": "test_det_v3.py",
-}
-
-
 def build_user_settings() -> dict[str, object]:
     # 把分组配置合并成底层模块统一使用的一份 settings
     settings: dict[str, object] = {}
@@ -138,7 +128,6 @@ def build_user_settings() -> dict[str, object]:
     settings.update(CLS_SETTINGS)
     settings.update(DET_SETTINGS)
     settings.update(SEG_SETTINGS)
-    settings.update(SCRIPT_SETTINGS)
     return settings
 
 

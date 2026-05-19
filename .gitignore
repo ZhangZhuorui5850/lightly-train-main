@@ -2,6 +2,9 @@
 lightly_train_docker_test_data
 out
 
+# Datasets (large files, do not upload)
+datasets/
+
 # TensorRT
 *.trt
 

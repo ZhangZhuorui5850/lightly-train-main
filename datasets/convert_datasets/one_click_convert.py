@@ -43,6 +43,63 @@ def copy_yolo_metadata(src_roots: list[Path], synced_root: Path) -> None:
                 return
 
 
+def detect_pre_split(src_roots: list[Path]) -> bool:
+    """每个源目录都至少含 2 个 {train, val, test} 子目录且非空时，视为已预划分。"""
+    for root in src_roots:
+        present = 0
+        for split in ("train", "val", "test"):
+            d = root / split
+            if d.is_dir() and any(d.iterdir()):
+                present += 1
+        if present < 2:
+            return False
+    return True
+
+
+def merge_pre_split_sources(
+    src_roots: list[Path],
+    synced_root: Path,
+    label_format: str,
+) -> dict:
+    """把多个已预划分的源目录按 train/val/test 合并到 synced_root（硬链接优先）。"""
+    import os
+
+    label_suffix = ".json" if label_format == "labelme" else ".txt"
+    stats = {"split_counts": {"train": 0, "val": 0, "test": 0}, "skipped_conflicts": 0}
+
+    for split in ("train", "val", "test"):
+        (synced_root / split).mkdir(parents=True, exist_ok=True)
+
+    used_per_split: dict = {"train": set(), "val": set(), "test": set()}
+
+    for root in src_roots:
+        for split in ("train", "val", "test"):
+            src_dir = root / split
+            if not src_dir.is_dir():
+                continue
+            for path in src_dir.iterdir():
+                if not path.is_file():
+                    continue
+                name = path.name
+                if name in used_per_split[split]:
+                    stats["skipped_conflicts"] += 1
+                    continue
+                dst = synced_root / split / name
+                try:
+                    os.link(path, dst)
+                except OSError:
+                    shutil.copy2(path, dst)
+                used_per_split[split].add(name)
+                if path.suffix.lower() == label_suffix or path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+                    pass
+            stats["split_counts"][split] = len(
+                [p for p in (synced_root / split).iterdir() if p.suffix.lower() == label_suffix]
+            )
+
+    stats["paired_total"] = sum(stats["split_counts"].values())
+    return stats
+
+
 def normalize_selected_tasks(task: str) -> tuple[str, ...]:
     task_key = task.strip().lower()
     if task_key == "all":
@@ -82,6 +139,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="划分 train/val/test 的随机种子",
     )
     parser.add_argument(
+        "--preserve-splits",
+        choices=["auto", "yes", "no"],
+        default="auto",
+        help=(
+            "源目录已含 train/val/test 时如何处理："
+            "auto=检测到则跳过 sync 直接用现有划分（默认），"
+            "yes=强制跳过 sync（要求已预划分），"
+            "no=始终走 sync 重新 8:1:1 划分"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="仅模拟整理阶段，不实际写文件",
@@ -97,6 +165,7 @@ def run_conversion(
     label_format: str = "auto",
     seed: int | None = None,
     dry_run: bool = False,
+    preserve_splits: str = "auto",
 ) -> None:
     sync_module = load_module("sync_picture_module", SYNC_PATH)
     convert_module = load_module("labelme_to_yolo_module", CONVERT_PATH)
@@ -119,6 +188,12 @@ def run_conversion(
             print("[ERROR] 未检测到可用标注文件（.json 或 .txt）")
             sys.exit(1)
 
+    is_pre_split = detect_pre_split(src_roots)
+    if preserve_splits == "yes" and not is_pre_split:
+        print("[ERROR] --preserve-splits=yes 但源目录并未含 train/val/test 子目录")
+        sys.exit(1)
+    use_preserve = preserve_splits == "yes" or (preserve_splits == "auto" and is_pre_split)
+
     print("=" * 60)
     print("  一键转换开始")
     print("=" * 60)
@@ -126,6 +201,7 @@ def run_conversion(
     print(f"TASKS        : {', '.join(selected_tasks)}")
     print(f"LABEL_FORMAT : {label_format}")
     print(f"OUTPUT_ROOT  : {output_root.resolve()}")
+    print(f"PRESERVE_SPL : {use_preserve} (mode={preserve_splits}, detected={is_pre_split})")
     if "det" in selected_tasks:
         print(f"DET_ROOT     : {(output_root / 'dataset_det').resolve()}")
     if "cls" in selected_tasks:
@@ -133,6 +209,54 @@ def run_conversion(
     if "seg" in selected_tasks:
         print(f"SEG_ROOT     : {(output_root / 'dataset_seg').resolve()}")
 
+    def _invoke_labelme_to_yolo(synced_root: Path) -> None:
+        original_policy = convert_module.EXISTING_OUTPUT_POLICY
+        convert_module.EXISTING_OUTPUT_POLICY = "clean"
+        original_argv = sys.argv[:]
+        try:
+            sys.argv = [
+                str(CONVERT_PATH),
+                "--source-root",
+                str(synced_root),
+                "--output-root",
+                str(output_root),
+                "--task",
+                task,
+                "--source-format",
+                label_format,
+            ]
+            convert_module.main()
+        finally:
+            sys.argv = original_argv
+            convert_module.EXISTING_OUTPUT_POLICY = original_policy
+
+    # ── 分支 A：已预划分，跳过 sync 的随机洗牌 ─────────────────────────────
+    if use_preserve:
+        if dry_run:
+            print("\n[INFO] 已检测到预划分，跳过 sync。dry-run 结束。")
+            return
+        if len(src_roots) == 1:
+            synced_root = src_roots[0]
+            print(f"[INFO] 单源已预划分，直接使用: {synced_root}")
+            _invoke_labelme_to_yolo(synced_root)
+            return
+        # 多源：合并到临时目录，保留各源的 split 归属
+        with tempfile.TemporaryDirectory(prefix="dataset_sync_") as temp_dir:
+            synced_root = Path(temp_dir) / "synced_source"
+            print(f"[INFO] 多源已预划分，合并到: {synced_root}")
+            stats = merge_pre_split_sources(src_roots, synced_root, label_format)
+            print(f"  合并完成: train={stats['split_counts']['train']} "
+                  f"val={stats['split_counts']['val']} test={stats['split_counts']['test']} "
+                  f"冲突跳过={stats['skipped_conflicts']}")
+            if label_format == "yolo":
+                copy_yolo_metadata(src_roots, synced_root)
+            if stats["paired_total"] == 0:
+                print("\n[ERROR] 合并阶段没有得到任何文件，终止后续转换。")
+                sys.exit(1)
+            _invoke_labelme_to_yolo(synced_root)
+            return
+
+    # ── 分支 B：走原 sync 流程，重新 8:1:1 随机划分 ─────────────────────────
     with tempfile.TemporaryDirectory(prefix="dataset_sync_") as temp_dir:
         synced_root = Path(temp_dir) / "synced_source"
         print(f"TEMP_SYNCED  : {synced_root}")
@@ -156,26 +280,7 @@ def run_conversion(
             print("\n[ERROR] 整理阶段没有得到任何有效配对，终止后续转换。")
             sys.exit(1)
 
-        original_policy = convert_module.EXISTING_OUTPUT_POLICY
-        convert_module.EXISTING_OUTPUT_POLICY = "clean"
-
-        original_argv = sys.argv[:]
-        try:
-            sys.argv = [
-                str(CONVERT_PATH),
-                "--source-root",
-                str(synced_root),
-                "--output-root",
-                str(output_root),
-                "--task",
-                task,
-                "--source-format",
-                label_format,
-            ]
-            convert_module.main()
-        finally:
-            sys.argv = original_argv
-            convert_module.EXISTING_OUTPUT_POLICY = original_policy
+        _invoke_labelme_to_yolo(synced_root)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -187,6 +292,7 @@ def main(argv: list[str] | None = None) -> None:
         label_format=args.label_format,
         seed=args.seed,
         dry_run=args.dry_run,
+        preserve_splits=args.preserve_splits,
     )
 
 

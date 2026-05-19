@@ -18,26 +18,44 @@ import sys
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
+    import numpy as np_types
+    import torch as torch_types
+    import yaml as yaml_types
+    from PIL import Image as PILImageModule
+    from PIL import ImageDraw as PILImageDrawModule
+    from PIL import ImageFont as PILImageFontModule
+else:
+    ModuleType = Any
+    torch_types = Any
+    yaml_types = Any
+    np_types = Any
+    PILImageModule = Any
+    PILImageDrawModule = Any
+    PILImageFontModule = Any
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-lightly_train = None
-np = None
-torch = None
-yaml = None
-Image = None
-ImageDraw = None
-ImageFont = None
-file_helpers = None
-yolo_helpers = None
-ObjectDetectionTaskMetric = None
-ObjectDetectionTaskMetricArgs = None
-InstanceSegmentationTaskMetric = None
-InstanceSegmentationTaskMetricArgs = None
+lightly_train: ModuleType | None = None
+np: ModuleType | None = None
+torch: ModuleType | None = None
+yaml: ModuleType | None = None
+Image: Any = None
+ImageDraw: Any = None
+ImageFont: Any = None
+file_helpers: Any = None
+yolo_helpers: Any = None
+ObjectDetectionTaskMetric: Any = None
+ObjectDetectionTaskMetricArgs: Any = None
+InstanceSegmentationTaskMetric: Any = None
+InstanceSegmentationTaskMetricArgs: Any = None
 
 OUT_DIR = ROOT_DIR / "out"
 EXPERIMENT_ROOT_DIR = OUT_DIR
@@ -70,7 +88,7 @@ INFER_DEFAULT_DEVICE = DEFAULT_DEVICE
 INFER_DEFAULT_OVERWRITE = DEFAULT_OVERWRITE
 
 INFER_DEFAULT_SAVE_VISUALIZATION = True
-INFER_DEFAULT_SAVE_JSON = False
+INFER_DEFAULT_SAVE_JSON = True
 INFER_DEFAULT_SAVE_TXT = False
 INFER_DEFAULT_REPORT_IOU_THRESHOLD = 0.5
 INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD = 0.3
@@ -433,9 +451,11 @@ def import_runtime_dependencies() -> None:
     InstanceSegmentationTaskMetricArgs = instance_segmentation_task_metric_args_module
 
 
-def resolve_device(device: str) -> str | torch.device | None:
+def resolve_device(device: str) -> Any:
     if device == "auto":
         return None
+    if torch is None:
+        raise ModuleNotFoundError("torch is not imported. Call import_runtime_dependencies() first.")
     return torch.device(device)
 
 
@@ -474,6 +494,8 @@ def load_data_config(data_path: Path) -> dict[str, Any]:
     data_path = data_path.expanduser().resolve()
     if not data_path.exists():
         raise FileNotFoundError(f"Data config does not exist: {data_path}")
+    if yaml is None:
+        raise ModuleNotFoundError("yaml is not imported. Call import_runtime_dependencies() first.")
     with data_path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
@@ -498,6 +520,8 @@ def load_data_config(data_path: Path) -> dict[str, Any]:
 
 def dump_yaml(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if yaml is None:
+        raise ModuleNotFoundError("yaml is not imported. Call import_runtime_dependencies() first.")
     path.write_text(
         yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
         encoding="utf-8",
@@ -731,7 +755,9 @@ def build_metric_label_mapping(class_names: dict[int, str]) -> tuple[dict[int, i
     return mapping, metric_class_names
 
 
-def remap_labels(labels: torch.Tensor, mapping: dict[int, int]) -> torch.Tensor:
+def remap_labels(labels: Any, mapping: dict[int, int]) -> Any:
+    if torch is None:
+        raise ModuleNotFoundError("torch is not imported. Call import_runtime_dependencies() first.")
     if labels.numel() == 0:
         return torch.zeros((0,), dtype=torch.int64)
     return torch.as_tensor([mapping[int(label)] for label in labels.tolist()], dtype=torch.int64)
