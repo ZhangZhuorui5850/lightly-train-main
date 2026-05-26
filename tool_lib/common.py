@@ -118,6 +118,24 @@ EXPORT_DEFAULT_MAX_BOXES_PER_CLASS_PER_IMAGE = 0
 EXPORT_DEFAULT_BOX_DENSITY_PENALTY = 0.0
 EXPORT_DEFAULT_EXPORT_SUFFIX = "_A"
 
+SEG_DATASET_DIR = ROOT_DIR / "datasets" / "neu_dataset" / "dataset_seg"
+SEG_EXPORT_DEFAULT_SOURCE_DATA = SEG_DATASET_DIR / "data.yaml"
+SEG_EXPORT_DEFAULT_REPORT_JSON: Path | None = None
+SEG_EXPORT_DEFAULT_GOOD_CLASS_THRESHOLD = 0.0
+SEG_EXPORT_DEFAULT_AUTO_BALANCE = True
+SEG_EXPORT_DEFAULT_AUTO_RELAX_CLASS_THRESHOLD = True
+SEG_EXPORT_DEFAULT_BALANCE_RATIO = 0.0
+SEG_EXPORT_DEFAULT_MIN_CLASS_IMAGES = 0
+SEG_EXPORT_DEFAULT_MIN_CLASS_INSTANCES = 0
+SEG_EXPORT_DEFAULT_TARGET_IMAGES_PER_CLASS = 0
+SEG_EXPORT_DEFAULT_TARGET_TOTAL_IMAGES = 0
+SEG_EXPORT_DEFAULT_SPLIT_RATIO = "8:1:1"
+SEG_EXPORT_DEFAULT_TARGET_INSTANCES_PER_CLASS = 0
+SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_IMAGE = 0
+SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_CLASS_PER_IMAGE = 0
+SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY = 0.0
+SEG_EXPORT_DEFAULT_EXPORT_SUFFIX = "_A"
+
 TRAIN_CLS_SCRIPT = ROOT_DIR / "train_cls.py"
 TRAIN_DET_SCRIPT = ROOT_DIR / "train_det.py"
 TRAIN_SEG_SCRIPT = ROOT_DIR / "train_seg.py"
@@ -265,6 +283,23 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global EXPORT_DEFAULT_MAX_BOXES_PER_CLASS_PER_IMAGE
     global EXPORT_DEFAULT_BOX_DENSITY_PENALTY
     global EXPORT_DEFAULT_EXPORT_SUFFIX
+    global SEG_DATASET_DIR
+    global SEG_EXPORT_DEFAULT_SOURCE_DATA
+    global SEG_EXPORT_DEFAULT_REPORT_JSON
+    global SEG_EXPORT_DEFAULT_GOOD_CLASS_THRESHOLD
+    global SEG_EXPORT_DEFAULT_AUTO_BALANCE
+    global SEG_EXPORT_DEFAULT_AUTO_RELAX_CLASS_THRESHOLD
+    global SEG_EXPORT_DEFAULT_BALANCE_RATIO
+    global SEG_EXPORT_DEFAULT_MIN_CLASS_IMAGES
+    global SEG_EXPORT_DEFAULT_MIN_CLASS_INSTANCES
+    global SEG_EXPORT_DEFAULT_TARGET_IMAGES_PER_CLASS
+    global SEG_EXPORT_DEFAULT_TARGET_TOTAL_IMAGES
+    global SEG_EXPORT_DEFAULT_SPLIT_RATIO
+    global SEG_EXPORT_DEFAULT_TARGET_INSTANCES_PER_CLASS
+    global SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_IMAGE
+    global SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_CLASS_PER_IMAGE
+    global SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY
+    global SEG_EXPORT_DEFAULT_EXPORT_SUFFIX
     global TRAIN_CLS_SCRIPT
     global TRAIN_DET_SCRIPT
     global TRAIN_SEG_SCRIPT
@@ -381,6 +416,81 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     )
     EXPORT_DEFAULT_EXPORT_SUFFIX = str(
         settings.get("det_export_suffix", EXPORT_DEFAULT_EXPORT_SUFFIX)
+    )
+
+    SEG_DATASET_DIR = _path("seg_dataset_dir", SEG_DATASET_DIR)
+    default_seg_data_yaml = SEG_DATASET_DIR / "data.yaml"
+    SEG_EXPORT_DEFAULT_SOURCE_DATA = _path("seg_export_source_data", default_seg_data_yaml)
+    seg_report_value = settings.get("seg_export_report_json")
+    if seg_report_value in {None, "", "auto"}:
+        SEG_EXPORT_DEFAULT_REPORT_JSON = None
+    else:
+        SEG_EXPORT_DEFAULT_REPORT_JSON = _path(
+            "seg_export_report_json",
+            SEG_EXPORT_DEFAULT_REPORT_JSON or default_seg_data_yaml,
+        )
+    SEG_EXPORT_DEFAULT_GOOD_CLASS_THRESHOLD = float(
+        settings.get("seg_export_good_class_threshold", SEG_EXPORT_DEFAULT_GOOD_CLASS_THRESHOLD)
+    )
+    SEG_EXPORT_DEFAULT_AUTO_BALANCE = bool(
+        settings.get("seg_export_auto_balance", SEG_EXPORT_DEFAULT_AUTO_BALANCE)
+    )
+    SEG_EXPORT_DEFAULT_AUTO_RELAX_CLASS_THRESHOLD = bool(
+        settings.get(
+            "seg_export_auto_relax_class_threshold",
+            SEG_EXPORT_DEFAULT_AUTO_RELAX_CLASS_THRESHOLD,
+        )
+    )
+    SEG_EXPORT_DEFAULT_BALANCE_RATIO = float(
+        settings.get("seg_export_balance_ratio", SEG_EXPORT_DEFAULT_BALANCE_RATIO)
+    )
+    SEG_EXPORT_DEFAULT_MIN_CLASS_IMAGES = int(
+        settings.get("seg_export_min_class_images", SEG_EXPORT_DEFAULT_MIN_CLASS_IMAGES)
+    )
+    SEG_EXPORT_DEFAULT_MIN_CLASS_INSTANCES = int(
+        settings.get("seg_export_min_class_instances", SEG_EXPORT_DEFAULT_MIN_CLASS_INSTANCES)
+    )
+    SEG_EXPORT_DEFAULT_TARGET_IMAGES_PER_CLASS = int(
+        settings.get(
+            "seg_export_target_images_per_class",
+            SEG_EXPORT_DEFAULT_TARGET_IMAGES_PER_CLASS,
+        )
+    )
+    SEG_EXPORT_DEFAULT_TARGET_TOTAL_IMAGES = int(
+        settings.get(
+            "seg_export_target_total_images",
+            SEG_EXPORT_DEFAULT_TARGET_TOTAL_IMAGES,
+        )
+    )
+    SEG_EXPORT_DEFAULT_SPLIT_RATIO = str(
+        settings.get("seg_export_split_ratio", SEG_EXPORT_DEFAULT_SPLIT_RATIO)
+    )
+    SEG_EXPORT_DEFAULT_TARGET_INSTANCES_PER_CLASS = int(
+        settings.get(
+            "seg_export_target_instances_per_class",
+            SEG_EXPORT_DEFAULT_TARGET_INSTANCES_PER_CLASS,
+        )
+    )
+    SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_IMAGE = int(
+        settings.get(
+            "seg_export_max_instances_per_image",
+            SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_IMAGE,
+        )
+    )
+    SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_CLASS_PER_IMAGE = int(
+        settings.get(
+            "seg_export_max_instances_per_class_per_image",
+            SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_CLASS_PER_IMAGE,
+        )
+    )
+    SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY = float(
+        settings.get(
+            "seg_export_instance_density_penalty",
+            SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY,
+        )
+    )
+    SEG_EXPORT_DEFAULT_EXPORT_SUFFIX = str(
+        settings.get("seg_export_suffix", SEG_EXPORT_DEFAULT_EXPORT_SUFFIX)
     )
 
     TRAIN_CLS_SCRIPT = _path("train_cls_script", TRAIN_CLS_SCRIPT)
@@ -984,6 +1094,18 @@ def resolve_det_export_dir_suffix(*, export_suffix: str, image_count: int) -> st
     normalized_suffix = str(export_suffix).strip() or EXPORT_DEFAULT_EXPORT_SUFFIX
     if normalized_suffix == EXPORT_DEFAULT_EXPORT_SUFFIX:
         return default_det_export_dir_suffix(image_count=image_count)
+    return normalized_suffix
+
+
+def default_seg_export_dir_suffix(*, image_count: int) -> str:
+    safe_count = max(int(image_count), 0)
+    return f"{SEG_EXPORT_DEFAULT_EXPORT_SUFFIX}_{safe_count}"
+
+
+def resolve_seg_export_dir_suffix(*, export_suffix: str, image_count: int) -> str:
+    normalized_suffix = str(export_suffix).strip() or SEG_EXPORT_DEFAULT_EXPORT_SUFFIX
+    if normalized_suffix == SEG_EXPORT_DEFAULT_EXPORT_SUFFIX:
+        return default_seg_export_dir_suffix(image_count=image_count)
     return normalized_suffix
 
 

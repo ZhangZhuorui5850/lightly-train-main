@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import heapq
 from collections import Counter, defaultdict
 from math import ceil, log1p, sqrt
 from pathlib import Path
@@ -1239,7 +1240,7 @@ def fallback_fill_score(
     density_weight = 1.0 / (1.0 + max(candidate.total_boxes - 1, 0) * max(box_density_penalty, 0.0))
     return balance_score * density_weight
 
-def select_balanced_train_candidates(
+def _select_balanced_train_candidates_legacy(
     *,
     candidates: list[ExportImageCandidate],
     kept_class_ids: list[int],
@@ -1250,6 +1251,11 @@ def select_balanced_train_candidates(
     box_density_penalty: float,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> tuple[list[ExportImageCandidate], dict[str, Any]]:
+    """旧版 O(N*K) 平衡选图。保留作 reference / 回退。
+
+    新流水线默认走 select_balanced_train_candidates（CELF 懒贪心，等价语义但
+    复杂度降到 O((N+K) log N)）。如需逐字节复现旧行为可手动调用本函数。
+    """
     effective_target_total_images, target_total_images_summary = derive_effective_target_total_images(
         requested_target_total_images=target_total_images,
         available_total_images=len(candidates),
@@ -1409,7 +1415,275 @@ def select_balanced_train_candidates(
         "target_total_images_summary": target_total_images_summary,
         "estimated_total_evaluations": estimated_total_evaluations,
         "actual_total_evaluations": evaluation_count,
+        "selection_algorithm": "legacy_full_rescan",
     }
+
+
+def select_balanced_train_candidates(
+    *,
+    candidates: list[ExportImageCandidate],
+    kept_class_ids: list[int],
+    target_total_images: int,
+    target_boxes_per_class: int,
+    balance_ratio: float,
+    target_images_per_class: int,
+    box_density_penalty: float,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> tuple[list[ExportImageCandidate], dict[str, Any]]:
+    """CELF (Cost-Effective Lazy Forward) 懒贪心平衡选图。
+
+    旧实现每轮 O(N) 扫描所有候选重新算分，整体 O(N*K)。在 7 万张数据集上
+    K=5000 时 ~3.4 亿次内层评估，纯 Python 跑十几到几十分钟；K=0（不限）
+    时则膨胀到 N²/2 ≈ 24 亿次。
+
+    本实现利用 score_export_candidate 的单调不增性（desired_box_counts 是
+    常数、selected_box_counts 只增不减、density_weight 是常数）——这是经典
+    的子模拟最大化结构，标准解法即 CELF：
+      - 维护一个 max-heap，每次 pop 堆顶；
+      - 用 class_epoch 记录每个类别的"最后一次被影响的时刻"；候选只要其类别
+        集合里有 epoch 比记录值新的，就 stale，需 pop 后重算 + 推回；
+      - 否则当前堆顶就是真正的全局最高分，直接 accept。
+    Phase 1 与原贪心**结果完全一致**，但每次 pick 只触发 O(log N) 次堆操作
+    + O(C_picked) 次 epoch 自增；总评估数从 K*N 降到 O((N+K) log N)。
+
+    Phase 2 (fallback_fill_score) 因 balance_weight 含 (max_selected+1)/
+    (selected[c]+1)，*可能上升*，不严格单调。Phase 2 仅在 target_total_images
+    > 0 且 Phase 1 已经把所有主分>0 的候选用光（即 per-class 目标已满足）后
+    才会出现，剩余指标对最终数据集分布影响有限；这里一次性按当前状态打分
+    + 排序取 top-K，O(R log R)，把潜在的 O(K_phase2 * R) 退化压成单次排序。
+
+    复杂度：Phase 1 ≈ O((N+K) log N)；Phase 2 ≤ O(R log R)。
+    内存：O(N + 已推回的过期堆条目)。
+    """
+    effective_target_total_images, target_total_images_summary = derive_effective_target_total_images(
+        requested_target_total_images=target_total_images,
+        available_total_images=len(candidates),
+    )
+    available_counts = count_candidate_images_per_class(candidates, kept_class_ids)
+    available_box_counts = count_candidate_boxes_per_class(candidates, kept_class_ids)
+    average_boxes_per_image = (
+        sum(candidate.total_boxes for candidate in candidates) / len(candidates)
+        if candidates
+        else 0.0
+    )
+    desired_box_counts, box_target_summary = derive_target_boxes_per_class(
+        available_boxes_per_class=available_box_counts,
+        requested_target_boxes_per_class=target_boxes_per_class,
+        balance_ratio=balance_ratio,
+        effective_target_total_images=effective_target_total_images,
+        average_boxes_per_image=average_boxes_per_image,
+    )
+    effective_target_images = max(target_images_per_class, 0)
+    desired_image_counts = {
+        class_id: min(effective_target_images, available_counts[class_id])
+        for class_id in kept_class_ids
+    }
+    selected_box_counts = {class_id: 0 for class_id in kept_class_ids}
+    selected_image_counts = {class_id: 0 for class_id in kept_class_ids}
+
+    summary_template = {
+        "target_total_images": target_total_images,
+        "effective_target_total_images": effective_target_total_images,
+        "available_total_images": len(candidates),
+        "available_images_per_class": available_counts,
+        "available_boxes_per_class": available_box_counts,
+        "target_images_per_class": target_images_per_class,
+        "effective_target_images_per_class": effective_target_images,
+        "desired_images_per_class": desired_image_counts,
+        "selected_images_per_class": selected_image_counts,
+        "target_boxes_per_class": box_target_summary["requested_target_boxes_per_class"],
+        "auto_target_boxes_per_class": box_target_summary.get("auto_target_boxes_per_class", 0),
+        "effective_target_boxes_per_class": box_target_summary.get("effective_target_boxes_per_class", 0),
+        "desired_boxes_per_class": desired_box_counts,
+        "selected_boxes_per_class": selected_box_counts,
+        "average_boxes_per_image": average_boxes_per_image,
+        "balance_ratio": balance_ratio,
+        "target_total_images_summary": target_total_images_summary,
+        "selection_algorithm": "celf_lazy_greedy",
+        "phase1_picks": 0,
+        "phase2_picks": 0,
+        "phase1_heap_pops": 0,
+        "phase1_stale_pops": 0,
+    }
+
+    n_candidates = len(candidates)
+    if n_candidates == 0:
+        return [], summary_template
+
+    picked = [False] * n_candidates
+    class_epoch: dict[int, int] = {class_id: 0 for class_id in kept_class_ids}
+    cand_seen_epoch = [0] * n_candidates
+
+    def _candidate_max_epoch(idx: int) -> int:
+        c = candidates[idx]
+        max_e = 0
+        for class_id in c.class_box_counts:
+            e = class_epoch.get(class_id, 0)
+            if e > max_e:
+                max_e = e
+        return max_e
+
+    def _saturation_multiplier(c: ExportImageCandidate) -> float:
+        if effective_target_images <= 0 or not c.class_box_counts:
+            return 1.0
+        for class_id in c.class_box_counts:
+            if selected_image_counts.get(class_id, 0) < desired_image_counts.get(class_id, 0):
+                return 1.0
+        return 0.2
+
+    def _primary_score(idx: int) -> float:
+        c = candidates[idx]
+        sc = score_export_candidate(
+            candidate=c,
+            desired_box_counts=desired_box_counts,
+            selected_box_counts=selected_box_counts,
+            available_box_counts=available_box_counts,
+            box_density_penalty=box_density_penalty,
+        )
+        return sc * _saturation_multiplier(c)
+
+    def _heap_key(idx: int, score: float) -> tuple:
+        c = candidates[idx]
+        # tie-break 完全对齐 legacy: score desc, total_boxes asc, class_count desc, path asc
+        return (
+            -score,
+            c.total_boxes,
+            -len(c.class_box_counts),
+            c.rel_path.as_posix(),
+            idx,
+        )
+
+    planned_rounds = (
+        min(effective_target_total_images, n_candidates)
+        if effective_target_total_images > 0
+        else n_candidates
+    )
+    progress_denom = max(planned_rounds * 10, 1)
+    selected: list[ExportImageCandidate] = []
+    last_progress_emit = -1
+    heap_pops = 0
+    stale_pops = 0
+
+    def _emit_progress(phase: str, extra: str = "") -> None:
+        nonlocal last_progress_emit
+        if progress_callback is None:
+            return
+        if last_progress_emit == len(selected):
+            return
+        last_progress_emit = len(selected)
+        current = min(progress_denom, len(selected) * 10)
+        msg = f"phase={phase} pick={len(selected)}/{planned_rounds}"
+        if extra:
+            msg = f"{msg} {extra}"
+        progress_callback(current, progress_denom, msg)
+
+    def _needs_met() -> bool:
+        for class_id in kept_class_ids:
+            if selected_box_counts[class_id] < desired_box_counts.get(class_id, 0):
+                return False
+        return True
+
+    # ----- Phase 1: 主分（单调不增）上的 CELF 懒贪心 -----
+    # 初始按 rel_path 排序入堆，使初始堆构造在 score 相等时退化到 legacy 一致顺序。
+    initial_order = sorted(range(n_candidates), key=lambda i: candidates[i].rel_path.as_posix())
+    heap: list[tuple] = []
+    for idx in initial_order:
+        sc = _primary_score(idx)
+        if sc > 0.0:
+            heap.append(_heap_key(idx, sc))
+    heapq.heapify(heap)
+
+    if progress_callback is not None:
+        _emit_progress("primary")
+
+    while heap:
+        if effective_target_total_images > 0 and len(selected) >= effective_target_total_images:
+            break
+        if effective_target_total_images <= 0 and _needs_met():
+            break
+
+        entry = heapq.heappop(heap)
+        heap_pops += 1
+        neg_score = entry[0]
+        idx = entry[-1]
+        if picked[idx]:
+            continue
+        cur_epoch = _candidate_max_epoch(idx)
+        if cur_epoch > cand_seen_epoch[idx]:
+            # stale —— 主分单调不增，重算后再入堆
+            stale_pops += 1
+            cand_seen_epoch[idx] = cur_epoch
+            new_score = _primary_score(idx)
+            if new_score > 0.0:
+                heapq.heappush(heap, _heap_key(idx, new_score))
+            continue
+
+        current_score = -neg_score
+        if current_score <= 0.0:
+            break  # 主分耗尽
+
+        # 通过 fresh 检查，即全局最高 —— accept
+        picked[idx] = True
+        c = candidates[idx]
+        selected.append(c)
+        for class_id, box_count in c.class_box_counts.items():
+            selected_box_counts[class_id] += box_count
+            selected_image_counts[class_id] += 1
+            class_epoch[class_id] = class_epoch.get(class_id, 0) + 1
+
+        if progress_callback is not None and (
+            len(selected) == 1
+            or len(selected) >= planned_rounds
+            or len(selected) - max(last_progress_emit, 0) >= 200
+        ):
+            _emit_progress("primary", f"heap={len(heap)}")
+
+    phase1_picks = len(selected)
+    if progress_callback is not None:
+        _emit_progress("primary", f"heap={len(heap)} done")
+
+    # ----- Phase 2: fallback 一次性批量补齐 -----
+    phase2_picks = 0
+    if effective_target_total_images > 0 and len(selected) < effective_target_total_images:
+        need = effective_target_total_images - len(selected)
+        fallback_entries: list[tuple[tuple, int]] = []
+        for idx in range(n_candidates):
+            if picked[idx]:
+                continue
+            c = candidates[idx]
+            sc = fallback_fill_score(
+                candidate=c,
+                selected_box_counts=selected_box_counts,
+                available_box_counts=available_box_counts,
+                box_density_penalty=box_density_penalty,
+            )
+            sc *= _saturation_multiplier(c)
+            if sc <= 0.0:
+                continue
+            fallback_entries.append((_heap_key(idx, sc), idx))
+        fallback_entries.sort(key=lambda item: item[0])
+        for _, idx in fallback_entries[:need]:
+            c = candidates[idx]
+            picked[idx] = True
+            selected.append(c)
+            for class_id, box_count in c.class_box_counts.items():
+                selected_box_counts[class_id] += box_count
+                selected_image_counts[class_id] += 1
+            phase2_picks += 1
+        if progress_callback is not None and phase2_picks > 0:
+            _emit_progress("fallback", f"added={phase2_picks}")
+
+    selected.sort(key=lambda item: item.rel_path.as_posix())
+
+    summary = dict(summary_template)
+    summary["selected_images_per_class"] = selected_image_counts
+    summary["selected_boxes_per_class"] = selected_box_counts
+    summary["phase1_picks"] = phase1_picks
+    summary["phase2_picks"] = phase2_picks
+    summary["phase1_heap_pops"] = heap_pops
+    summary["phase1_stale_pops"] = stale_pops
+    return selected, summary
+
 
 def pool_candidates(candidates_by_split: dict[str, list[ExportImageCandidate]]) -> list[ExportImageCandidate]:
     pooled: list[ExportImageCandidate] = []

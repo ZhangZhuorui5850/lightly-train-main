@@ -60,4 +60,7 @@ def dispatch(args) -> None:
         if args.tool_action == "eval":
             seg_tools.run_eval(args)
             return
+        if args.tool_action == "export":
+            seg_tools.run_export(args)
+            return
     raise ValueError(f"Unsupported action: {args.tool_task}/{args.tool_action}")

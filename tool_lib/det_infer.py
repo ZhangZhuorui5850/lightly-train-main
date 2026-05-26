@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -112,6 +113,26 @@ def ensure_object_detection_model(model: Any) -> None:
     class_name = model.__class__.__name__.lower()
     if "objectdetection" not in class_name:
         raise ValueError(f"Expected an object detection model, got '{model.__class__.__name__}'.")
+
+
+def _prepare_rgb_predict_path(image: Any, sample: Any, scratch_dir: Path) -> Path:
+    """非 RGB 图转 RGB 并写入 scratch_dir；返回预测使用的路径。
+
+    保留原扩展名，避免静默把 PNG/TIFF/BMP 有损压成 JPEG。
+    PIL 无法以原扩展名保存 RGB 时回退到 .png（无损）。scratch_dir 由调用方
+    用 tempfile.TemporaryDirectory 管理，函数返回后图片随上下文清理。
+    """
+    orig_ext = sample.image_path.suffix or ".png"
+    predict_path = scratch_dir / relative_output_path(sample, orig_ext)
+    predict_path.parent.mkdir(parents=True, exist_ok=True)
+    rgb_image = image.convert("RGB")
+    try:
+        rgb_image.save(predict_path)
+    except (OSError, ValueError, KeyError):
+        predict_path = predict_path.with_suffix(".png")
+        rgb_image.save(predict_path)
+    return predict_path
+
 
 def save_prediction_json(json_path: Path, sample: rt.ImageSample, image_size: tuple[int, int], records: list[dict[str, Any]]) -> None:
     json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1023,69 +1044,67 @@ def run_multi_split_shard_infer(args) -> None:
     print(f"Images to process: {len(split_samples)}")
     print(f"Selected splits: {', '.join(splits)}")
 
-    for idx, split_sample in enumerate(split_samples, start=1):
-        split = split_sample.split
-        sample = split_sample.sample
-        state = split_states[split]
-        state["num_images"] += 1
+    with tempfile.TemporaryDirectory(prefix="lt_rgb_") as _rgb_scratch_str:
+        _rgb_scratch = Path(_rgb_scratch_str)
+        for idx, split_sample in enumerate(split_samples, start=1):
+            split = split_sample.split
+            sample = split_sample.sample
+            state = split_states[split]
+            state["num_images"] += 1
 
-        output_dir = output_dirs[split]
-        temp_dir = rt.infer_temp_dir(output_dir)
-        images_dir = output_dir / "images"
-        json_dir = temp_dir / "json"
-        txt_dir = temp_dir / "txt"
+            output_dir = output_dirs[split]
+            temp_dir = rt.infer_temp_dir(output_dir)
+            images_dir = output_dir / "images"
+            json_dir = temp_dir / "json"
+            txt_dir = temp_dir / "txt"
 
-        with rt.Image.open(sample.image_path) as image:
-            image_size = image.size
-            predict_path = sample.image_path
-            if image.mode != "RGB":
-                tmp_dir = temp_dir / "_tmp_rgb"
-                tmp_dir.mkdir(parents=True, exist_ok=True)
-                predict_path = tmp_dir / relative_output_path(sample, ".jpg")
-                predict_path.parent.mkdir(parents=True, exist_ok=True)
-                image.convert("RGB").save(predict_path)
+            with rt.Image.open(sample.image_path) as image:
+                image_size = image.size
+                predict_path = sample.image_path
+                if image.mode != "RGB":
+                    predict_path = _prepare_rgb_predict_path(image, sample, _rgb_scratch)
 
-        infer_start = time.perf_counter()
-        prediction = model.predict(predict_path, threshold=args.score_threshold)
-        state["infer_time_sum_ms"] += (time.perf_counter() - infer_start) * 1000.0
-        records = prediction_records(prediction, class_names, image_size)
+            infer_start = time.perf_counter()
+            prediction = model.predict(predict_path, threshold=args.score_threshold)
+            state["infer_time_sum_ms"] += (time.perf_counter() - infer_start) * 1000.0
+            records = prediction_records(prediction, class_names, image_size)
 
-        gt_boxes, gt_labels, has_label = load_ground_truth(sample.label_path, image_size)
+            gt_boxes, gt_labels, has_label = load_ground_truth(sample.label_path, image_size)
 
-        if args.save_visualization:
-            vis_path = visualization_output_path(
-                images_dir,
-                sample,
-                rt.visualization_suffix(sample.image_path),
-                records,
-            )
-            gt_items_vis = gt_records(gt_boxes, gt_labels) if has_label else []
-            draw_predictions(sample.image_path, vis_path, records, gt_items_vis, class_names)
-        if args.save_json:
-            save_prediction_json(json_dir / relative_output_path(sample, ".json"), sample, image_size, records)
-        if args.save_txt:
-            save_prediction_txt(txt_dir / relative_output_path(sample, ".txt"), records)
+            if args.save_visualization:
+                vis_path = visualization_output_path(
+                    images_dir,
+                    sample,
+                    rt.visualization_suffix(sample.image_path),
+                    records,
+                )
+                gt_items_vis = gt_records(gt_boxes, gt_labels) if has_label else []
+                draw_predictions(sample.image_path, vis_path, records, gt_items_vis, class_names)
+            if args.save_json:
+                save_prediction_json(json_dir / relative_output_path(sample, ".json"), sample, image_size, records)
+            if args.save_txt:
+                save_prediction_txt(txt_dir / relative_output_path(sample, ".txt"), records)
 
-        if has_label:
-            state["metrics_meta"]["images_with_labels"] += 1
-        else:
-            state["metrics_meta"]["images_without_labels"] += 1
-        state["metric_entries"].append(build_metric_entry(prediction, gt_boxes, gt_labels))
-        if args.save_test_report:
-            gt_items = gt_records(gt_boxes, gt_labels)
-            image_total_gt, image_total_pred, image_total_tp = update_legacy_report_state(
-                state["legacy_class_data"],
-                gt_items,
-                records,
-                args.report_iou_threshold,
-            )
-            state["total_gt"] += image_total_gt
-            state["total_pred"] += image_total_pred
-            state["total_tp"] += image_total_tp
+            if has_label:
+                state["metrics_meta"]["images_with_labels"] += 1
+            else:
+                state["metrics_meta"]["images_without_labels"] += 1
+            state["metric_entries"].append(build_metric_entry(prediction, gt_boxes, gt_labels))
+            if args.save_test_report:
+                gt_items = gt_records(gt_boxes, gt_labels)
+                image_total_gt, image_total_pred, image_total_tp = update_legacy_report_state(
+                    state["legacy_class_data"],
+                    gt_items,
+                    records,
+                    args.report_iou_threshold,
+                )
+                state["total_gt"] += image_total_gt
+                state["total_pred"] += image_total_pred
+                state["total_tp"] += image_total_tp
 
-        state["processed_images"] += 1
-        if idx == 1 or idx % 20 == 0 or idx == len(split_samples):
-            print(f"[{idx}/{len(split_samples)}] processed ({split}): {sample.image_path}")
+            state["processed_images"] += 1
+            if idx == 1 or idx % 20 == 0 or idx == len(split_samples):
+                print(f"[{idx}/{len(split_samples)}] processed ({split}): {sample.image_path}")
 
     for split in splits:
         state = split_states[split]
@@ -1472,67 +1491,65 @@ def run_single_infer(args) -> None:
     legacy_total_pred = 0
     legacy_total_tp = 0
     metric_entries: list[dict[str, Any]] = []
-    for idx, sample in enumerate(samples, start=1):
-        with rt.Image.open(sample.image_path) as image:
-            image_size = image.size
-            predict_path = sample.image_path
-            if image.mode != "RGB":
-                tmp_dir = temp_dir / "_tmp_rgb"
-                tmp_dir.mkdir(parents=True, exist_ok=True)
-                predict_path = tmp_dir / relative_output_path(sample, ".jpg")
-                predict_path.parent.mkdir(parents=True, exist_ok=True)
-                image.convert("RGB").save(predict_path)
+    with tempfile.TemporaryDirectory(prefix="lt_rgb_") as _rgb_scratch_str:
+        _rgb_scratch = Path(_rgb_scratch_str)
+        for idx, sample in enumerate(samples, start=1):
+            with rt.Image.open(sample.image_path) as image:
+                image_size = image.size
+                predict_path = sample.image_path
+                if image.mode != "RGB":
+                    predict_path = _prepare_rgb_predict_path(image, sample, _rgb_scratch)
 
-        infer_start = time.perf_counter()
-        prediction = model.predict(predict_path, threshold=args.score_threshold)
-        infer_time_sum_ms += (time.perf_counter() - infer_start) * 1000.0
-        records = prediction_records(prediction, class_names, image_size)
+            infer_start = time.perf_counter()
+            prediction = model.predict(predict_path, threshold=args.score_threshold)
+            infer_time_sum_ms += (time.perf_counter() - infer_start) * 1000.0
+            records = prediction_records(prediction, class_names, image_size)
 
-        if sample.label_path is not None:
-            label_path_cur = sample.label_path
-        elif args.image_dir is not None:
-            labels_dir = args.image_dir.expanduser().resolve().parent.parent / "labels" / args.image_dir.name
-            label_path_cur = (labels_dir / sample.relative_path).with_suffix(".txt")
-        else:
-            label_path_cur = None
-        gt_boxes, gt_labels, has_label = load_ground_truth(label_path_cur, image_size)
-
-        if args.save_visualization:
-            vis_path = visualization_output_path(
-                images_dir,
-                sample,
-                rt.visualization_suffix(sample.image_path),
-                records,
-            )
-            gt_items_vis = gt_records(gt_boxes, gt_labels) if has_label else []
-            draw_predictions(sample.image_path, vis_path, records, gt_items_vis, class_names)
-        if args.save_json:
-            save_prediction_json(json_dir / relative_output_path(sample, ".json"), sample, image_size, records)
-        if args.save_txt:
-            save_prediction_txt(txt_dir / relative_output_path(sample, ".txt"), records)
-
-        if use_dataset:
-            if has_label:
-                metrics_meta["images_with_labels"] += 1
+            if sample.label_path is not None:
+                label_path_cur = sample.label_path
+            elif args.image_dir is not None:
+                labels_dir = args.image_dir.expanduser().resolve().parent.parent / "labels" / args.image_dir.name
+                label_path_cur = (labels_dir / sample.relative_path).with_suffix(".txt")
             else:
-                metrics_meta["images_without_labels"] += 1
-            update_metric(metric, label_mapping, prediction, gt_boxes, gt_labels)
-            if shard_child:
-                metric_entries.append(build_metric_entry(prediction, gt_boxes, gt_labels))
-            if args.save_test_report:
-                gt_items = gt_records(gt_boxes, gt_labels)
-                image_total_gt, image_total_pred, image_total_tp = update_legacy_report_state(
-                    legacy_class_data,
-                    gt_items,
-                    records,
-                    args.report_iou_threshold,
-                )
-                legacy_total_gt += image_total_gt
-                legacy_total_pred += image_total_pred
-                legacy_total_tp += image_total_tp
+                label_path_cur = None
+            gt_boxes, gt_labels, has_label = load_ground_truth(label_path_cur, image_size)
 
-        if idx == 1 or idx % 20 == 0 or idx == len(samples):
-            print(f"[{idx}/{len(samples)}] processed: {sample.image_path}")
+            if args.save_visualization:
+                vis_path = visualization_output_path(
+                    images_dir,
+                    sample,
+                    rt.visualization_suffix(sample.image_path),
+                    records,
+                )
+                gt_items_vis = gt_records(gt_boxes, gt_labels) if has_label else []
+                draw_predictions(sample.image_path, vis_path, records, gt_items_vis, class_names)
+            if args.save_json:
+                save_prediction_json(json_dir / relative_output_path(sample, ".json"), sample, image_size, records)
+            if args.save_txt:
+                save_prediction_txt(txt_dir / relative_output_path(sample, ".txt"), records)
+
+            if use_dataset:
+                if has_label:
+                    metrics_meta["images_with_labels"] += 1
+                else:
+                    metrics_meta["images_without_labels"] += 1
+                update_metric(metric, label_mapping, prediction, gt_boxes, gt_labels)
+                if shard_child:
+                    metric_entries.append(build_metric_entry(prediction, gt_boxes, gt_labels))
+                if args.save_test_report:
+                    gt_items = gt_records(gt_boxes, gt_labels)
+                    image_total_gt, image_total_pred, image_total_tp = update_legacy_report_state(
+                        legacy_class_data,
+                        gt_items,
+                        records,
+                        args.report_iou_threshold,
+                    )
+                    legacy_total_gt += image_total_gt
+                    legacy_total_pred += image_total_pred
+                    legacy_total_tp += image_total_tp
+
+            if idx == 1 or idx % 20 == 0 or idx == len(samples):
+                print(f"[{idx}/{len(samples)}] processed: {sample.image_path}")
 
     if shard_child:
         shard_result_path = write_shard_result(

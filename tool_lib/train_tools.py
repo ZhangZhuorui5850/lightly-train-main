@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -334,3 +335,4 @@ def run_train(args) -> None:
                 print(f"  dashboard : {dashboard_path}")
         except Exception as exc:
             print(f"[{task}/train] 警告：摘要同步失败: {exc}")
+            traceback.print_exc()

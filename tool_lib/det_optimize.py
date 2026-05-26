@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -29,7 +31,20 @@ DEFAULT_CONFUSION_THRESHOLD = 0.15
 # - 跳过 train，只导出 val + test，下载量小
 # - 每个候选类别/类别对的图片上限，避免重复样本太多
 PREVIEW_SKIP_SPLITS = frozenset({"train"})
-PREVIEW_MAX_IMAGES_PER_CATEGORY = 50
+PREVIEW_MAX_IMAGES_PER_MERGE = 20
+PREVIEW_MAX_IMAGES_PER_DROP = 50
+
+# 预览阶段 tier 化抽样：
+#   T1 黄金 — GT↔pred IoU ≥ T1 阈值，类别错配，最强信号。
+#   T2 次优 — IoU 在 [T2_min, T1) 之间类别错配；或 GT 有 A、pred 有 B 但没配上。
+#   T3 对照 — 仅含 GT A 或 B，无另一类痕迹；给用户看类别真实样貌。
+# T1 优先填满到 max_images_per_merge；不足 PREVIEW_MIN_PER_CANDIDATE 时用 T2 再 T3 兜底。
+PREVIEW_MATCH_IOU_THRESHOLD = 0.5  # 兼容旧字段名，等同于 T1 阈值
+PREVIEW_TIER_T1_IOU = 0.5
+PREVIEW_TIER_T2_IOU = 0.3
+PREVIEW_MIN_PER_CANDIDATE = 5
+# 合并后去重：同 new_id 组内 IoU ≥ 此值即视为重复框，保留面积大的那个。
+MERGE_DEDUP_IOU = 0.7
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +188,53 @@ def _box_iou(box_a: list[float], box_b: list[float]) -> float:
     area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
     union = area_a + area_b - inter
     return inter / union if union > 0 else 0.0
+
+
+def _dedup_merged_overlapping_boxes(
+    entries: list[dict[str, Any]], iou_threshold: float
+) -> tuple[list[int], int]:
+    """对同 new_id 组做贪心 IoU 去重，仅当组内含至少一个 came_from_merge 项时启用。
+
+    每项 entries[i] 需含:
+      - new_id:      int
+      - came_from_merge: bool
+      - bbox:        (cx, cy, w, h)，YOLO 归一化坐标（IoU 在归一化坐标下不变）
+
+    保留面积大的框；返回 (保留下来的索引按原顺序排列, 被丢弃的数量)。
+    """
+    by_new_id: dict[int, list[int]] = defaultdict(list)
+    for idx, e in enumerate(entries):
+        by_new_id[e["new_id"]].append(idx)
+
+    removed: set[int] = set()
+    for idxs in by_new_id.values():
+        if len(idxs) < 2:
+            continue
+        if not any(entries[i]["came_from_merge"] for i in idxs):
+            continue
+        order = sorted(
+            idxs,
+            key=lambda i: entries[i]["bbox"][2] * entries[i]["bbox"][3],
+            reverse=True,
+        )
+        kept: list[int] = []
+        for i in order:
+            cx_i, cy_i, w_i, h_i = entries[i]["bbox"]
+            box_i = [cx_i - w_i / 2, cy_i - h_i / 2, cx_i + w_i / 2, cy_i + h_i / 2]
+            drop_me = False
+            for k in kept:
+                cx_k, cy_k, w_k, h_k = entries[k]["bbox"]
+                box_k = [cx_k - w_k / 2, cy_k - h_k / 2, cx_k + w_k / 2, cy_k + h_k / 2]
+                if _box_iou(box_i, box_k) >= iou_threshold:
+                    drop_me = True
+                    break
+            if drop_me:
+                removed.add(i)
+            else:
+                kept.append(i)
+
+    keep_idx = [i for i in range(len(entries)) if i not in removed]
+    return keep_idx, len(removed)
 
 
 def _hungarian_match(cost_matrix: list[list[float]]) -> list[tuple[int, int]]:
@@ -724,10 +786,11 @@ def apply_optimize_decisions(
     source_data_yaml: Path,
     *,
     output_suffix: str = OPTIMIZE_SUFFIX,
-) -> tuple[Path, dict[int, str], int]:
-    """执行合并/删除并写出新数据集，返回 (新数据集根目录, 新类别名称)。
+) -> tuple[Path, dict[int, str], int, int]:
+    """执行合并/删除并写出新数据集，返回 (新数据集根目录, 新类别名称, 复制图数, 去重框数)。
 
-    不修改原始数据集任何文件。
+    不修改原始数据集任何文件。合并后会在同 new_id 组内做 IoU 去重，
+    阈值 MERGE_DEDUP_IOU；保留面积更大的框。
     """
     source_cfg = rt.load_data_config(source_data_yaml)
     source_root = Path(source_cfg["_root_dir"])
@@ -759,6 +822,7 @@ def apply_optimize_decisions(
 
     total_images = sum(len(infos) for infos in source_infos_by_split.values())
     copied = 0
+    dedup_total = 0  # 合并后被 IoU 去重的框数（累计）
     # review 数据：按操作标签分组，每组记录 (split, rel_path, src_image_path, original_lines, new_lines)
     review_by_op: dict[str, list[dict[str, Any]]] = {}
     print(f"\n[det/optimize] 写出新数据集 ...")
@@ -780,14 +844,17 @@ def apply_optimize_decisions(
             dst_image.parent.mkdir(parents=True, exist_ok=True)
             dst_label.parent.mkdir(parents=True, exist_ok=True)
 
-            # 重写标签：跳过被删类，合并类改 class_id
-            remapped: list[str] = []
+            # 重写标签：跳过被删类，合并类改 class_id；后续做 IoU 去重
+            entries: list[dict[str, Any]] = []
             affected_ops: set[str] = set()  # 该图片涉及的操作标签
             for line in info.label_lines:
                 parts = line.strip().split()
                 if len(parts) != 5:
                     continue
-                old_id = int(float(parts[0]))
+                try:
+                    old_id = int(float(parts[0]))
+                except ValueError:
+                    continue
                 new_id = id_map.get(old_id)
                 if new_id is None:
                     # 删除操作
@@ -795,15 +862,35 @@ def apply_optimize_decisions(
                         drop_name = original_class_names.get(old_id, str(old_id))
                         affected_ops.add(f"drop_{drop_name}")
                     continue
+                came_from_merge = False
                 if new_id != old_id:
-                    # 合并操作
                     md = merge_groups.get(old_id)
                     if md is not None:
+                        came_from_merge = True
                         names_str = "+".join(
                             original_class_names.get(c, str(c)) for c in md["class_ids"]
                         )
                         affected_ops.add(f"merge_{names_str}→{md['merged_name']}")
-                remapped.append(f"{new_id} {' '.join(parts[1:])}")
+                try:
+                    cx = float(parts[1]); cy = float(parts[2])
+                    bw = float(parts[3]); bh = float(parts[4])
+                except ValueError:
+                    continue
+                entries.append({
+                    "new_id": new_id,
+                    "came_from_merge": came_from_merge,
+                    "bbox": (cx, cy, bw, bh),
+                    "coords_str": " ".join(parts[1:]),
+                })
+
+            keep_idx, removed_here = _dedup_merged_overlapping_boxes(entries, MERGE_DEDUP_IOU)
+            if removed_here > 0:
+                dedup_total += removed_here
+                affected_ops.add("dedup_overlap")
+            remapped = [
+                f"{entries[i]['new_id']} {entries[i]['coords_str']}"
+                for i in keep_idx
+            ]
 
             # 只有被修改的图片才复制并记录 review
             if affected_ops:
@@ -836,6 +923,8 @@ def apply_optimize_decisions(
     print(f"  final_root={final_root}")
     print(f"  copied_images={copied}")
     print(f"  new_class_count={len(new_names)}")
+    if dedup_total > 0:
+        print(f"  dedup_overlap_boxes={dedup_total} (IoU≥{MERGE_DEDUP_IOU}，保留面积大的)")
 
     # 写 data.yaml 和 classes.txt
     export_cfg = {
@@ -862,7 +951,7 @@ def apply_optimize_decisions(
             new_class_names=new_names,
         )
 
-    return final_root, new_names, copied
+    return final_root, new_names, copied, dedup_total
 
 
 def _write_optimize_review(
@@ -995,6 +1084,62 @@ def _inference_labels_yolo(pred_payload: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _prompt_preview_export_kinds(
+    *, has_merge: bool, has_drop: bool
+) -> frozenset[str]:
+    """询问用户预览要导出哪类候选；返回空集表示跳过预览。"""
+    if has_merge and has_drop:
+        print("\n  预览导出选项：")
+        print("    1) 仅 merge（默认）")
+        print("    2) 仅 drop")
+        print("    3) 两者都导出")
+        print("    0) 跳过预览，直接进入决策")
+        raw = _read_line("  请选择 [0/1/2/3，回车默认 1]: ").strip()
+        if raw == "0":
+            return frozenset()
+        if raw == "2":
+            return frozenset({"drop"})
+        if raw == "3":
+            return frozenset({"merge", "drop"})
+        return frozenset({"merge"})
+    only = "merge" if has_merge else "drop"
+    print(f"\n  仅检出 {only} 候选。")
+    if not _prompt_yes_no(f"是否导出 {only} 预览供查看？", default=True):
+        return frozenset()
+    return frozenset({only})
+
+
+def _zip_preview_dir(preview_dir: Path) -> Path:
+    """把预览目录打包成同名 .zip，方便服务器侧下载。
+
+    使用 ZIP_STORED（不压缩）——图片本身已经是压缩格式，再压缩省不了多少空间
+    但会显著拖慢。zip 与 preview_dir 同级，文件名 <preview_dir.name>.zip。
+    包内顶层保留 preview_dir.name 这一层，解压后是一个整齐的文件夹。
+    """
+    # 用字符串拼接而不是 with_suffix，避免数据集名带点时（如 dataset.v2）被替换掉
+    zip_path = preview_dir.parent / f"{preview_dir.name}.zip"
+    if zip_path.exists():
+        zip_path.unlink()
+    base = preview_dir.parent
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
+        for path in sorted(preview_dir.rglob("*")):
+            if path.is_file():
+                zf.write(path, path.relative_to(base))
+    return zip_path
+
+
+def _resolve_preview_dir(source_root: Path) -> Path:
+    """预览目录放在源数据集同级，命名 <dataset>_preview_<YYYYMMDD-HHMMSS>。
+
+    例如源数据集是 datasets/wuwanPic_dataset/dataset_det，
+    预览目录就放到 datasets/wuwanPic_dataset/dataset_det_preview_20260521-123456。
+    打包后的 .zip 也跟它并列在同一目录下。
+    """
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    name = f"{source_root.name}_preview_{ts}"
+    return rt.deduplicate_path(source_root.parent / name)
+
+
 def _export_preview_for_review(
     *,
     merge_candidates: list[dict[str, Any]],
@@ -1003,19 +1148,29 @@ def _export_preview_for_review(
     class_names: dict[int, str],
     infer_output_dir: Path | None = None,
     output_suffix: str = OPTIMIZE_SUFFIX,
-    max_images_per_category: int = PREVIEW_MAX_IMAGES_PER_CATEGORY,
+    max_images_per_merge: int = PREVIEW_MAX_IMAGES_PER_MERGE,
+    max_images_per_drop: int = PREVIEW_MAX_IMAGES_PER_DROP,
     skip_splits: frozenset[str] = PREVIEW_SKIP_SPLITS,
+    export_kinds: frozenset[str] = frozenset({"merge", "drop"}),
 ) -> tuple[Path, int]:
     """在确认前导出受影响图片的预览，供用户查看后再决定。
 
-    为压缩下载体积、只保留能让用户判断的样本，遵循三条规则：
-      - 仅导出 val/test 等非训练 split（由 skip_splits 控制）。
-      - 合并候选只收同时含两类的图片；劣质类别只收含该类的图片。
-      - 每个候选最多 max_images_per_category 张。
+    目录布局（扁平化，便于 X-AnyLabeling 一次性查看所有候选）：
+        preview_dir/
+        ├── visualizations/<候选>/<原名>__<split>.<ext>   (人眼看，分子目录)
+        ├── inference_dataset/                            (X-AnyLabeling 打开此处)
+        │   ├── data.yaml / classes.txt                   (全局类名)
+        │   ├── images/<候选>__<原名>__<split>.<ext>      (扁平)
+        │   └── labels/<同名>.txt                         (YOLO 归一化预测)
+        ├── README.txt                                    (所有候选的总览)
+        └── manifest.json                                 (机器读)
 
-    每个候选目录有两个子目录：
-      - with_gt/         可视化图：同时画 GT + 推理框，便于人眼判断。
-      - inference_only/  原图 + 仅含推理结果的 YOLO label，便于在 X-AnyLabeling 中查看。
+    采样规则：
+      - 仅导出 val/test 等非训练 split（由 skip_splits 控制）。
+      - 合并候选：GT↔pred 一对一最佳-IoU 匹配（IoU≥{PREVIEW_MATCH_IOU_THRESHOLD}），类别错配才算混淆现场。
+      - 劣质类别：图片含该类即可。
+      - 每个 merge 候选最多 max_images_per_merge 张，每个 drop 候选最多 max_images_per_drop 张。
+      - export_kinds 控制只导 merge / 只导 drop / 两者都导。
 
     返回 (preview_dir, total_preview_images)。
     """
@@ -1027,7 +1182,7 @@ def _export_preview_for_review(
     if infer_output_dir is not None and infer_output_dir.exists():
         pred_lookup = _build_pred_json_lookup(infer_output_dir)
 
-    preview_dir = rt.deduplicate_path(source_root.parent / f"_preview_optimize{id(source_root):x}")
+    preview_dir = _resolve_preview_dir(source_root)
     preview_dir.mkdir(parents=True, exist_ok=True)
 
     sorted_cids = sorted(class_names.keys())
@@ -1036,50 +1191,84 @@ def _export_preview_for_review(
     full_names_by_original_id = {cid: class_names[cid] for cid in sorted_cids}
     max_cid = max(sorted_cids) if sorted_cids else -1
 
-    def _write_inference_only_yaml(subfolder: Path) -> None:
-        # 用原始 class_id 作为 key，与推理 label 中的 class_id 对齐
-        names_for_yaml = {
-            cid: full_names_by_original_id.get(cid, str(cid))
-            for cid in range(max_cid + 1)
-        }
-        cfg = {
-            "path": str(subfolder),
+    # 统一的输出目录：所有候选共用一个 X-AnyLabeling 数据集 + 一个可视化图库
+    vis_root = preview_dir / "visualizations"
+    ds_root = preview_dir / "inference_dataset"
+    ds_images = ds_root / "images"
+    ds_labels = ds_root / "labels"
+    vis_root.mkdir(parents=True, exist_ok=True)
+    ds_images.mkdir(parents=True, exist_ok=True)
+    ds_labels.mkdir(parents=True, exist_ok=True)
+
+    # 全局 data.yaml / classes.txt：用原始 class_id 作为 key，与推理 label 对齐
+    names_for_yaml = {
+        cid: full_names_by_original_id.get(cid, str(cid))
+        for cid in range(max_cid + 1)
+    }
+    rt.dump_yaml(
+        ds_root / "data.yaml",
+        {
+            "path": str(ds_root),
             "train": "images",
             "val": "images",
             "test": "images",
             "task": "detect",
             "nc": max_cid + 1,
             "names": names_for_yaml,
-        }
-        rt.dump_yaml(subfolder / "data.yaml", cfg)
-        (subfolder / "classes.txt").write_text(
-            "\n".join(names_for_yaml[i] for i in range(max_cid + 1)) + "\n",
-            encoding="utf-8",
-        )
+        },
+    )
+    (ds_root / "classes.txt").write_text(
+        "\n".join(names_for_yaml[i] for i in range(max_cid + 1)) + "\n",
+        encoding="utf-8",
+    )
 
-    def _emit_pair(
-        info: Any,
-        split_name: str,
-        with_gt_dir: Path,
-        inference_only_dir: Path,
+    manifest_images: list[dict[str, Any]] = []
+    vis_missing_count = 0  # 找不到 vis 图的张数（不回退原图，避免误导）
+
+    def _safe_token(s: str) -> str:
+        return s.replace("/", "_").replace("\\", "_").replace(" ", "_")
+
+    def _emit_flat(
+        info: Any, split_name: str, cand_key: str, tier: str | None = None
     ) -> None:
-        # with_gt：复制带 GT+推理框的可视化图，找不到回退原图
-        with_gt_img = with_gt_dir / "images" / split_name / info.rel_path
-        with_gt_img.parent.mkdir(parents=True, exist_ok=True)
-        vis: Path | None = None
-        if infer_output_dir is not None:
-            vis = _find_vis_image(infer_output_dir, info.src_image_path)
-        shutil.copy2(vis if vis is not None else info.src_image_path, with_gt_img)
+        nonlocal vis_missing_count
+        # 用 rel_path（含子目录）展平成唯一标识，避免不同子目录同名图相互覆盖
+        orig_id = info.rel_path.with_suffix("").as_posix().replace("/", "__")
+        orig_ext = info.rel_path.suffix
+        tier_token = f"{tier}__" if tier else ""
 
-        # inference_only：原图 + 仅推理结果的 YOLO label
-        infer_img = inference_only_dir / "images" / split_name / info.rel_path
-        infer_lbl = inference_only_dir / "labels" / split_name / info.rel_path.with_suffix(".txt")
-        infer_img.parent.mkdir(parents=True, exist_ok=True)
-        infer_lbl.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(info.src_image_path, infer_img)
+        # 1) visualizations/<候选>/[<tier>__]<原名>__<split>.<ext>，找不到 vis 时不回退原图
+        vis_src: Path | None = None
+        if infer_output_dir is not None:
+            vis_src = _find_vis_image(infer_output_dir, info.src_image_path)
+        vis_rel: str | None = None
+        if vis_src is not None:
+            vis_dir = vis_root / cand_key
+            vis_dir.mkdir(parents=True, exist_ok=True)
+            vis_dst = vis_dir / f"{tier_token}{orig_id}__{split_name}{vis_src.suffix}"
+            shutil.copy2(vis_src, vis_dst)
+            vis_rel = vis_dst.relative_to(preview_dir).as_posix()
+        else:
+            vis_missing_count += 1
+
+        # 2) inference_dataset/images & labels，扁平化、文件名带候选+tier 前缀
+        stem = f"{cand_key}__{tier_token}{orig_id}__{split_name}"
+        img_dst = ds_images / f"{stem}{orig_ext}"
+        lbl_dst = ds_labels / f"{stem}.txt"
+        shutil.copy2(info.src_image_path, img_dst)
         pred_payload = pred_lookup.get(info.src_image_path.stem)
         lines = _inference_labels_yolo(pred_payload) if pred_payload is not None else []
-        infer_lbl.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        lbl_dst.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+        manifest_images.append({
+            "candidate": cand_key,
+            "tier": tier,
+            "split": split_name,
+            "image": img_dst.name,
+            "label": lbl_dst.name,
+            "visualization": vis_rel,
+            "original_path": str(info.src_image_path),
+        })
 
     def _label_cids(info: Any) -> set[int]:
         cids: set[int] = set()
@@ -1092,96 +1281,343 @@ def _export_preview_for_review(
                     pass
         return cids
 
-    total = 0
+    match_cache: dict[str, tuple[set[int], set[int], list[tuple[int, int, float]]]] = {}
 
-    # 合并候选：图片必须同时含 cid_a 和 cid_b
-    for cand in merge_candidates:
-        cid_a, cid_b = cand["class_id_a"], cand["class_id_b"]
-        name_a = cand.get("name_a", class_names.get(cid_a, str(cid_a)))
-        name_b = cand.get("name_b", class_names.get(cid_b, str(cid_b)))
-        confusion_type = cand.get("confusion_type", "")
+    def _per_image_match_details(
+        info: Any,
+    ) -> tuple[set[int], set[int], list[tuple[int, int, float]]]:
+        """返回 (gt_cids, pred_cids, matches)；按图缓存，跨候选共享。
 
-        op_dir = preview_dir / f"merge_{name_a}+{name_b}"
-        with_gt_dir = op_dir / "with_gt"
-        inference_only_dir = op_dir / "inference_only"
-        with_gt_dir.mkdir(parents=True, exist_ok=True)
-        inference_only_dir.mkdir(parents=True, exist_ok=True)
-        _write_inference_only_yaml(inference_only_dir)
+        matches 是 [(gt_cid, pred_cid, iou), ...]，IoU ≥ PREVIEW_TIER_T2_IOU；
+        贪心一对一匹配，pred 按 score 降序优先。
+        """
+        cache_key = str(info.src_image_path)
+        cached = match_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        result = _compute_match_details(info)
+        match_cache[cache_key] = result
+        return result
 
-        count = 0
-        for split_name, infos in source_infos_by_split.items():
-            if split_name in skip_splits:
+    def _compute_match_details(
+        info: Any,
+    ) -> tuple[set[int], set[int], list[tuple[int, int, float]]]:
+        gt_cids: set[int] = set()
+        pred_cids: set[int] = set()
+        matches: list[tuple[int, int, float]] = []
+        payload = pred_lookup.get(info.src_image_path.stem)
+        # 即便没有 pred，也仍然解析 GT 类，便于 T3 兜底
+        for line in info.label_lines:
+            parts = line.strip().split()
+            if len(parts) != 5:
                 continue
-            if count >= max_images_per_category:
-                break
-            for info in infos:
-                if count >= max_images_per_category:
-                    break
-                cids = _label_cids(info)
-                if cid_a not in cids or cid_b not in cids:
-                    continue
-                _emit_pair(info, split_name, with_gt_dir, inference_only_dir)
-                count += 1
+            try:
+                gt_cids.add(int(float(parts[0])))
+            except ValueError:
+                continue
+        if not payload:
+            return gt_cids, pred_cids, matches
+        width = float(payload.get("width", 0) or 0)
+        height = float(payload.get("height", 0) or 0)
+        if width <= 0 or height <= 0:
+            return gt_cids, pred_cids, matches
 
-        (op_dir / "README.txt").write_text(
-            f"类别: {name_a} (ID={cid_a}) + {name_b} (ID={cid_b})\n"
-            f"类型: {confusion_type}混淆\n"
-            f"图片数: {count} (上限 {max_images_per_category}，仅含同时出现两类的图)\n"
-            f"跳过 split: {sorted(skip_splits)}\n\n"
-            f"with_gt/         同时画了 GT 和推理框，用于判断是否合并\n"
-            f"inference_only/  原图 + 仅含推理结果的 YOLO label，可在 X-AnyLabeling 中查看\n\n"
-            f"{name_a}→{name_b}: {cand.get('rate_a_to_b', 0):.1%} "
-            f"({cand.get('count_a_to_b', 0)} 次 / GT={cand.get('gt_a', 0)})\n"
-            f"{name_b}→{name_a}: {cand.get('rate_b_to_a', 0):.1%} "
-            f"({cand.get('count_b_to_a', 0)} 次 / GT={cand.get('gt_b', 0)})\n",
-            encoding="utf-8",
-        )
-        total += count
+        gt_boxes: list[tuple[int, list[float]]] = []
+        for line in info.label_lines:
+            parts = line.strip().split()
+            if len(parts) != 5:
+                continue
+            try:
+                cid = int(float(parts[0]))
+                cx = float(parts[1]) * width
+                cy = float(parts[2]) * height
+                bw = float(parts[3]) * width
+                bh = float(parts[4]) * height
+            except ValueError:
+                continue
+            gt_boxes.append(
+                (cid, [cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2])
+            )
+
+        preds: list[tuple[int, list[float], float]] = []
+        for pred in payload.get("predictions", []) or []:
+            try:
+                cid = int(pred.get("class_id", -1))
+            except (TypeError, ValueError):
+                continue
+            bbox = pred.get("bbox_xyxy", [])
+            if cid < 0 or len(bbox) != 4:
+                continue
+            score = float(pred.get("score", 1.0))
+            pred_cids.add(cid)
+            preds.append((cid, [float(v) for v in bbox], score))
+
+        if not gt_boxes or not preds:
+            return gt_cids, pred_cids, matches
+
+        matched_gt: set[int] = set()
+        for pred_cid, pred_box, _score in sorted(preds, key=lambda p: p[2], reverse=True):
+            best_iou = 0.0
+            best_gi = -1
+            for gi, (_, gt_box) in enumerate(gt_boxes):
+                if gi in matched_gt:
+                    continue
+                iou = _box_iou(pred_box, gt_box)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gi = gi
+            if best_gi >= 0 and best_iou >= PREVIEW_TIER_T2_IOU:
+                matched_gt.add(best_gi)
+                matches.append((gt_boxes[best_gi][0], pred_cid, best_iou))
+        return gt_cids, pred_cids, matches
+
+    def _classify_image_tier(info: Any, cid_a: int, cid_b: int) -> str | None:
+        """对单张图返回该候选下的 tier，或 None 表示不收。"""
+        gt_cids, pred_cids, matches = _per_image_match_details(info)
+        target_pairs = {(cid_a, cid_b), (cid_b, cid_a)}
+        relevant_ious = [iou for (g, p, iou) in matches if (g, p) in target_pairs]
+        if any(iou >= PREVIEW_TIER_T1_IOU for iou in relevant_ious):
+            return "T1"
+        if relevant_ious:  # 已在 [T2_IOU, T1_IOU) 范围
+            return "T2"
+        has_a, has_b = cid_a in gt_cids, cid_b in gt_cids
+        has_pred_a, has_pred_b = cid_a in pred_cids, cid_b in pred_cids
+        if (has_a and has_pred_b) or (has_b and has_pred_a):
+            return "T2"
+        if has_a or has_b:
+            return "T3"
+        return None
+
+    # 全数据集类别人口（含 train），供用户对照"导出几张 vs 实际有多少"
+    class_image_count: dict[int, int] = defaultdict(int)
+    class_box_count: dict[int, int] = defaultdict(int)
+    for _infos in source_infos_by_split.values():
+        for _info in _infos:
+            _seen: set[int] = set()
+            for _line in _info.label_lines:
+                _parts = _line.strip().split()
+                if len(_parts) != 5:
+                    continue
+                try:
+                    _cid = int(float(_parts[0]))
+                except ValueError:
+                    continue
+                class_box_count[_cid] += 1
+                if _cid not in _seen:
+                    class_image_count[_cid] += 1
+                    _seen.add(_cid)
+
+    total = 0
+    candidate_stats: list[dict[str, Any]] = []
+
+    # 合并候选：tier 分层抽样——T1 黄金 → T2 次优 → T3 对照，凑量但保信号
+    if "merge" in export_kinds and merge_candidates:
+        print(f"  [merge] 导出 {len(merge_candidates)} 个候选 ...")
+    if "merge" in export_kinds:
+        for cand_idx, cand in enumerate(merge_candidates, 1):
+            cid_a, cid_b = cand["class_id_a"], cand["class_id_b"]
+            name_a = cand.get("name_a", class_names.get(cid_a, str(cid_a)))
+            name_b = cand.get("name_b", class_names.get(cid_b, str(cid_b)))
+            confusion_type = cand.get("confusion_type", "")
+            cand_key = f"merge_{_safe_token(name_a)}+{_safe_token(name_b)}"
+
+            # 先按 tier 归桶（在非 skip split 上扫一遍）
+            buckets: dict[str, list[tuple[Any, str]]] = {"T1": [], "T2": [], "T3": []}
+            for split_name, infos in source_infos_by_split.items():
+                if split_name in skip_splits:
+                    continue
+                for info in infos:
+                    tier = _classify_image_tier(info, cid_a, cid_b)
+                    if tier is not None:
+                        buckets[tier].append((info, split_name))
+
+            # 优先级凑量：T1 先填满至 max；不足 MIN 时 T2 补，再不够 T3 兜
+            chosen: list[tuple[Any, str, str]] = []
+            for info, split_name in buckets["T1"]:
+                if len(chosen) >= max_images_per_merge:
+                    break
+                chosen.append((info, split_name, "T1"))
+            if len(chosen) < PREVIEW_MIN_PER_CANDIDATE:
+                for info, split_name in buckets["T2"]:
+                    if len(chosen) >= PREVIEW_MIN_PER_CANDIDATE:
+                        break
+                    chosen.append((info, split_name, "T2"))
+            if len(chosen) < PREVIEW_MIN_PER_CANDIDATE:
+                for info, split_name in buckets["T3"]:
+                    if len(chosen) >= PREVIEW_MIN_PER_CANDIDATE:
+                        break
+                    chosen.append((info, split_name, "T3"))
+
+            for info, split_name, tier in chosen:
+                _emit_flat(info, split_name, cand_key, tier=tier)
+            tier_counts = {"T1": 0, "T2": 0, "T3": 0}
+            for _, _, t in chosen:
+                tier_counts[t] += 1
+            count = len(chosen)
+
+            stats_a = {"images": class_image_count.get(cid_a, 0), "boxes": class_box_count.get(cid_a, 0)}
+            stats_b = {"images": class_image_count.get(cid_b, 0), "boxes": class_box_count.get(cid_b, 0)}
+
+            candidate_stats.append({
+                "kind": "merge",
+                "key": cand_key,
+                "images": count,
+                "tier_counts": tier_counts,
+                "tier_pool_sizes": {k: len(v) for k, v in buckets.items()},
+                "class_stats_a": stats_a,
+                "class_stats_b": stats_b,
+                "name_a": name_a, "name_b": name_b,
+                "cid_a": cid_a, "cid_b": cid_b,
+                "confusion_type": confusion_type,
+                "rate_a_to_b": cand.get("rate_a_to_b", 0),
+                "rate_b_to_a": cand.get("rate_b_to_a", 0),
+                "count_a_to_b": cand.get("count_a_to_b", 0),
+                "count_b_to_a": cand.get("count_b_to_a", 0),
+                "gt_a": cand.get("gt_a", 0),
+                "gt_b": cand.get("gt_b", 0),
+            })
+            total += count
+            print(
+                f"    [{cand_idx}/{len(merge_candidates)}] {cand_key}: {count} 张 "
+                f"(T1={tier_counts['T1']}/T2={tier_counts['T2']}/T3={tier_counts['T3']})  "
+                f"{name_a}={stats_a['images']}图/{stats_a['boxes']}框  "
+                f"{name_b}={stats_b['images']}图/{stats_b['boxes']}框"
+            )
 
     # 劣质类别：图片含该类即可
-    risky = [q for q in class_quality if q["risk_level"] in {"极高", "高", "中"}]
-    merged_class_ids: set[int] = set()
-    for cand in merge_candidates:
-        merged_class_ids.add(cand["class_id_a"])
-        merged_class_ids.add(cand["class_id_b"])
+    if "drop" in export_kinds:
+        risky = [q for q in class_quality if q["risk_level"] in {"极高", "高", "中"}]
+        merged_class_ids: set[int] = set()
+        for cand in merge_candidates:
+            merged_class_ids.add(cand["class_id_a"])
+            merged_class_ids.add(cand["class_id_b"])
 
-    for q in risky:
-        cid = q["class_id"]
-        if cid in merged_class_ids:
-            continue
-        name = q["name"]
-        op_dir = preview_dir / f"drop_{name}"
-        with_gt_dir = op_dir / "with_gt"
-        inference_only_dir = op_dir / "inference_only"
-        with_gt_dir.mkdir(parents=True, exist_ok=True)
-        inference_only_dir.mkdir(parents=True, exist_ok=True)
-        _write_inference_only_yaml(inference_only_dir)
-
-        count = 0
-        for split_name, infos in source_infos_by_split.items():
-            if split_name in skip_splits:
+        drop_total = sum(1 for q in risky if q["class_id"] not in merged_class_ids)
+        if drop_total:
+            print(f"  [drop] 导出 {drop_total} 个候选 ...")
+        drop_idx = 0
+        for q in risky:
+            cid = q["class_id"]
+            if cid in merged_class_ids:
                 continue
-            if count >= max_images_per_category:
-                break
-            for info in infos:
-                if count >= max_images_per_category:
-                    break
-                if cid not in _label_cids(info):
-                    continue
-                _emit_pair(info, split_name, with_gt_dir, inference_only_dir)
-                count += 1
+            drop_idx += 1
+            name = q["name"]
+            cand_key = f"drop_{_safe_token(name)}"
 
-        (op_dir / "README.txt").write_text(
-            f"类别: {name} (ID={cid})\n"
-            f"风险等级: {q['risk_level']}  可信度: {q.get('confidence', 'normal')}\n"
-            f"AP={q['ap']:.3f}  F1={q['f1']:.3f}  GT={q['gt']}  Pred={q['pred']}\n"
-            f"图片数: {count} (上限 {max_images_per_category})\n"
-            f"跳过 split: {sorted(skip_splits)}\n\n"
-            f"with_gt/         同时画了 GT 和推理框，用于判断是否删除\n"
-            f"inference_only/  原图 + 仅含推理结果的 YOLO label，可在 X-AnyLabeling 中查看\n",
-            encoding="utf-8",
+            count = 0
+            for split_name, infos in source_infos_by_split.items():
+                if split_name in skip_splits:
+                    continue
+                if count >= max_images_per_drop:
+                    break
+                for info in infos:
+                    if count >= max_images_per_drop:
+                        break
+                    if cid not in _label_cids(info):
+                        continue
+                    _emit_flat(info, split_name, cand_key)
+                    count += 1
+
+            stats_drop = {"images": class_image_count.get(cid, 0), "boxes": class_box_count.get(cid, 0)}
+            candidate_stats.append({
+                "kind": "drop",
+                "key": cand_key,
+                "images": count,
+                "class_stats": stats_drop,
+                "name": name, "cid": cid,
+                "risk_level": q["risk_level"],
+                "confidence": q.get("confidence", "normal"),
+                "ap": q.get("ap", 0.0),
+                "f1": q.get("f1", 0.0),
+                "gt": q.get("gt", 0),
+                "pred": q.get("pred", 0),
+            })
+            total += count
+            print(
+                f"    [{drop_idx}/{drop_total}] {cand_key}: {count} 张  "
+                f"{name}={stats_drop['images']}图/{stats_drop['boxes']}框"
+            )
+
+    # 全局 README：所有候选汇总在一份
+    readme_lines: list[str] = [
+        "# 数据集优化预览",
+        "",
+        f"skip_splits: {sorted(skip_splits)}",
+        f"预览混淆判定 IoU 阈值: {PREVIEW_MATCH_IOU_THRESHOLD}",
+        f"图片上限：merge={max_images_per_merge}, drop={max_images_per_drop}",
+        f"总图片数: {total}",
+        f"未找到可视化图: {vis_missing_count} 张（manifest 中 visualization 为 null）"
+        if vis_missing_count else f"未找到可视化图: 0",
+        "",
+        "目录说明:",
+        "  visualizations/<候选>/   GT+pred 可视化，用文件管理器直接看",
+        "  inference_dataset/       X-AnyLabeling 打开此目录即可看完所有候选",
+        "    data.yaml / classes.txt  全局类名（原始 class_id）",
+        "    images/<候选>__<原名>__<split>.<ext>",
+        "    labels/<同名>.txt        YOLO 归一化预测结果",
+        "  manifest.json            机器读，列出每张图归属哪个候选",
+        "",
+    ]
+    merge_stats = [c for c in candidate_stats if c["kind"] == "merge"]
+    drop_stats = [c for c in candidate_stats if c["kind"] == "drop"]
+    if merge_stats:
+        readme_lines += [
+            f"## 合并候选 ({len(merge_stats)} 组)",
+            "",
+            "样本分层（按可信度从高到低）：",
+            "  T1 黄金 — GT框与pred框 IoU≥0.5 且类别错配，最强混淆信号",
+            "  T2 次优 — IoU 在 [0.3, 0.5) 错配，或 GT 有一类、pred 有另一类但没配上",
+            "  T3 对照 — 图中只含其中一类、无另一类痕迹，给你看类别真实样貌做对照",
+            f"  策略：先填 T1 至上限 {max_images_per_merge}，不足 {PREVIEW_MIN_PER_CANDIDATE} 张时用 T2 再 T3 兜底",
+            "",
+        ]
+        for c in merge_stats:
+            pool = c.get("tier_pool_sizes", {})
+            readme_lines += [
+                f"[{c['key']}]  共 {c['images']} 张  类型: {c['confusion_type']}混淆",
+                f"  样本构成: T1黄金={c['tier_counts']['T1']}  T2次优={c['tier_counts']['T2']}  T3对照={c['tier_counts']['T3']}  "
+                f"(候选池: T1={pool.get('T1', 0)} / T2={pool.get('T2', 0)} / T3={pool.get('T3', 0)})",
+                f"  类别概况: {c['name_a']} (ID={c['cid_a']}) — {c['class_stats_a']['images']} 张图 / {c['class_stats_a']['boxes']} 框",
+                f"            {c['name_b']} (ID={c['cid_b']}) — {c['class_stats_b']['images']} 张图 / {c['class_stats_b']['boxes']} 框",
+                f"  混淆数据: {c['name_a']}→{c['name_b']}: {c['rate_a_to_b']:.1%} ({c['count_a_to_b']} 次 / GT={c['gt_a']})",
+                f"            {c['name_b']}→{c['name_a']}: {c['rate_b_to_a']:.1%} ({c['count_b_to_a']} 次 / GT={c['gt_b']})",
+                "",
+            ]
+    if drop_stats:
+        readme_lines += [f"## 劣质类别候选 ({len(drop_stats)} 个)", ""]
+        for c in drop_stats:
+            cs = c.get("class_stats", {"images": 0, "boxes": 0})
+            readme_lines += [
+                f"[{c['key']}]  {c['images']} 张样本  "
+                f"类别 {c['name']} 全集: {cs['images']} 图 / {cs['boxes']} 框",
+                f"  风险={c['risk_level']}  可信度={c['confidence']}  "
+                f"AP={c['ap']:.3f}  F1={c['f1']:.3f}  GT={c['gt']}  Pred={c['pred']}",
+                "",
+            ]
+    (preview_dir / "README.txt").write_text("\n".join(readme_lines), encoding="utf-8")
+
+    # manifest.json：机器读
+    manifest = {
+        "preview_dir": str(preview_dir),
+        "skip_splits": sorted(skip_splits),
+        "match_iou_threshold": PREVIEW_MATCH_IOU_THRESHOLD,
+        "max_images_per_merge": max_images_per_merge,
+        "max_images_per_drop": max_images_per_drop,
+        "total_images": total,
+        "visualizations_missing": vis_missing_count,
+        "candidates": candidate_stats,
+        "images": manifest_images,
+    }
+    (preview_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    if vis_missing_count:
+        print(
+            f"  ⚠ 未找到 {vis_missing_count} 张图的可视化（visualizations/ 中缺失），"
+            f"manifest 中标记 visualization=null"
         )
-        total += count
 
     return preview_dir, total
 
@@ -1213,6 +1649,7 @@ def write_optimize_report(
     original_class_names: dict[int, str],
     new_class_names: dict[int, str],
     confusion_available: bool,
+    dedup_total: int = 0,
 ) -> Path:
     """写出 optimize_summary.json 和 optimize_summary.md。"""
     merge_decisions = decisions["merge_decisions"]
@@ -1229,6 +1666,8 @@ def write_optimize_report(
         "drop_decisions": drop_decisions,
         "class_quality": class_quality,
         "merge_candidates_analyzed": merge_candidates,
+        "dedup_overlap_boxes": dedup_total,
+        "dedup_iou_threshold": MERGE_DEDUP_IOU,
     }
     json_path = output_root / "optimize_summary.json"
     json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1249,6 +1688,12 @@ def write_optimize_report(
             )
             lines.append(f"| {names_str} | {d['merged_name']} | {d['reason']} |")
         lines.append("")
+        if dedup_total > 0:
+            lines += [
+                f"> **自动去重重叠框**: {dedup_total} 个 "
+                f"(同 new_id 组内 IoU≥{MERGE_DEDUP_IOU}，保留面积大的)",
+                "",
+            ]
 
     if drop_decisions:
         lines += [
@@ -1425,60 +1870,68 @@ def run_optimize(args) -> None:
 
     # 6. 导出预览：让用户先看到受影响的图片再做决定
     preview_dir: Path | None = None
-    if merge_candidates or any(
-        q["risk_level"] in {"极高", "高", "中"} for q in class_quality
-    ):
-        preview_dir, preview_count = _export_preview_for_review(
-            merge_candidates=merge_candidates,
+    has_merge = bool(merge_candidates)
+    has_drop = any(q["risk_level"] in {"极高", "高", "中"} for q in class_quality)
+
+    try:
+        if has_merge or has_drop:
+            export_kinds = _prompt_preview_export_kinds(has_merge=has_merge, has_drop=has_drop)
+            if export_kinds:
+                preview_dir, preview_count = _export_preview_for_review(
+                    merge_candidates=merge_candidates,
+                    class_quality=class_quality,
+                    source_data_yaml=source_data_yaml,
+                    class_names=class_names,
+                    infer_output_dir=infer_output_dir if infer_output_dir is not None and infer_output_dir.exists() else None,
+                    export_kinds=export_kinds,
+                )
+                print(f"\n  ★ 预览已导出（{preview_count} 张受影响图片）: {preview_dir}")
+                zip_path = _zip_preview_dir(preview_dir)
+                zip_size_mb = zip_path.stat().st_size / (1024 * 1024)
+                print(f"    ★ 已打包: {zip_path}  ({zip_size_mb:.1f} MB，可直接 scp 下载)")
+                print("    请查看图片和标签，然后决定是否执行操作。\n")
+
+        # 7. 交互确认
+        decisions = interactive_collect_decisions(class_quality, merge_candidates, class_names)
+        if decisions is None:
+            _cleanup_auto_infer_temp_dir(auto_infer_temp_dir)
+            return
+
+        # 8. 写出新数据集
+        output_root, new_class_names, copied_count, dedup_total = apply_optimize_decisions(
+            decisions=decisions,
+            source_data_yaml=source_data_yaml,
+        )
+
+        # 9. 写优化报告到新数据集目录
+        original_class_names = rt.normalize_names(data_cfg.get("names"))
+        md_path = write_optimize_report(
+            output_root,
+            source_data_yaml=source_data_yaml,
+            decisions=decisions,
             class_quality=class_quality,
-            source_data_yaml=source_data_yaml,
-            class_names=class_names,
-            infer_output_dir=infer_output_dir if infer_output_dir is not None and infer_output_dir.exists() else None,
+            merge_candidates=merge_candidates,
+            original_class_names=original_class_names,
+            new_class_names=new_class_names,
+            confusion_available=confusion_available,
+            dedup_total=dedup_total,
         )
-        print(f"\n  ★ 预览已导出（{preview_count} 张受影响图片）: {preview_dir}")
-        print("    请在文件管理器中查看图片和标签，然后决定是否执行操作。\n")
 
-    # 7. 交互确认
-    decisions = interactive_collect_decisions(class_quality, merge_candidates, class_names)
-    if decisions is None:
-        _cleanup_preview_dir(preview_dir)
+        # 10. 若是 auto-infer 流程，将报告归档到 optimize/ 文件夹，然后清理临时推理目录
+        opt_report_dir: Path | None = None
+        if optimize_experiment_dir is not None:
+            opt_report_dir = _archive_optimize_report(
+                optimize_experiment_dir=optimize_experiment_dir,
+                source_data_yaml=source_data_yaml,
+                copied_count=copied_count,
+                report_json_path=report_json_path,
+                summary_json=output_root / "optimize_summary.json",
+                summary_md=md_path,
+            )
+
         _cleanup_auto_infer_temp_dir(auto_infer_temp_dir)
-        return
-
-    _cleanup_preview_dir(preview_dir)
-
-    # 8. 写出新数据集
-    output_root, new_class_names, copied_count = apply_optimize_decisions(
-        decisions=decisions,
-        source_data_yaml=source_data_yaml,
-    )
-
-    # 9. 写优化报告到新数据集目录
-    original_class_names = rt.normalize_names(data_cfg.get("names"))
-    md_path = write_optimize_report(
-        output_root,
-        source_data_yaml=source_data_yaml,
-        decisions=decisions,
-        class_quality=class_quality,
-        merge_candidates=merge_candidates,
-        original_class_names=original_class_names,
-        new_class_names=new_class_names,
-        confusion_available=confusion_available,
-    )
-
-    # 10. 若是 auto-infer 流程，将报告归档到 optimize/ 文件夹，然后清理临时推理目录
-    opt_report_dir: Path | None = None
-    if optimize_experiment_dir is not None:
-        opt_report_dir = _archive_optimize_report(
-            optimize_experiment_dir=optimize_experiment_dir,
-            source_data_yaml=source_data_yaml,
-            copied_count=copied_count,
-            report_json_path=report_json_path,
-            summary_json=output_root / "optimize_summary.json",
-            summary_md=md_path,
-        )
-
-    _cleanup_auto_infer_temp_dir(auto_infer_temp_dir)
+    finally:
+        _cleanup_preview_dir(preview_dir)
 
     print("\n[det/optimize] 完成！")
     print(f"  新数据集 : {output_root}")

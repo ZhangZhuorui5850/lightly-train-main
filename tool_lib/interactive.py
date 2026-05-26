@@ -534,9 +534,55 @@ def print_det_export_preview(args: argparse.Namespace) -> None:
     print(_det_export_strategy_text("box_density_penalty", args.box_density_penalty, enabled=args.auto_balance))
 
 
+def _seg_export_strategy_text(label: str, value, *, enabled: bool = True) -> str:
+    if not enabled:
+        return f"  {label}: 关闭"
+    if isinstance(value, bool):
+        return f"  {label}: {'开启' if value else '关闭'}"
+    if isinstance(value, (int, float)) and float(value) <= 0.0:
+        return f"  {label}: 自动推导"
+    if value is None:
+        return f"  {label}: 自动匹配"
+    return f"  {label}: 手动覆盖为 {compact_display_value(value)}"
+
+
+def print_seg_export_preview(args: argparse.Namespace) -> None:
+    print("\nseg/export 输入确认")
+    report_value = "(auto)" if args.report_json is None else compact_display_value(args.report_json)
+    if args.export_suffix == rt.SEG_EXPORT_DEFAULT_EXPORT_SUFFIX:
+        if int(args.target_total_images) > 0:
+            export_name_preview = rt.default_seg_export_dir_suffix(image_count=int(args.target_total_images))
+        else:
+            export_name_preview = f"{rt.SEG_EXPORT_DEFAULT_EXPORT_SUFFIX}_<实际导出图数>"
+    else:
+        export_name_preview = str(args.export_suffix)
+    print(f"  export_source_data: {compact_display_value(args.export_source_data)}")
+    print(f"  report_json: {report_value}")
+    print(f"  target_total_images: {compact_display_value(args.target_total_images)}")
+    print(f"  split_ratio: {compact_display_value(args.split_ratio)}")
+    print(f"  export_suffix: {compact_display_value(args.export_suffix)}")
+    print(f"  export_dir_name: <dataset>{export_name_preview}")
+
+    print("\n自动分析策略")
+    print(f"  auto_balance: {'开启' if args.auto_balance else '关闭'}")
+    print(f"  auto_relax_class_threshold: {'开启' if args.auto_relax_class_threshold else '关闭'}")
+    print(_seg_export_strategy_text("good_class_threshold", args.good_class_threshold))
+    print(_seg_export_strategy_text("balance_ratio", args.balance_ratio, enabled=args.auto_balance))
+    print(_seg_export_strategy_text("min_class_images", args.min_class_images, enabled=args.auto_balance))
+    print(_seg_export_strategy_text("min_class_instances", args.min_class_instances, enabled=args.auto_balance))
+    print(_seg_export_strategy_text("target_images_per_class", args.target_images_per_class, enabled=args.auto_balance))
+    print(_seg_export_strategy_text("target_instances_per_class", args.target_instances_per_class, enabled=args.auto_balance))
+    print(_seg_export_strategy_text("max_instances_per_image", args.max_instances_per_image, enabled=args.auto_balance))
+    print(_seg_export_strategy_text("max_instances_per_class_per_image", args.max_instances_per_class_per_image, enabled=args.auto_balance))
+    print(_seg_export_strategy_text("instance_density_penalty", args.instance_density_penalty, enabled=args.auto_balance))
+
+
 def confirm_args(title: str, args: argparse.Namespace) -> argparse.Namespace | None:
     if title == "det/export":
         print_det_export_preview(args)
+        confirm_text = "确认按以上输入开始分析并导出吗"
+    elif title == "seg/export":
+        print_seg_export_preview(args)
         confirm_text = "确认按以上输入开始分析并导出吗"
     else:
         print_config_preview(title, args)
@@ -658,6 +704,34 @@ def build_det_cli_preview(args: argparse.Namespace) -> str:
             parts.extend(["--output-dir", str(args.output_dir)])
         if getattr(args, "overwrite", False):
             parts.append("--overwrite")
+    return " ".join(parts)
+
+
+def build_seg_export_cli_preview(args: argparse.Namespace) -> str:
+    parts = ["python", "launcher.py", "seg-export"]
+    if args.report_json is not None:
+        parts.extend(["--report-json", str(args.report_json)])
+    parts.extend(["--export-source-data", str(args.export_source_data)])
+    parts.extend(["--target-total-images", str(args.target_total_images)])
+    parts.extend(["--split-ratio", str(args.split_ratio)])
+    parts.extend(["--good-class-threshold", str(args.good_class_threshold)])
+    if args.auto_balance:
+        parts.append("--auto-balance")
+    else:
+        parts.append("--no-auto-balance")
+    if args.auto_relax_class_threshold:
+        parts.append("--auto-relax-class-threshold")
+    else:
+        parts.append("--strict-class-threshold")
+    parts.extend(["--balance-ratio", str(args.balance_ratio)])
+    parts.extend(["--min-class-images", str(args.min_class_images)])
+    parts.extend(["--min-class-instances", str(args.min_class_instances)])
+    parts.extend(["--target-images-per-class", str(args.target_images_per_class)])
+    parts.extend(["--target-instances-per-class", str(args.target_instances_per_class)])
+    parts.extend(["--max-instances-per-image", str(args.max_instances_per_image)])
+    parts.extend(["--max-instances-per-class-per-image", str(args.max_instances_per_class_per_image)])
+    parts.extend(["--instance-density-penalty", str(args.instance_density_penalty)])
+    parts.extend(["--export-suffix", str(args.export_suffix)])
     return " ".join(parts)
 
 
@@ -1846,6 +1920,8 @@ def build_interactive_args() -> argparse.Namespace | None:
     action_options = [("train", "train 训练"), ("infer", "infer 推理")]
     if task in {"cls", "seg"}:
         action_options.append(("eval", "eval 评估"))
+    if task == "seg":
+        action_options.append(("export", "export 数据集筛选"))
     if task == "det":
         action_options.append(("eda", "EDA 数据集分析"))
         action_options.append(("export", "export 数据集筛选"))
@@ -1931,6 +2007,39 @@ def build_interactive_args() -> argparse.Namespace | None:
         print("\nEDA 内容: split 对照、类别分布、不平衡分析、目标尺寸、框密度、分辨率和逐图清单。")
         print(f"\n等价命令预览:\n  {build_det_cli_preview(args)}")
         return confirm_args("det/eda", args)
+
+    if task == "seg" and action == "export":
+        export_source_data = prompt_dataset_yaml("seg", Path(rt.SEG_EXPORT_DEFAULT_SOURCE_DATA))
+        target_total_images = prompt_int(
+            "导出总图数 --target-total-images，0 表示按数据自动决定",
+            rt.SEG_EXPORT_DEFAULT_TARGET_TOTAL_IMAGES,
+        )
+        args = argparse.Namespace(
+            tool_task="seg",
+            tool_action="export",
+            command="seg-export",
+            report_json=None,
+            export_source_data=export_source_data,
+            target_total_images=target_total_images,
+            split_ratio=rt.SEG_EXPORT_DEFAULT_SPLIT_RATIO,
+            good_class_threshold=rt.SEG_EXPORT_DEFAULT_GOOD_CLASS_THRESHOLD,
+            auto_balance=True,
+            auto_relax_class_threshold=True,
+            balance_ratio=rt.SEG_EXPORT_DEFAULT_BALANCE_RATIO,
+            min_class_images=rt.SEG_EXPORT_DEFAULT_MIN_CLASS_IMAGES,
+            min_class_instances=rt.SEG_EXPORT_DEFAULT_MIN_CLASS_INSTANCES,
+            target_images_per_class=rt.SEG_EXPORT_DEFAULT_TARGET_IMAGES_PER_CLASS,
+            target_instances_per_class=rt.SEG_EXPORT_DEFAULT_TARGET_INSTANCES_PER_CLASS,
+            max_instances_per_image=rt.SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_IMAGE,
+            max_instances_per_class_per_image=rt.SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_CLASS_PER_IMAGE,
+            instance_density_penalty=rt.SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY,
+            export_suffix=rt.SEG_EXPORT_DEFAULT_EXPORT_SUFFIX,
+        )
+        print("\n导出策略: 只询问总图数，其余阈值基于 EDA 和目标图数自动联合推导。")
+        print(f"重划分比例固定为 train:val:test = {rt.SEG_EXPORT_DEFAULT_SPLIT_RATIO}")
+        print("report_json 将自动优先匹配当前数据集最近的 seg_eval_summary.json；找不到时按纯数据分布导出。")
+        print(f"\n等价命令预览:\n  {build_seg_export_cli_preview(args)}")
+        return confirm_args("seg/export", args)
 
     if task == "det" and action == "export":
         export_source_data = prompt_dataset_yaml("det", Path(rt.EXPORT_DEFAULT_SOURCE_DATA))
@@ -2229,6 +2338,76 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     export_parser.add_argument("--box-density-penalty", type=float, default=rt.EXPORT_DEFAULT_BOX_DENSITY_PENALTY)
     export_parser.add_argument("--export-suffix", type=str, default=rt.EXPORT_DEFAULT_EXPORT_SUFFIX)
 
+    seg_export_parser = subparsers.add_parser("seg-export")
+    seg_export_parser.add_argument("--report-json", type=Path, default=None)
+    seg_export_parser.add_argument("--export-source-data", type=Path, default=rt.SEG_EXPORT_DEFAULT_SOURCE_DATA)
+    seg_export_parser.add_argument(
+        "--good-class-threshold",
+        type=float,
+        default=rt.SEG_EXPORT_DEFAULT_GOOD_CLASS_THRESHOLD,
+    )
+    seg_export_parser.add_argument("--auto-balance", dest="auto_balance", action="store_true")
+    seg_export_parser.add_argument("--no-auto-balance", dest="auto_balance", action="store_false")
+    seg_export_parser.set_defaults(auto_balance=rt.SEG_EXPORT_DEFAULT_AUTO_BALANCE)
+    seg_export_parser.add_argument(
+        "--auto-relax-class-threshold",
+        dest="auto_relax_class_threshold",
+        action="store_true",
+    )
+    seg_export_parser.add_argument(
+        "--strict-class-threshold",
+        dest="auto_relax_class_threshold",
+        action="store_false",
+    )
+    seg_export_parser.set_defaults(
+        auto_relax_class_threshold=rt.SEG_EXPORT_DEFAULT_AUTO_RELAX_CLASS_THRESHOLD
+    )
+    seg_export_parser.add_argument(
+        "--balance-ratio", type=float, default=rt.SEG_EXPORT_DEFAULT_BALANCE_RATIO
+    )
+    seg_export_parser.add_argument(
+        "--min-class-images", type=int, default=rt.SEG_EXPORT_DEFAULT_MIN_CLASS_IMAGES
+    )
+    seg_export_parser.add_argument(
+        "--min-class-instances", type=int, default=rt.SEG_EXPORT_DEFAULT_MIN_CLASS_INSTANCES
+    )
+    seg_export_parser.add_argument(
+        "--target-images-per-class",
+        type=int,
+        default=rt.SEG_EXPORT_DEFAULT_TARGET_IMAGES_PER_CLASS,
+    )
+    seg_export_parser.add_argument(
+        "--target-total-images",
+        type=int,
+        default=rt.SEG_EXPORT_DEFAULT_TARGET_TOTAL_IMAGES,
+    )
+    seg_export_parser.add_argument(
+        "--split-ratio", type=str, default=rt.SEG_EXPORT_DEFAULT_SPLIT_RATIO
+    )
+    seg_export_parser.add_argument(
+        "--target-instances-per-class",
+        type=int,
+        default=rt.SEG_EXPORT_DEFAULT_TARGET_INSTANCES_PER_CLASS,
+    )
+    seg_export_parser.add_argument(
+        "--max-instances-per-image",
+        type=int,
+        default=rt.SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_IMAGE,
+    )
+    seg_export_parser.add_argument(
+        "--max-instances-per-class-per-image",
+        type=int,
+        default=rt.SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_CLASS_PER_IMAGE,
+    )
+    seg_export_parser.add_argument(
+        "--instance-density-penalty",
+        type=float,
+        default=rt.SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY,
+    )
+    seg_export_parser.add_argument(
+        "--export-suffix", type=str, default=rt.SEG_EXPORT_DEFAULT_EXPORT_SUFFIX
+    )
+
     eda_parser = subparsers.add_parser("eda")
     eda_parser.add_argument("--data", type=Path, default=rt.INFER_DEFAULT_DATA)
     eda_parser.add_argument("--output-dir", type=Path, default=None)
@@ -2250,6 +2429,10 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
             args.output_name = args.output_name or args.output_root.name
         args.tool_task = "data"
         args.tool_action = "convert"
+        return args
+    if args.command == "seg-export":
+        args.tool_task = "seg"
+        args.tool_action = "export"
         return args
     if args.command == "infer" and args.image is None and args.image_dir is None and args.data is None:
         args.data = rt.INFER_DEFAULT_DATA

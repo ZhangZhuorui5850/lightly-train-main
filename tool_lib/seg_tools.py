@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import common as rt
+from .seg_export import run_export  # noqa: F401  re-export to keep dispatch wiring simple
 
 
 def color_for_index(index: int) -> tuple[int, int, int]:

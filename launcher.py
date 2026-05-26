@@ -115,10 +115,65 @@ CLS_SETTINGS = {
     "cls_threshold": 0.5,
 }
 
-# 分割配置：后面如果要统一 seg 默认路径，就加在这里
+# 分割配置：和 det 一样，常改的路径和导出参数都放在这里
 SEG_SETTINGS = {
-    # 分割推理/评估默认阈值。掩码太少就调低，噪声太多就调高。
+    # 基础配置
+    # 改 seg 数据集时，下面 seg_export_* 的源数据会自动跟着变
+    "seg_dataset_dir": "datasets/neu_dataset/dataset_seg",
+
+    # 阈值配置
+    # seg_threshold:
+    #   推理/评估默认阈值。掩码太少就调低，噪声太多就调高。
     "seg_threshold": 0.8,
+
+    # export 默认配置（参数语义对齐 det，关键词把"框"换成"实例"）
+    # seg_export_source_data 不填时，默认 <seg_dataset_dir>/data.yaml
+    # seg_export_report_json 不填或填 "auto" 时，自动检索最近的 seg_eval_summary.json
+    # seg_export_good_class_threshold:
+    #   类别 AP 参考阈值。自动模式下进入分析报告；严格模式下参与删类。
+    # seg_export_min_class_images:
+    #   一个类别至少要有多少张图才参与导出。
+    # seg_export_min_class_instances:
+    #   一个类别至少要有多少个实例（多少条 polygon）才参与导出。
+    #   填 0 时按 seg_export_balance_ratio 自动推导。
+    # seg_export_target_images_per_class:
+    #   train 导出时，每个类别尽量靠近这个图数。填 0 自动取中位数。
+    # seg_export_target_total_images:
+    #   导出后总图片数目标。填 0 表示由筛选结果自动决定；
+    #   填入后系统会围绕这个总量预算自动推导类别下限、实例密度阈值和每类目标实例数。
+    # seg_export_split_ratio:
+    #   导出后重新划分的 train:val:test 比例（交互模式固定 8:1:1）。
+    # seg_export_target_instances_per_class:
+    #   train 导出时每个类别尽量靠近这个实例数。填 0 按 balance_ratio 自动推导。
+    # seg_export_balance_ratio:
+    #   导出后 train 中最多和最少类别的实例数比例上限。
+    # seg_export_auto_balance:
+    #   导出前先做标签分布分析，并自动推导保留阈值和每类实例数上限。
+    # seg_export_auto_relax_class_threshold:
+    #   开启后 AP 阈值仅作参考；关闭后 AP 阈值进入严格删类。
+    # seg_export_max_instances_per_image:
+    #   单张图保留类别的实例总数上限。填 0 自动按总图数预算和密度分布推导。
+    # seg_export_max_instances_per_class_per_image:
+    #   单张图里同一类别的实例数上限。填 0 自动推导。
+    # seg_export_instance_density_penalty:
+    #   选图时对高实例密度图片的惩罚强度，越大越偏向少实例图片。
+    #   自动模式下会以这个值为基础，按筛选压力向上调整。
+    # "seg_export_source_data": "datasets/neu_dataset/dataset_seg/data.yaml",
+    # "seg_export_report_json": "auto",
+    "seg_export_target_total_images": 0,
+    "seg_export_good_class_threshold": 0.0,
+    "seg_export_auto_balance": True,
+    "seg_export_auto_relax_class_threshold": True,
+    "seg_export_balance_ratio": 0.0,
+    "seg_export_min_class_images": 0,
+    "seg_export_min_class_instances": 0,
+    "seg_export_target_images_per_class": 0,
+    "seg_export_split_ratio": "8:1:1",
+    "seg_export_target_instances_per_class": 0,
+    "seg_export_max_instances_per_image": 0,
+    "seg_export_max_instances_per_class_per_image": 0,
+    "seg_export_instance_density_penalty": 0.0,
+    "seg_export_suffix": "_A",
 }
 
 def build_user_settings() -> dict[str, object]:
