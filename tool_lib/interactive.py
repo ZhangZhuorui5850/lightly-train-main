@@ -344,7 +344,12 @@ def list_dataset_yaml_candidates(
             continue
         if task == "det" and "dataset_det" not in parent_name and "detect" not in path_text:
             continue
-        if task == "seg" and "dataset_seg" not in parent_name and "seg" not in path_text:
+        if (
+            task == "seg"
+            and "dataset_seg" not in parent_name
+            and "seg" not in path_text
+            and "semantic" not in path_text
+        ):
             continue
         candidates.append(path.resolve())
 
@@ -749,6 +754,11 @@ def build_convert_cli_preview(args: argparse.Namespace) -> str:
         parts.extend(["--task", str(args.task)])
     if args.label_format != "auto":
         parts.extend(["--label-format", str(args.label_format)])
+    seg_type = getattr(args, "seg_type", "auto")
+    if seg_type != "auto":
+        parts.extend(["--seg-type", seg_type])
+    if getattr(args, "class_ref", None):
+        parts.extend(["--class-ref", str(args.class_ref)])
     if args.seed is not None:
         parts.extend(["--seed", str(args.seed)])
     if args.dry_run:
@@ -1546,6 +1556,44 @@ def _prompt_train_model(recent_models: list[str], default: str) -> str:
         return raw
 
 
+def _prompt_seg_train_type(default: str | None = None) -> str:
+    default = (default or rt.SEG_TRAIN_TYPE or "instance").lower()
+    options = [
+        ("semantic", "semantic 语义分割（PNG mask）"),
+        ("instance", "instance 实例分割（YOLO polygon txt）"),
+    ]
+    if default == "instance":
+        options = [options[1], options[0]]
+    return prompt_choice("请选择 seg 训练类型", options)
+
+
+def _default_train_data_yaml(task: str, seg_train_type: str | None = None) -> Path:
+    if task == "seg" and seg_train_type == "semantic":
+        return Path(rt.SEMANTIC_SEG_DEFAULT_DATA)
+    if task == "seg":
+        return Path(rt.SEG_EXPORT_DEFAULT_SOURCE_DATA)
+    return Path(rt.INFER_DEFAULT_DATA)
+
+
+def _default_train_model(task: str, seg_train_type: str | None = None) -> str:
+    if task == "det":
+        return "dinov3/vits16-ltdetr"
+    if task == "seg" and seg_train_type == "semantic":
+        return "dinov3/vits16-eomt"
+    if task == "seg":
+        return "dinov3/vits16-eomt"
+    return "dinov3/vits16"
+
+
+def _seg_train_type_from_logged_task(task_name: object) -> str:
+    text = str(task_name or "").lower()
+    if "semantic" in text:
+        return "semantic"
+    if "instance" in text:
+        return "instance"
+    return rt.SEG_TRAIN_TYPE
+
+
 def _prompt_backbone_weights(weight_files: list[Path]) -> Path | None:
     """让用户选择骨干预训练权重文件，或跳过。"""
     print("\n[可选] 选择骨干预训练权重文件（回车跳过）：")
@@ -1595,12 +1643,16 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
     # 路径 A：新训练
     # ------------------------------------------------------------------ #
     if train_mode == "new":
+        seg_train_type = _prompt_seg_train_type() if task == "seg" else None
+        data_yaml = prompt_dataset_yaml(
+            task,
+            _default_train_data_yaml(task, seg_train_type),
+        )
         # A1. 数据集
-        data_yaml = prompt_dataset_yaml(task, Path(rt.INFER_DEFAULT_DATA))
 
         # A2. 模型
         recent_models = train_tools.discover_recent_models(task)
-        default_model = recent_models[0] if recent_models else "dinov3/vits16-ltdetr"
+        default_model = recent_models[0] if recent_models else _default_train_model(task, seg_train_type)
         model = _prompt_train_model(recent_models, default_model)
 
         # A3. 骨干权重（可选）
@@ -1653,6 +1705,7 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
         args = argparse.Namespace(
             tool_task=task,
             tool_action="train",
+            seg_train_type=seg_train_type,
             data_yaml=data_yaml,
             model=model,
             backbone_weights=backbone_weights,
@@ -1672,6 +1725,8 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
             if isinstance(devices, list) else "auto (全部)"
         )
         print(f"\n{task}/train 新训练配置确认")
+        if task == "seg":
+            print(f"  seg_train_type  : {seg_train_type}")
         print(f"  data_yaml       : {compact_display_path(data_yaml)}")
         print(f"  model           : {model}")
         print(f"  backbone_weights: {compact_display_path(backbone_weights) if backbone_weights else '(无)'}")
@@ -1701,9 +1756,14 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
         return None
 
     src_experiment_dir = prompt_experiment_dir(task, checkpoint_dirs[0])
+    orig_params = train_tools.read_original_train_params(src_experiment_dir)
+    seg_train_type = (
+        _seg_train_type_from_logged_task(orig_params.get("task"))
+        if task == "seg"
+        else None
+    )
 
     # 读取原始训练参数并回显
-    orig_params = train_tools.read_original_train_params(src_experiment_dir)
     if orig_params:
         print("\n原始训练参数摘要：")
         for k in ("model", "steps", "batch_size", "devices", "data"):
@@ -1726,7 +1786,8 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
         if not orig_params.get("model"):
             print("无法续跑：原 train.log 没有 model 字段，请改用「修改参数」从 checkpoint 微调。")
             return None
-        if orig_data_path is None or not orig_data_path.exists():
+        data_config = orig_params.get("data_config")
+        if (orig_data_path is None or not orig_data_path.exists()) and data_config is None:
             print(f"无法续跑：原数据集路径无效或不存在 ({orig_data_raw})。请改用「修改参数」并重新指定数据集。")
             return None
 
@@ -1736,7 +1797,9 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
         args = argparse.Namespace(
             tool_task=task,
             tool_action="train",
+            seg_train_type=seg_train_type,
             data_yaml=orig_data_path,
+            data_config=data_config if orig_data_path is None else None,
             model=orig_params["model"],
             backbone_weights=None,
             out_dir=src_experiment_dir,
@@ -1755,6 +1818,8 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
         )
         print(f"\n{task}/train 续跑（保持原参数）配置确认")
         print(f"  mode            : resume_interrupted")
+        if task == "seg":
+            print(f"  seg_train_type  : {seg_train_type}")
         print(f"  out_dir         : {compact_display_path(src_experiment_dir)}")
         print(f"  model           : {args.model}")
         print(f"  steps           : {args.steps}")
@@ -1785,7 +1850,7 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
 
     # 数据集（默认复用原实验的；若原路径无效则强制重选）
     if orig_data_path is None:
-        orig_data_path = Path(rt.INFER_DEFAULT_DATA)
+        orig_data_path = _default_train_data_yaml(task, seg_train_type)
         if not orig_data_path.is_absolute():
             orig_data_path = (rt.ROOT_DIR / orig_data_path).resolve()
     if not orig_data_path.exists():
@@ -1806,7 +1871,7 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
     if not orig_model:
         print("\n原 train.log 没有 model 字段，请手动输入要使用的模型。")
         recent_models = train_tools.discover_recent_models(task)
-        default_model = recent_models[0] if recent_models else "dinov3/vits16-ltdetr"
+        default_model = recent_models[0] if recent_models else _default_train_model(task, seg_train_type)
         orig_model = _prompt_train_model(recent_models, default_model)
 
     # B2f. 新输出目录（与 path A 一致：存在且非空时给覆盖 / 改名 / 取消三选项）
@@ -1849,6 +1914,7 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
     args = argparse.Namespace(
         tool_task=task,
         tool_action="train",
+        seg_train_type=seg_train_type,
         data_yaml=data_yaml,
         model=orig_model,
         backbone_weights=None,
@@ -1868,6 +1934,8 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
     )
     print(f"\n{task}/train 续跑（修改参数）配置确认")
     print(f"  mode            : finetune from checkpoint")
+    if task == "seg":
+        print(f"  seg_train_type  : {seg_train_type}")
     print(f"  checkpoint      : {compact_display_path(last_ckpt)}")
     print(f"  data_yaml       : {compact_display_path(data_yaml)}")
     print(f"  model           : {orig_model}")
@@ -1892,25 +1960,54 @@ def build_interactive_args() -> argparse.Namespace | None:
     if task == "data":
         source_dir = prompt_convert_source_dir()
         output_name = prompt_directory_name("输出数据集目录名", source_dir.name)
+        output_task = prompt_choice(
+            "请选择输出任务",
+            [
+                ("det", "det 检测"),
+                ("cls", "cls 分类"),
+                ("seg", "seg 分割"),
+                ("all", "all 全部"),
+            ],
+        )
+        # Ask seg_type when task includes seg
+        seg_type = "auto"
+        if output_task in {"seg", "all"}:
+            seg_type = prompt_choice(
+                "请选择 seg 输出类型 --seg-type",
+                [
+                    ("auto", "auto 自动判断"),
+                    ("instance", "instance 实例分割（YOLO polygon）"),
+                    ("semantic", "semantic 语义分割（PNG mask）"),
+                ],
+            )
+        # label_format only applies to instance seg (JSON/TXT polygon labels).
+        # For semantic seg, labels ARE the PNG masks - no separate format concept.
+        # For auto seg_type, the backend auto-detects VOC-style vs JSON/TXT anyway.
+        label_format = "auto"
+        need_label_format = (
+            (output_task in {"det", "cls"})
+            or (output_task == "seg" and seg_type == "instance")
+            or (output_task == "all" and seg_type == "instance")
+        )
+        if need_label_format:
+            label_format = prompt_choice(
+                "请选择标注格式 --label-format",
+                [("auto", "auto 自动判断"), ("labelme", "labelme JSON"), ("yolo", "yolo TXT")],
+            )
+        class_ref_str = prompt_text(
+            "参考类别文件 --class-ref（data.yaml / classes.txt，留空则自动从数据收集）",
+        )
+        class_ref = str(Path(class_ref_str).resolve()) if class_ref_str else None
         args = argparse.Namespace(
             tool_task="data",
             tool_action="convert",
             source_dir=source_dir,
             output_name=output_name,
             output_root=(rt.ROOT_DIR / "datasets" / output_name).resolve(),
-            task=prompt_choice(
-                "请选择输出任务",
-                [
-                    ("det", "det 检测"),
-                    ("cls", "cls 分类"),
-                    ("seg", "seg 分割"),
-                    ("all", "all 全部"),
-                ],
-            ),
-            label_format=prompt_choice(
-                "请选择标注格式 --label-format",
-                [("auto", "auto 自动判断"), ("labelme", "labelme JSON"), ("yolo", "yolo TXT")],
-            ),
+            task=output_task,
+            label_format=label_format,
+            seg_type=seg_type,
+            class_ref=class_ref,
             seed=None,
             dry_run=False,
         )
@@ -1959,16 +2056,20 @@ def build_interactive_args() -> argparse.Namespace | None:
         return confirm_args("cls/infer", args)
 
     if task == "seg" and action in {"infer", "eval"}:
+        seg_train_type = _prompt_seg_train_type()
         experiment_dir = prompt_experiment_dir("seg", rt.EXPERIMENT_ROOT_DIR / "my_experiment_seg")
         if action == "infer":
             mode = prompt_choice("请选择 seg 推理输入方式", [("image", "image 单张图片"), ("image_dir", "image_dir 文件夹批量推理")])
             args = argparse.Namespace(
                 tool_task="seg",
                 tool_action="infer",
+                seg_train_type=seg_train_type,
                 experiment_dir=experiment_dir,
                 checkpoint=None,
                 image=None,
                 image_dir=None,
+                data=None,
+                split="test",
                 output_dir=Path(prompt_text("输出目录", str(experiment_dir / "infer")) or str(experiment_dir / "infer")),
                 threshold=prompt_float("分割阈值 threshold", rt.DEFAULT_SEG_THRESHOLD),
                 overwrite=prompt_yes_no("输出目录非空时是否允许覆盖", False),
@@ -1982,9 +2083,10 @@ def build_interactive_args() -> argparse.Namespace | None:
         args = argparse.Namespace(
             tool_task="seg",
             tool_action="eval",
+            seg_train_type=seg_train_type,
             experiment_dir=experiment_dir,
             checkpoint=None,
-            data=prompt_dataset_yaml("seg", Path("datasets/dataset_seg/data.yaml")),
+            data=prompt_dataset_yaml("seg", _default_train_data_yaml("seg", seg_train_type)),
             split=prompt_choice("请选择数据集划分 --split", [("test", "test"), ("val", "val")]),
             output_dir=Path(prompt_text("输出目录", str(experiment_dir / "eval")) or str(experiment_dir / "eval")),
             threshold=prompt_float("分割阈值 threshold", rt.DEFAULT_SEG_THRESHOLD),
@@ -2009,6 +2111,10 @@ def build_interactive_args() -> argparse.Namespace | None:
         return confirm_args("det/eda", args)
 
     if task == "seg" and action == "export":
+        seg_train_type = _prompt_seg_train_type()
+        if seg_train_type == "semantic":
+            print("semantic segmentation export is not supported yet; current seg/export only supports YOLO polygon instance segmentation datasets.")
+            return None
         export_source_data = prompt_dataset_yaml("seg", Path(rt.SEG_EXPORT_DEFAULT_SOURCE_DATA))
         target_total_images = prompt_int(
             "导出总图数 --target-total-images，0 表示按数据自动决定",
@@ -2017,6 +2123,7 @@ def build_interactive_args() -> argparse.Namespace | None:
         args = argparse.Namespace(
             tool_task="seg",
             tool_action="export",
+            seg_train_type=seg_train_type,
             command="seg-export",
             report_json=None,
             export_source_data=export_source_data,
@@ -2249,6 +2356,21 @@ def build_interactive_args() -> argparse.Namespace | None:
     return None
 
 
+def _int_or_auto(value: str) -> int | str:
+    if value.lower() == "auto":
+        return "auto"
+    return int(value)
+
+
+def _devices_arg(value: str) -> int | str | list[int]:
+    raw = value.strip().lower()
+    if raw == "auto":
+        return "auto"
+    if "," in raw:
+        return [int(part.strip()) for part in raw.split(",") if part.strip()]
+    return int(raw)
+
+
 def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Thin multi-task launcher. Detection CLI is still supported.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2259,10 +2381,39 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     convert_parser.add_argument("--output-root", type=Path, default=None)
     convert_parser.add_argument("--task", choices=("det", "cls", "seg", "all"), default="all")
     convert_parser.add_argument("--label-format", choices=("auto", "labelme", "yolo"), default="auto")
+    convert_parser.add_argument("--seg-type", choices=("auto", "instance", "semantic"), default="auto")
+    convert_parser.add_argument("--class-ref", type=str, default=None, help="参考类别文件（data.yaml / classes.txt），输出使用其完整类别列表和 ID 映射")
     convert_parser.add_argument("--seed", type=int, default=None)
     convert_parser.add_argument("--dry-run", action="store_true", default=False)
 
+    train_parser = subparsers.add_parser("train")
+    train_parser.add_argument("--task", choices=("cls", "det", "seg"), default="det")
+    train_parser.add_argument(
+        "--seg-train-type",
+        choices=("instance", "semantic"),
+        default=rt.SEG_TRAIN_TYPE,
+        help="Only used when --task seg.",
+    )
+    train_parser.add_argument("--data", "--data-yaml", dest="data_yaml", type=Path, default=None)
+    train_parser.add_argument("--model", type=str, default=None)
+    train_parser.add_argument("--backbone-weights", type=Path, default=None)
+    train_parser.add_argument("--checkpoint", type=Path, default=None)
+    train_parser.add_argument("--out-dir", type=Path, default=None)
+    train_parser.add_argument("--steps", type=_int_or_auto, default="auto")
+    train_parser.add_argument("--batch-size", type=_int_or_auto, default="auto")
+    train_parser.add_argument("--num-workers", type=_int_or_auto, default="auto")
+    train_parser.add_argument("--devices", type=_devices_arg, default="auto")
+    train_parser.add_argument("--overwrite", action="store_true", default=False)
+    train_parser.add_argument("--resume-interrupted", action="store_true", default=False)
+
     infer_parser = subparsers.add_parser("infer")
+    infer_parser.add_argument("--task", choices=("det", "cls", "seg"), default="det")
+    infer_parser.add_argument(
+        "--seg-train-type",
+        choices=("instance", "semantic"),
+        default=rt.SEG_TRAIN_TYPE,
+        help="Only used when --task seg.",
+    )
     infer_parser.add_argument("--experiment-dir", type=Path, default=rt.INFER_DEFAULT_EXPERIMENT_DIR)
     infer_parser.add_argument("--checkpoint", type=Path, default=rt.INFER_DEFAULT_CHECKPOINT)
     infer_input = infer_parser.add_mutually_exclusive_group(required=False)
@@ -2276,6 +2427,8 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     infer_parser.add_argument("--output-dir", type=Path, default=None)
     infer_parser.add_argument("--score-threshold", type=float, default=rt.INFER_DEFAULT_SCORE_THRESHOLD)
+    infer_parser.add_argument("--threshold", type=float, default=None)
+    infer_parser.add_argument("--topk", type=int, default=1)
     infer_parser.add_argument("--device", type=str, default=rt.INFER_DEFAULT_DEVICE)
     infer_parser.add_argument("--save-visualization", dest="save_visualization", action="store_true")
     infer_parser.add_argument("--skip-visualization", dest="save_visualization", action="store_false")
@@ -2301,6 +2454,26 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     infer_parser.add_argument("--multi-output-root", type=Path, default=None, help=argparse.SUPPRESS)
     infer_parser.add_argument("--shard-index", type=int, default=None, help=argparse.SUPPRESS)
     infer_parser.add_argument("--num-shards", type=int, default=1, help=argparse.SUPPRESS)
+
+    eval_parser = subparsers.add_parser("eval")
+    eval_parser.add_argument("--task", choices=("cls", "seg"), default="seg")
+    eval_parser.add_argument(
+        "--seg-train-type",
+        choices=("instance", "semantic"),
+        default=rt.SEG_TRAIN_TYPE,
+        help="Only used when --task seg.",
+    )
+    eval_parser.add_argument("--experiment-dir", type=Path, default=rt.INFER_DEFAULT_EXPERIMENT_DIR)
+    eval_parser.add_argument("--checkpoint", type=Path, default=rt.INFER_DEFAULT_CHECKPOINT)
+    eval_parser.add_argument("--data", type=Path, default=None)
+    eval_parser.add_argument("--test-dir", type=Path, default=None)
+    eval_parser.add_argument("--split", choices=("train", "val", "test"), default="test")
+    eval_parser.add_argument("--output-dir", type=Path, default=None)
+    eval_parser.add_argument("--threshold", type=float, default=None)
+    eval_parser.add_argument("--topk", type=int, default=1)
+    eval_parser.add_argument("--classwise", action="store_true", default=False)
+    eval_parser.add_argument("--device", type=str, default=rt.INFER_DEFAULT_DEVICE)
+    eval_parser.add_argument("--overwrite", action="store_true", default=rt.INFER_DEFAULT_OVERWRITE)
 
     export_parser = subparsers.add_parser("export")
     export_parser.add_argument("--report-json", type=Path, default=None)
@@ -2339,6 +2512,11 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     export_parser.add_argument("--export-suffix", type=str, default=rt.EXPORT_DEFAULT_EXPORT_SUFFIX)
 
     seg_export_parser = subparsers.add_parser("seg-export")
+    seg_export_parser.add_argument(
+        "--seg-train-type",
+        choices=("instance", "semantic"),
+        default="instance",
+    )
     seg_export_parser.add_argument("--report-json", type=Path, default=None)
     seg_export_parser.add_argument("--export-source-data", type=Path, default=rt.SEG_EXPORT_DEFAULT_SOURCE_DATA)
     seg_export_parser.add_argument(
@@ -2430,12 +2608,65 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.tool_task = "data"
         args.tool_action = "convert"
         return args
+    if args.command == "train":
+        from . import train_tools
+
+        args.tool_task = args.task
+        args.tool_action = "train"
+        if args.data_yaml is None:
+            args.data_yaml = _default_train_data_yaml(args.task, args.seg_train_type)
+        if args.model is None:
+            args.model = _default_train_model(args.task, args.seg_train_type)
+        if args.out_dir is None:
+            args.out_dir = train_tools.build_default_out_dir(args.data_yaml, args.model)
+        return args
     if args.command == "seg-export":
         args.tool_task = "seg"
         args.tool_action = "export"
         return args
-    if args.command == "infer" and args.image is None and args.image_dir is None and args.data is None:
-        args.data = rt.INFER_DEFAULT_DATA
+    if args.command == "infer":
+        args.tool_task = args.task
+        args.tool_action = "infer"
+        if args.task == "seg":
+            if args.experiment_dir == rt.INFER_DEFAULT_EXPERIMENT_DIR:
+                args.experiment_dir = rt.EXPERIMENT_ROOT_DIR / "my_experiment_seg"
+            if args.image is None and args.image_dir is None and args.data is None:
+                args.data = _default_train_data_yaml("seg", args.seg_train_type)
+            args.threshold = args.threshold if args.threshold is not None else rt.DEFAULT_SEG_THRESHOLD
+            if args.output_dir is None:
+                args.output_dir = Path(args.experiment_dir) / "infer"
+        elif args.task == "cls":
+            if args.experiment_dir == rt.INFER_DEFAULT_EXPERIMENT_DIR:
+                args.experiment_dir = rt.EXPERIMENT_ROOT_DIR / "my_experiment_cls"
+            args.threshold = args.threshold if args.threshold is not None else rt.DEFAULT_CLS_THRESHOLD
+            if args.output_dir is None:
+                args.output_dir = Path(args.experiment_dir) / "infer"
+            if args.image is None and args.image_dir is None:
+                raise ValueError("cls infer requires --image or --image-dir.")
+        else:
+            if args.image is None and args.image_dir is None and args.data is None:
+                args.data = rt.INFER_DEFAULT_DATA
+        return args
+    if args.command == "eval":
+        args.tool_task = args.task
+        args.tool_action = "eval"
+        if args.task == "seg":
+            if args.experiment_dir == rt.INFER_DEFAULT_EXPERIMENT_DIR:
+                args.experiment_dir = rt.EXPERIMENT_ROOT_DIR / "my_experiment_seg"
+            if args.data is None:
+                args.data = _default_train_data_yaml("seg", args.seg_train_type)
+            args.threshold = args.threshold if args.threshold is not None else rt.DEFAULT_SEG_THRESHOLD
+            if args.output_dir is None:
+                args.output_dir = Path(args.experiment_dir) / "eval"
+        else:
+            if args.experiment_dir == rt.INFER_DEFAULT_EXPERIMENT_DIR:
+                args.experiment_dir = rt.EXPERIMENT_ROOT_DIR / "my_experiment_cls"
+            if args.test_dir is None:
+                raise ValueError("cls eval requires --test-dir.")
+            args.threshold = args.threshold if args.threshold is not None else rt.DEFAULT_CLS_THRESHOLD
+            if args.output_dir is None:
+                args.output_dir = Path(args.experiment_dir) / "eval"
+        return args
     args.tool_task = "det"
     args.tool_action = args.command
     return args

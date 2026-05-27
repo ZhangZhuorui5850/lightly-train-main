@@ -94,6 +94,10 @@ def unique_stem(wanted: str, used: set) -> str:
 
 
 def detect_label_format(src_roots: list[Path]) -> str:
+    # VOC-style semantic segmentation takes priority
+    if _has_voc_semantic_masks(src_roots):
+        return "voc_seg"
+
     has_json = False
     has_txt = False
     for root in src_roots:
@@ -117,6 +121,216 @@ def detect_label_format(src_roots: list[Path]) -> str:
     if has_json and has_txt:
         return "mixed"
     return "unknown"
+
+
+def _has_voc_semantic_masks(src_roots: list[Path]) -> bool:
+    """Check if any source root has a SegmentationClass/ directory with PNG files."""
+    for root in src_roots:
+        seg_dir = root / "SegmentationClass"
+        if seg_dir.is_dir():
+            for f in seg_dir.iterdir():
+                if f.suffix.lower() == ".png":
+                    return True
+    return False
+
+
+def detect_seg_type(src_roots: list[Path]) -> str:
+    """Auto-detect seg type: 'semantic' (VOC PNG masks) or 'instance' (JSON/TXT labels)."""
+    if _has_voc_semantic_masks(src_roots):
+        return "semantic"
+    fmt = detect_label_format(src_roots)
+    if fmt in {"labelme", "yolo"}:
+        return "instance"
+    return "unknown"
+
+
+def collect_voc_semantic_files(src_roots: list[Path]) -> list[tuple[Path, Path, str]]:
+    """Collect (image_path, mask_path, stem) tuples from VOC-style semantic seg datasets.
+
+    Looks for:
+    - JPEGImages/ or images/ for images
+    - SegmentationClass/ or masks/ for PNG masks
+    """
+    image_dir_names = {"JPEGImages", "images", "Images"}
+    mask_dir_names = {"SegmentationClass", "masks", "Masks"}
+    image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+    results: list[tuple[Path, Path, str]] = []
+    for root in src_roots:
+        # Find image directory
+        img_dir = None
+        for name in image_dir_names:
+            candidate = root / name
+            if candidate.is_dir():
+                img_dir = candidate
+                break
+        if img_dir is None:
+            # Fallback: use root itself if it contains images
+            img_dir = root
+
+        # Find mask directory
+        mask_dir = None
+        for name in mask_dir_names:
+            candidate = root / name
+            if candidate.is_dir():
+                mask_dir = candidate
+                break
+        if mask_dir is None:
+            continue
+
+        # Build mask index: stem -> mask_path
+        mask_index: dict[str, Path] = {}
+        for f in mask_dir.iterdir():
+            if f.suffix.lower() == ".png":
+                mask_index[f.stem] = f
+
+        # Match images with masks
+        for f in img_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in image_exts:
+                mask_path = mask_index.get(f.stem)
+                if mask_path is not None:
+                    results.append((f, mask_path, f.stem))
+
+    return results
+
+
+def _read_voc_split_file(split_file: Path) -> list[str]:
+    """Read a VOC-style split file (one stem per line, no extension)."""
+    stems = []
+    with split_file.open("r", encoding="utf-8") as f:
+        for line in f:
+            stem = line.strip()
+            if stem:
+                stems.append(stem)
+    return stems
+
+
+def split_voc_semantic_files(
+    src_roots: list[Path],
+    dest: Path,
+    seed: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Split VOC-style semantic seg dataset into train/val/test.
+
+    If ImageSets/ with split files exists, uses those.
+    Otherwise falls back to 8:1:1 random split.
+
+    Copies images to dest/images/{split}/ and masks to dest/masks/{split}/.
+    """
+    pairs = collect_voc_semantic_files(src_roots)
+    if not pairs:
+        return {"paired_total": 0, "split_counts": {"train": 0, "val": 0, "test": 0}}
+
+    # Check for VOC-style ImageSets split files
+    split_map: dict[str, str] = {}  # stem -> split_name
+    imageset_files: dict[str, list[str]] = {}  # split_name -> [stems]
+    split_aliases = {"trn": "train", "val": "val", "test": "test", "train": "train"}
+
+    for root in src_roots:
+        imagesets_dir = root / "ImageSets"
+        if imagesets_dir.is_dir():
+            for f in imagesets_dir.iterdir():
+                if f.suffix.lower() == ".txt":
+                    split_name = split_aliases.get(f.stem.lower(), f.stem.lower())
+                    stems = _read_voc_split_file(f)
+                    if stems:
+                        imageset_files[split_name] = stems
+            break
+
+    required_splits = {"train", "val", "test"}
+    if imageset_files:
+        provided_splits = set(imageset_files.keys())
+        if required_splits.issubset(provided_splits):
+            # All three splits present - use them directly
+            for split_name, stems in imageset_files.items():
+                for stem in stems:
+                    split_map[stem] = split_name
+        else:
+            # Missing one or more splits - merge and re-split 8:1:1
+            all_stems: list[str] = []
+            for stems in imageset_files.values():
+                all_stems.extend(stems)
+            # Deduplicate while preserving order
+            seen: set[str] = set()
+            deduped: list[str] = []
+            for stem in all_stems:
+                if stem not in seen:
+                    seen.add(stem)
+                    deduped.append(stem)
+            print(f"[INFO] ImageSets/ 缺少完整 train/val/test（仅有 {provided_splits}），将合并后重新 8:1:1 划分")
+            rng = random.Random(seed)
+            rng.shuffle(deduped)
+            n = len(deduped)
+            n_train = round(n * 0.8)
+            n_val = round(n * 0.1)
+            for stem in deduped[:n_train]:
+                split_map[stem] = "train"
+            for stem in deduped[n_train:n_train + n_val]:
+                split_map[stem] = "val"
+            for stem in deduped[n_train + n_val:]:
+                split_map[stem] = "test"
+
+    # Create output directories
+    all_splits = required_splits if split_map else required_splits
+    for split in all_splits:
+        (dest / "images" / split).mkdir(parents=True, exist_ok=True)
+        (dest / "masks" / split).mkdir(parents=True, exist_ok=True)
+
+    # Assign splits
+    stem_set = {stem for _, _, stem in pairs}
+    unmatched_in_splits = stem_set - set(split_map.keys())
+
+    if unmatched_in_splits and split_map:
+        # Some stems not in any split file - assign to train by default
+        for stem in unmatched_in_splits:
+            split_map[stem] = "train"
+    elif not split_map:
+        # No split files found - random 8:1:1
+        stems_list = sorted(stem_set)
+        rng = random.Random(seed)
+        rng.shuffle(stems_list)
+        n = len(stems_list)
+        n_train = round(n * 0.8)
+        n_val = round(n * 0.1)
+        for stem in stems_list[:n_train]:
+            split_map[stem] = "train"
+        for stem in stems_list[n_train:n_train + n_val]:
+            split_map[stem] = "val"
+        for stem in stems_list[n_train + n_val:]:
+            split_map[stem] = "test"
+
+    stats: dict = {
+        "paired_total": len(pairs),
+        "split_counts": {s: 0 for s in all_splits},
+        "errors": [],
+        "skipped_no_split": 0,
+    }
+
+    for img_path, mask_path, stem in pairs:
+        split = split_map.get(stem)
+        if split is None:
+            stats["skipped_no_split"] += 1
+            continue
+
+        img_dest = dest / "images" / split / img_path.name
+        mask_dest = dest / "masks" / split / f"{stem}.png"
+
+        if not dry_run:
+            try:
+                shutil.copy2(img_path, img_dest)
+            except Exception as e:
+                stats["errors"].append(f"Image copy failed: {img_path}: {e}")
+                continue
+            try:
+                shutil.copy2(mask_path, mask_dest)
+            except Exception as e:
+                stats["errors"].append(f"Mask copy failed: {mask_path}: {e}")
+                continue
+
+        stats["split_counts"][split] = stats["split_counts"].get(split, 0) + 1
+
+    return stats
 
 # ── 收集文件 ──────────────────────────────────────────────────────────────────
 def collect_files(src_roots: list, label_format: str):

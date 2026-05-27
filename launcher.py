@@ -120,6 +120,9 @@ SEG_SETTINGS = {
     # 基础配置
     # 改 seg 数据集时，下面 seg_export_* 的源数据会自动跟着变
     "seg_dataset_dir": "datasets/neu_dataset/dataset_seg",
+    "seg_train_type": "instance",
+    "semantic_seg_dataset_dir": "datasets/neu_dataset/dataset_semantic",
+    "semantic_seg_data_yaml": "datasets/neu_dataset/dataset_semantic/data.yaml",
 
     # 阈值配置
     # seg_threshold:

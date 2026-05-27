@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import common as rt
+from . import train_tools
 from .seg_export import run_export  # noqa: F401  re-export to keep dispatch wiring simple
 
 
@@ -44,10 +45,132 @@ def predict_model(model: Any, image_path: Path, threshold: float) -> Any:
         return model.predict(str(image_path))
 
 
+def _normalize_seg_type(args: Any) -> str:
+    value = str(getattr(args, "seg_train_type", "instance") or "instance").lower()
+    if value not in {"instance", "semantic"}:
+        raise ValueError("seg_train_type must be either 'instance' or 'semantic'.")
+    return value
+
+
+def _semantic_class_names(classes: dict[int, Any], ignore_classes: set[int]) -> dict[int, str]:
+    names: dict[int, str] = {}
+    for internal_id, class_id in enumerate(sorted(set(classes) - ignore_classes)):
+        info = classes[class_id]
+        names[internal_id] = str(info.get("name", class_id) if isinstance(info, dict) else info)
+    return names
+
+
+def _semantic_image_mask_samples(data_path: Path, split: str) -> tuple[list[tuple[Path, Path]], dict[int, str], int]:
+    data_cfg = train_tools.load_semantic_segmentation_split_config(data_path, split)
+    split_cfg = data_cfg[split]
+    image_dir = Path(split_cfg["images"])
+    mask_dir_or_file = str(split_cfg["masks"])
+    mask_dir = Path(mask_dir_or_file)
+    is_mask_dir = mask_dir.is_dir()
+    classes = data_cfg["classes"]
+    ignore_classes = {int(item) for item in data_cfg.get("ignore_classes", set()) or set()}
+    class_names = _semantic_class_names(classes, ignore_classes)
+
+    samples: list[tuple[Path, Path]] = []
+    for rel_image in rt.file_helpers.list_image_filenames_from_dir(image_dir=image_dir):
+        image_path = image_dir / Path(rel_image)
+        if is_mask_dir:
+            mask_path = (mask_dir / Path(rel_image)).with_suffix(".png")
+        else:
+            mask_path = Path(mask_dir_or_file.format(image_path=image_path))
+        if mask_path.exists():
+            samples.append((image_path, mask_path))
+    return samples, class_names, len(classes)
+
+
+def _seg_infer_image_paths(args: Any) -> list[Path]:
+    data_path = getattr(args, "data", None)
+    if data_path is not None:
+        if _normalize_seg_type(args) == "semantic":
+            split_cfg = train_tools.load_semantic_segmentation_split_config(Path(data_path), args.split)
+            image_dir = Path(split_cfg[args.split]["images"])
+            return [image_dir / Path(rel) for rel in rt.file_helpers.list_image_filenames_from_dir(image_dir=image_dir)]
+        data_cfg = rt.load_data_config(Path(data_path))
+        samples, _ = rt.list_dataset_samples(data_cfg=data_cfg, split=args.split)
+        return [sample.image_path for sample in samples]
+    return rt.list_image_files(args.image if args.image is not None else args.image_dir)
+
+
+def _class_labels(classes: dict[int, Any], class_id: int) -> set[Any]:
+    info = classes[class_id]
+    if isinstance(info, str):
+        return {class_id}
+    if isinstance(info, dict):
+        labels = info.get("labels", info.get("values"))
+        if labels is None:
+            return {class_id}
+        normalized = set()
+        for label in labels:
+            normalized.add(tuple(label) if isinstance(label, list) else label)
+        return normalized
+    return {class_id}
+
+
+def _load_semantic_mask(mask_path: Path, classes: dict[int, Any], ignore_classes: set[int]) -> Any:
+    with rt.Image.open(mask_path) as mask_image:
+        mask_np = rt.np.array(mask_image)
+    compare_np = mask_np if mask_np.ndim == 3 else mask_np[:, :, None]
+    target = rt.np.full(mask_np.shape[:2], -100, dtype=rt.np.int64)
+    original_to_internal = {
+        class_id: internal_id
+        for internal_id, class_id in enumerate(sorted(set(classes) - ignore_classes))
+    }
+    for class_id, internal_id in original_to_internal.items():
+        for label in _class_labels(classes, class_id):
+            label_tuple = tuple(int(v) for v in label) if isinstance(label, tuple) else (int(label),)
+            target[rt.np.all(compare_np == rt.np.array(label_tuple), axis=2)] = internal_id
+    return target
+
+
+def _prediction_to_numpy(prediction: Any) -> Any:
+    if isinstance(prediction, dict):
+        if len(prediction) != 1:
+            raise ValueError("Multihead semantic segmentation eval requires selecting one output head first.")
+        prediction = next(iter(prediction.values()))
+    return prediction.detach().cpu().numpy().astype(rt.np.int64)
+
+
+def _resize_prediction_if_needed(pred_np: Any, target_shape: tuple[int, int]) -> Any:
+    if tuple(pred_np.shape[-2:]) == target_shape:
+        return pred_np
+    image = rt.Image.fromarray(pred_np.astype(rt.np.int32), mode="I")
+    resampling = getattr(rt.Image, "Resampling", rt.Image)
+    resized = image.resize((target_shape[1], target_shape[0]), resample=resampling.NEAREST)
+    return rt.np.array(resized).astype(rt.np.int64)
+
+
+def _compute_semantic_iou(confusion: Any) -> tuple[dict[str, float], dict[str, dict[str, float | int]]]:
+    per_class: dict[str, dict[str, float | int]] = {}
+    ious: list[float] = []
+    for class_id in range(confusion.shape[0]):
+        tp = int(confusion[class_id, class_id])
+        fp = int(confusion[:, class_id].sum() - tp)
+        fn = int(confusion[class_id, :].sum() - tp)
+        union = tp + fp + fn
+        iou = float(tp / union) if union > 0 else 0.0
+        if union > 0:
+            ious.append(iou)
+        per_class[str(class_id)] = {"tp": tp, "fp": fp, "fn": fn, "iou": iou}
+    metrics = {
+        "miou": float(sum(ious) / len(ious)) if ious else 0.0,
+        "pixel_accuracy": float(confusion.diagonal().sum() / max(confusion.sum(), 1)),
+    }
+    return metrics, per_class
+
+
 def save_semantic_visualization(image_path: Path, output_path: Path, mask_tensor: Any, class_names: dict[int, str]) -> None:
     with rt.Image.open(image_path) as image:
         image = image.convert("RGB")
         image_np = rt.np.array(image)
+    if isinstance(mask_tensor, dict):
+        if len(mask_tensor) != 1:
+            raise ValueError("Multihead semantic segmentation visualization requires selecting one output head first.")
+        mask_tensor = next(iter(mask_tensor.values()))
     mask_np = mask_tensor.detach().cpu().numpy()
     overlay = image_np.copy()
     for class_id in sorted(set(mask_np.reshape(-1).tolist())):
@@ -87,7 +210,7 @@ def run_infer(args) -> None:
     model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
     model.eval()
     class_names = rt.get_model_class_names(model)
-    image_paths = rt.list_image_files(args.image if args.image is not None else args.image_dir)
+    image_paths = _seg_infer_image_paths(args)
     if not image_paths:
         raise ValueError("没有找到可推理的图片。")
     for idx, image_path in enumerate(image_paths, start=1):
@@ -143,7 +266,73 @@ def update_metric(metric, label_mapping: dict[int, int], prediction: dict[str, A
     )
 
 
+def run_semantic_eval(args) -> None:
+    checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
+    rt.prepare_output_dir(args.output_dir, args.overwrite)
+    data_path = Path(args.data).expanduser().resolve()
+    data_cfg = train_tools.load_semantic_segmentation_split_config(data_path, args.split)
+    samples, data_class_names, num_classes = _semantic_image_mask_samples(data_path, args.split)
+    if not samples:
+        raise ValueError("No image/mask pairs found for semantic segmentation eval.")
+
+    classes = data_cfg["classes"]
+    ignore_classes = {int(item) for item in data_cfg.get("ignore_classes", set()) or set()}
+    model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
+    model.eval()
+    class_names = rt.merge_class_names(rt.get_model_class_names(model), data_class_names)
+    confusion = rt.np.zeros((len(class_names), len(class_names)), dtype=rt.np.int64)
+    rows: list[dict[str, Any]] = []
+
+    for idx, (image_path, mask_path) in enumerate(samples, start=1):
+        prediction = predict_model(model, image_path, args.threshold)
+        pred_np = _prediction_to_numpy(prediction)
+        target_np = _load_semantic_mask(mask_path, classes, ignore_classes)
+        pred_np = _resize_prediction_if_needed(pred_np, target_np.shape)
+        valid = target_np != -100
+        valid &= pred_np >= 0
+        valid &= pred_np < len(class_names)
+        if valid.any():
+            bincount = rt.np.bincount(
+                len(class_names) * target_np[valid].astype(rt.np.int64) + pred_np[valid].astype(rt.np.int64),
+                minlength=len(class_names) ** 2,
+            )
+            confusion += bincount.reshape((len(class_names), len(class_names)))
+        rows.append({"image_path": str(image_path), "mask_path": str(mask_path), "valid_pixels": int(valid.sum())})
+        if idx == 1 or idx % 20 == 0 or idx == len(samples):
+            print(f"[{idx}/{len(samples)}] processed: {image_path}")
+
+    metrics, per_class = _compute_semantic_iou(confusion)
+    summary_path = args.output_dir / "seg_semantic_eval_summary.json"
+    csv_path = args.output_dir / "seg_semantic_eval_samples.csv"
+    rt.save_records_csv(csv_path, rows, ["image_path", "mask_path", "valid_pixels"])
+    summary_path.write_text(
+        json.dumps(
+            {
+                "task": "semantic_segmentation",
+                "checkpoint": str(checkpoint_path),
+                "data": str(data_path),
+                "split": args.split,
+                "num_images": len(samples),
+                "num_classes": num_classes,
+                "class_names": class_names,
+                "metrics": metrics,
+                "per_class": per_class,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(f"Summary saved to: {summary_path}")
+    print(f"CSV saved to: {csv_path}")
+
+
 def run_eval(args) -> None:
+    if _normalize_seg_type(args) == "semantic":
+        run_semantic_eval(args)
+        return
+
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
     rt.prepare_output_dir(args.output_dir, args.overwrite)
     data_cfg = rt.load_data_config(args.data)
@@ -158,7 +347,9 @@ def run_eval(args) -> None:
     for idx, sample in enumerate(samples, start=1):
         with rt.Image.open(sample.image_path) as image:
             image_size = image.size
-        prediction = predict_model(model, sample.image_path, args.threshold)
+        # mAP 必须吃全量带分预测：阈值过滤会截断 PR 曲线、人为压低指标，
+        # 与训练内部验证（不做阈值过滤）不一致。故评估恒用 0.0。
+        prediction = predict_model(model, sample.image_path, 0.0)
         if not isinstance(prediction, dict) or "masks" not in prediction:
             raise ValueError("当前 seg eval 只支持实例分割模型。")
         target, has_label = load_instance_ground_truth(sample.label_path, image_size)

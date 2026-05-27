@@ -133,6 +133,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="输入标注格式：auto 自动判断，labelme 为 .json，yolo 为 .txt",
     )
     parser.add_argument(
+        "--seg-type",
+        choices=["auto", "instance", "semantic"],
+        default="auto",
+        help="seg 输出类型：auto 自动判断，instance 为 YOLO polygon，semantic 为 PNG mask",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -154,7 +160,127 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="仅模拟整理阶段，不实际写文件",
     )
+    parser.add_argument(
+        "--class-ref",
+        default=None,
+        help="参考类别文件（data.yaml / classes.txt），输出将使用其中的完整类别列表和 ID 映射",
+    )
     return parser.parse_args(argv)
+
+
+def _detect_seg_type(src_roots: list[Path]) -> str:
+    """Auto-detect seg type from source directories."""
+    sync_module = load_module("sync_picture_module", SYNC_PATH)
+    return sync_module.detect_seg_type(src_roots)
+
+
+def _resolve_seg_type(seg_type: str, src_roots: list[Path]) -> str:
+    """Resolve 'auto' seg_type to 'instance' or 'semantic'."""
+    if seg_type != "auto":
+        return seg_type
+    detected = _detect_seg_type(src_roots)
+    if detected == "semantic":
+        return "semantic"
+    return "instance"
+
+
+def run_semantic_conversion(
+    sources: list[str | Path],
+    output_root: str | Path,
+    *,
+    seed: int | None = None,
+    dry_run: bool = False,
+) -> None:
+    """Convert VOC-style semantic segmentation dataset to dataset_semantic/."""
+    sync_module = load_module("sync_picture_module", SYNC_PATH)
+    src_roots = [Path(s).expanduser().resolve() for s in sources]
+    for src in src_roots:
+        if not src.is_dir():
+            print(f"[ERROR] 源目录不存在: {src.resolve()}")
+            sys.exit(1)
+
+    output_root = Path(output_root).expanduser().resolve()
+    target_dir = output_root / "dataset_semantic"
+
+    print("=" * 60)
+    print("  语义分割数据集转换")
+    print("=" * 60)
+    print(f"SOURCES      : {[str(p.resolve()) for p in src_roots]}")
+    print(f"OUTPUT       : {target_dir.resolve()}")
+    print(f"DRY_RUN      : {dry_run}")
+
+    # Check for VOC-style ImageSets
+    has_imagesets = any((root / "ImageSets").is_dir() for root in src_roots)
+
+    # Collect pairs to get stats
+    pairs = sync_module.collect_voc_semantic_files(src_roots)
+    if not pairs:
+        print("[ERROR] 未找到图片+mask 配对。确保源目录有 JPEGImages/ + SegmentationClass/ 或 images/ + masks/")
+        sys.exit(1)
+
+    print(f"PAIRS_FOUND  : {len(pairs)}")
+    print(f"SPLIT_SOURCE : {'ImageSets/ 文件' if has_imagesets else '随机 8:1:1'}")
+
+    if dry_run:
+        print("\n[INFO] dry-run 模式，不实际写入文件。")
+        return
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stats = sync_module.split_voc_semantic_files(src_roots, target_dir, seed=seed, dry_run=dry_run)
+
+    # Scan unique class IDs from masks to generate class names
+    import numpy as np
+    from PIL import Image
+
+    all_class_ids: set[int] = set()
+    for split_dir in (target_dir / "masks").iterdir():
+        if split_dir.is_dir():
+            for mask_file in split_dir.glob("*.png"):
+                with Image.open(mask_file) as img:
+                    vals = set(np.unique(np.array(img)).tolist())
+                    all_class_ids.update(vals)
+
+    sorted_ids = sorted(all_class_ids)
+    class_names = {cid: f"class_{cid}" for cid in sorted_ids}
+    if 0 in class_names:
+        class_names[0] = "background"
+
+    # Write classes.txt
+    classes_path = target_dir / "classes.txt"
+    with classes_path.open("w", encoding="utf-8") as f:
+        for cid in sorted_ids:
+            f.write(f"{class_names[cid]}\n")
+
+    # Write data.yaml
+    import yaml
+
+    data_yaml = target_dir / "data.yaml"
+    yaml_content: dict = {"task": "semantic_segmentation"}
+    splits_present = [s for s in ("train", "val", "test") if (target_dir / "images" / s).is_dir()]
+    for split in splits_present:
+        yaml_content[split] = {
+            "images": f"images/{split}",
+            "masks": f"masks/{split}",
+        }
+    yaml_content["classes"] = class_names
+
+    with data_yaml.open("w", encoding="utf-8") as f:
+        yaml.dump(yaml_content, f, default_flow_style=False, allow_unicode=True)
+
+    # Print summary
+    print()
+    print("─" * 40)
+    print("  转换完成")
+    print("─" * 40)
+    for split, count in stats.get("split_counts", {}).items():
+        print(f"  {split:<8} {count} 对")
+    print(f"  classes  : {sorted_ids}")
+    print(f"  output   : {target_dir}")
+    if stats.get("errors"):
+        print(f"\n  [WARNING] {len(stats['errors'])} 个错误:")
+        for e in stats["errors"][:10]:
+            print(f"    {e}")
+    print()
 
 
 def run_conversion(
@@ -163,9 +289,11 @@ def run_conversion(
     *,
     task: str = "all",
     label_format: str = "auto",
+    seg_type: str = "auto",
     seed: int | None = None,
     dry_run: bool = False,
     preserve_splits: str = "auto",
+    class_ref: str | None = None,
 ) -> None:
     sync_module = load_module("sync_picture_module", SYNC_PATH)
     convert_module = load_module("labelme_to_yolo_module", CONVERT_PATH)
@@ -179,14 +307,37 @@ def run_conversion(
 
     output_root = Path(output_root).expanduser().resolve()
 
-    if label_format == "auto":
+    # Resolve seg type for seg tasks
+    need_seg = "seg" in selected_tasks
+    resolved_seg_type = _resolve_seg_type(seg_type, src_roots) if need_seg else "instance"
+
+    # For semantic seg, we don't need label_format (JSON/TXT) at all
+    need_instance_seg = need_seg and resolved_seg_type == "instance"
+    need_det_or_cls = "det" in selected_tasks or "cls" in selected_tasks
+    need_labelme_yolo = need_instance_seg or need_det_or_cls
+
+    if need_labelme_yolo and label_format == "auto":
         label_format = sync_module.detect_label_format(src_roots)
+        if label_format == "voc_seg":
+            # VOC-style detected but user wants instance seg or det/cls
+            # Fall back to unknown since there are no JSON/TXT labels
+            if not need_instance_seg:
+                label_format = "unknown"
+            else:
+                print("[ERROR] 源目录是 VOC 语义分割格式（SegmentationClass/），无 JSON/TXT 标注，无法转为 instance seg")
+                sys.exit(1)
         if label_format == "mixed":
             print("[ERROR] 自动检测到源目录同时包含 JSON 和 TXT，请显式指定 --label-format")
             sys.exit(1)
         if label_format == "unknown":
-            print("[ERROR] 未检测到可用标注文件（.json 或 .txt）")
-            sys.exit(1)
+            if need_seg and resolved_seg_type == "semantic":
+                # Semantic seg can still run, just skip det/cls
+                print("[WARNING] 未检测到 JSON/TXT 标注，det/cls 任务将跳过，仅执行 semantic seg")
+                need_det_or_cls = False
+                need_labelme_yolo = False
+            else:
+                print("[ERROR] 未检测到可用标注文件（.json 或 .txt）")
+                sys.exit(1)
 
     is_pre_split = detect_pre_split(src_roots)
     if preserve_splits == "yes" and not is_pre_split:
@@ -199,17 +350,23 @@ def run_conversion(
     print("=" * 60)
     print(f"SOURCES      : {[str(p.resolve()) for p in src_roots]}")
     print(f"TASKS        : {', '.join(selected_tasks)}")
-    print(f"LABEL_FORMAT : {label_format}")
+    if need_seg:
+        print(f"SEG_TYPE     : {resolved_seg_type}")
+    if need_labelme_yolo:
+        print(f"LABEL_FORMAT : {label_format}")
     print(f"OUTPUT_ROOT  : {output_root.resolve()}")
+    if class_ref:
+        print(f"CLASS_REF    : {class_ref}")
     print(f"PRESERVE_SPL : {use_preserve} (mode={preserve_splits}, detected={is_pre_split})")
-    if "det" in selected_tasks:
+    if "det" in selected_tasks and (need_det_or_cls or not need_seg):
         print(f"DET_ROOT     : {(output_root / 'dataset_det').resolve()}")
-    if "cls" in selected_tasks:
+    if "cls" in selected_tasks and (need_det_or_cls or not need_seg):
         print(f"CLS_ROOT     : {(output_root / 'dataset_cls').resolve()}")
-    if "seg" in selected_tasks:
-        print(f"SEG_ROOT     : {(output_root / 'dataset_seg').resolve()}")
+    if need_seg:
+        seg_root_name = "dataset_semantic" if resolved_seg_type == "semantic" else "dataset_seg"
+        print(f"SEG_ROOT     : {(output_root / seg_root_name).resolve()}")
 
-    def _invoke_labelme_to_yolo(synced_root: Path) -> None:
+    def _invoke_labelme_to_yolo(synced_root: Path, override_task: str | None = None) -> None:
         original_policy = convert_module.EXISTING_OUTPUT_POLICY
         convert_module.EXISTING_OUTPUT_POLICY = "clean"
         original_argv = sys.argv[:]
@@ -221,14 +378,44 @@ def run_conversion(
                 "--output-root",
                 str(output_root),
                 "--task",
-                task,
+                override_task or task,
                 "--source-format",
                 label_format,
             ]
+            if class_ref:
+                sys.argv.extend(["--class-ref", class_ref])
             convert_module.main()
         finally:
             sys.argv = original_argv
             convert_module.EXISTING_OUTPUT_POLICY = original_policy
+
+    # ── Semantic seg: self-contained path, skips LabelMeToYOLO ──────────
+    if need_seg and resolved_seg_type == "semantic":
+        print("\n[INFO] 语义分割转换路径")
+        run_semantic_conversion(sources, output_root, seed=seed, dry_run=dry_run)
+        # If there are also det/cls tasks, run them through the existing flow
+        if need_det_or_cls:
+            # Strip "seg" from task for LabelMeToYOLO
+            remaining_tasks = [t for t in selected_tasks if t != "seg"]
+            remaining_task_str = remaining_tasks[0] if len(remaining_tasks) == 1 else "all"
+            # Need to handle sync for det/cls
+            if use_preserve:
+                synced_root = src_roots[0] if len(src_roots) == 1 else src_roots[0]
+                _invoke_labelme_to_yolo(synced_root, override_task=remaining_task_str)
+            else:
+                with tempfile.TemporaryDirectory(prefix="dataset_sync_") as temp_dir:
+                    synced_root = Path(temp_dir) / "synced_source"
+                    copy_stats = sync_module.copy_files(
+                        src_roots, synced_root, label_format=label_format, seed=seed, dry_run=dry_run,
+                    )
+                    if dry_run:
+                        print("\n[INFO] dry-run 模式已结束。")
+                        return
+                    if copy_stats["paired_total"] == 0:
+                        print("\n[WARNING] det/cls 整理阶段没有配对，跳过。")
+                        return
+                    _invoke_labelme_to_yolo(synced_root, override_task=remaining_task_str)
+        return
 
     # ── 分支 A：已预划分，跳过 sync 的随机洗牌 ─────────────────────────────
     if use_preserve:
@@ -290,9 +477,11 @@ def main(argv: list[str] | None = None) -> None:
         args.output_root,
         task=args.task,
         label_format=args.label_format,
+        seg_type=args.seg_type,
         seed=args.seed,
         dry_run=args.dry_run,
         preserve_splits=args.preserve_splits,
+        class_ref=args.class_ref,
     )
 
 

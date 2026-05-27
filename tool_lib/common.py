@@ -119,6 +119,9 @@ EXPORT_DEFAULT_BOX_DENSITY_PENALTY = 0.0
 EXPORT_DEFAULT_EXPORT_SUFFIX = "_A"
 
 SEG_DATASET_DIR = ROOT_DIR / "datasets" / "neu_dataset" / "dataset_seg"
+SEMANTIC_SEG_DATASET_DIR = ROOT_DIR / "datasets" / "neu_dataset" / "dataset_semantic"
+SEMANTIC_SEG_DEFAULT_DATA = SEMANTIC_SEG_DATASET_DIR / "data.yaml"
+SEG_TRAIN_TYPE = "instance"
 SEG_EXPORT_DEFAULT_SOURCE_DATA = SEG_DATASET_DIR / "data.yaml"
 SEG_EXPORT_DEFAULT_REPORT_JSON: Path | None = None
 SEG_EXPORT_DEFAULT_GOOD_CLASS_THRESHOLD = 0.0
@@ -284,6 +287,9 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global EXPORT_DEFAULT_BOX_DENSITY_PENALTY
     global EXPORT_DEFAULT_EXPORT_SUFFIX
     global SEG_DATASET_DIR
+    global SEMANTIC_SEG_DATASET_DIR
+    global SEMANTIC_SEG_DEFAULT_DATA
+    global SEG_TRAIN_TYPE
     global SEG_EXPORT_DEFAULT_SOURCE_DATA
     global SEG_EXPORT_DEFAULT_REPORT_JSON
     global SEG_EXPORT_DEFAULT_GOOD_CLASS_THRESHOLD
@@ -419,6 +425,12 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     )
 
     SEG_DATASET_DIR = _path("seg_dataset_dir", SEG_DATASET_DIR)
+    SEMANTIC_SEG_DATASET_DIR = _path("semantic_seg_dataset_dir", SEMANTIC_SEG_DATASET_DIR)
+    SEMANTIC_SEG_DEFAULT_DATA = _path(
+        "semantic_seg_data_yaml",
+        SEMANTIC_SEG_DATASET_DIR / "data.yaml",
+    )
+    SEG_TRAIN_TYPE = str(settings.get("seg_train_type", SEG_TRAIN_TYPE)).lower()
     default_seg_data_yaml = SEG_DATASET_DIR / "data.yaml"
     SEG_EXPORT_DEFAULT_SOURCE_DATA = _path("seg_export_source_data", default_seg_data_yaml)
     seg_report_value = settings.get("seg_export_report_json")

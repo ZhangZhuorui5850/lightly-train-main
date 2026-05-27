@@ -1549,6 +1549,11 @@ def _export_filtered_dataset_impl(
 
 
 def run_export(args) -> None:
+    if str(getattr(args, "seg_train_type", "instance") or "instance").lower() == "semantic":
+        raise NotImplementedError(
+            "semantic segmentation export is not supported by this launcher yet. "
+            "The existing seg-export pipeline is for YOLO polygon instance segmentation datasets."
+        )
     report_path, report_payload, report_resolution = resolve_export_report(
         args.report_json,
         args.export_source_data,

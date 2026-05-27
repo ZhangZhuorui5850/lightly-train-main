@@ -11,7 +11,7 @@ import math
 import re
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from . import common as rt
 
@@ -19,7 +19,8 @@ from . import common as rt
 _TRAIN_FUNC_NAME: dict[str, str] = {
     "det": "train_object_detection",
     "cls": "train_image_classification",
-    "seg": "train_instance_segmentation",
+    "seg_instance": "train_instance_segmentation",
+    "seg_semantic": "train_semantic_segmentation",
 }
 
 _WEIGHT_EXTENSIONS = {".pth", ".pt", ".ckpt", ".safetensors"}
@@ -44,6 +45,138 @@ def detect_available_gpus() -> list[tuple[int, str]]:
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
+def _load_yaml_dict(path: Path) -> dict[str, Any]:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required to read data yaml files.") from exc
+    with path.open("r", encoding="utf-8") as file:
+        cfg = yaml.safe_load(file)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Invalid yaml payload in {path}: expected a mapping.")
+    return cfg
+
+
+def _resolve_data_root(cfg: dict[str, Any], data_yaml: Path) -> Path:
+    root = Path(cfg.get("path", data_yaml.parent)).expanduser()
+    if not root.is_absolute():
+        root = (data_yaml.parent / root).resolve()
+    return root
+
+
+def _resolve_data_path(root: Path, value: Any) -> str:
+    text = str(value)
+    if "{image_path" in text:
+        return text
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = (root / path).resolve()
+    return str(path)
+
+
+def _infer_semantic_mask_path(image_value: Any) -> str:
+    image_path = Path(str(image_value))
+    if "images" in image_path.parts:
+        parts = ["masks" if part == "images" else part for part in image_path.parts]
+        return str(Path(*parts))
+    return str(image_value).replace("images", "masks", 1)
+
+
+def _class_mapping_from_yaml(cfg: dict[str, Any]) -> dict[int, Any]:
+    classes = cfg.get("classes", cfg.get("names"))
+    if classes is None:
+        raise ValueError(
+            "Semantic segmentation data yaml must define either 'classes' or 'names'."
+        )
+    if isinstance(classes, list):
+        return {idx: str(name) for idx, name in enumerate(classes)}
+    if isinstance(classes, dict):
+        return {int(idx): value for idx, value in classes.items()}
+    raise ValueError(f"Unsupported class mapping in data yaml: {classes!r}")
+
+
+def _semantic_split_from_yaml(
+    cfg: dict[str, Any], root: Path, split_name: str
+) -> dict[str, str]:
+    split_value = cfg.get(split_name)
+    if split_value is None:
+        raise ValueError(f"Semantic segmentation data yaml is missing '{split_name}'.")
+
+    if isinstance(split_value, dict):
+        image_value = split_value.get("images")
+        mask_value = split_value.get("masks")
+        if image_value is None or mask_value is None:
+            raise ValueError(
+                f"Semantic split '{split_name}' must contain both 'images' and 'masks'."
+            )
+    else:
+        image_value = split_value
+        mask_value = cfg.get(f"{split_name}_masks") or _infer_semantic_mask_path(
+            image_value
+        )
+
+    images = _resolve_data_path(root, image_value)
+    masks = _resolve_data_path(root, mask_value)
+
+    image_dir = Path(images)
+    if not image_dir.exists():
+        raise FileNotFoundError(
+            f"Semantic {split_name} images directory does not exist: {image_dir}"
+        )
+    if "{image_path" not in masks:
+        mask_dir = Path(masks)
+        if not mask_dir.exists():
+            raise FileNotFoundError(
+                f"Semantic {split_name} masks directory does not exist: {mask_dir}. "
+                "Semantic segmentation requires PNG masks, not YOLO txt labels."
+            )
+    return {"images": images, "masks": masks}
+
+
+def load_semantic_segmentation_data_config(data_yaml: Path) -> dict[str, Any]:
+    cfg = _load_yaml_dict(data_yaml)
+    root = _resolve_data_root(cfg, data_yaml)
+    data: dict[str, Any] = {
+        "train": _semantic_split_from_yaml(cfg, root, "train"),
+        "val": _semantic_split_from_yaml(cfg, root, "val"),
+        "classes": _class_mapping_from_yaml(cfg),
+    }
+    ignore_classes = cfg.get("ignore_classes")
+    if ignore_classes:
+        data["ignore_classes"] = ignore_classes
+    return data
+
+
+def load_semantic_segmentation_split_config(data_yaml: Path, split: str) -> dict[str, Any]:
+    cfg = _load_yaml_dict(data_yaml)
+    root = _resolve_data_root(cfg, data_yaml)
+    data: dict[str, Any] = {
+        split: _semantic_split_from_yaml(cfg, root, split),
+        "classes": _class_mapping_from_yaml(cfg),
+    }
+    ignore_classes = cfg.get("ignore_classes")
+    if ignore_classes:
+        data["ignore_classes"] = ignore_classes
+    return data
+
+
+def get_seg_train_type(args: Any) -> Literal["instance", "semantic"]:
+    value = str(getattr(args, "seg_train_type", "instance") or "instance").lower()
+    if value not in {"instance", "semantic"}:
+        raise ValueError("seg_train_type must be either 'instance' or 'semantic'.")
+    return value  # type: ignore[return-value]
+
+
+def get_train_func_name(args: Any) -> str:
+    task = str(args.tool_task)
+    if task == "seg":
+        return _TRAIN_FUNC_NAME[f"seg_{get_seg_train_type(args)}"]
+    try:
+        return _TRAIN_FUNC_NAME[task]
+    except KeyError:
+        raise ValueError(f"Unsupported training task: {task}") from None
+
+
 def _count_train_images(data_yaml: Path) -> int:
     """从 data.yaml 直接统计 train split 图片数，无需 import_runtime_dependencies。
 
@@ -65,6 +198,8 @@ def _count_train_images(data_yaml: Path) -> int:
         root = (data_yaml.parent / root).resolve()
 
     train_val = cfg.get("train", "images/train")
+    if isinstance(train_val, dict):
+        train_val = train_val.get("images", "images/train")
     train_paths = train_val if isinstance(train_val, list) else [train_val]
 
     total = 0
@@ -126,12 +261,15 @@ def read_original_train_params(experiment_dir: Path) -> dict[str, Any]:
                 except json.JSONDecodeError:
                     return {}
                 result: dict[str, Any] = {}
-                for key in ("model", "steps", "batch_size", "devices"):
+                for key in ("model", "steps", "batch_size", "devices", "task"):
                     if key in payload:
                         result[key] = payload[key]
                 data_val = payload.get("data")
                 if isinstance(data_val, dict) and "path" in data_val:
                     result["data"] = data_val["path"]
+                    result["data_config"] = data_val
+                elif isinstance(data_val, dict):
+                    result["data_config"] = data_val
                 elif isinstance(data_val, str):
                     result["data"] = data_val
                 return result
@@ -248,17 +386,25 @@ def run_train(args) -> None:
     rt.import_runtime_dependencies()
 
     task: str = args.tool_task
-    func_name = _TRAIN_FUNC_NAME.get(task)
+    func_name = get_train_func_name(args)
     if func_name is None:
         raise ValueError(f"不支持的任务类型: {task}")
     train_func = getattr(rt.lightly_train, func_name)
 
     out_dir = Path(args.out_dir).expanduser().resolve()
 
-    data_yaml_path = Path(args.data_yaml).expanduser().resolve()
+    data_config = getattr(args, "data_config", None)
+    data_yaml = getattr(args, "data_yaml", None) or rt.ROOT_DIR
+    data_yaml_path = Path(data_yaml).expanduser().resolve()
     if not data_yaml_path.exists():
         raise FileNotFoundError(f"数据集 yaml 不存在: {data_yaml_path}")
     data = str(data_yaml_path)
+    data_display = str(data_yaml_path)
+    if data_config is not None:
+        data = data_config
+        data_display = "<data_config>"
+    elif task == "seg" and get_seg_train_type(args) == "semantic":
+        data = load_semantic_segmentation_data_config(data_yaml_path)
 
     model_str = str(getattr(args, "model", "") or "").strip()
     if not model_str:
@@ -294,7 +440,9 @@ def run_train(args) -> None:
 
     print(f"\n[{task}/train] 开始训练")
     print(f"  out          : {out_dir}")
-    print(f"  data         : {data}")
+    if task == "seg":
+        print(f"  seg_type     : {get_seg_train_type(args)}")
+    print(f"  data         : {data_display}")
     print(f"  model        : {args.model}")
     if backbone_weights is not None:
         print(f"  backbone     : {backbone_weights}")

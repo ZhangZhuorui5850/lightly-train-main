@@ -52,11 +52,14 @@ def run_convert(args) -> None:
     module = load_one_click_convert_module()
     source_dir = resolve_convert_source_dir(args.source_dir)
     output_root = Path(args.output_root).expanduser().resolve()
+    class_ref = getattr(args, "class_ref", None)
     module.run_conversion(
         [source_dir],
         output_root,
         task=args.task,
         label_format=args.label_format,
+        seg_type=getattr(args, "seg_type", "auto"),
         seed=args.seed,
         dry_run=args.dry_run,
+        class_ref=class_ref,
     )

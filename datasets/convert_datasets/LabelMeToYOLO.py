@@ -113,6 +113,11 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="输入格式：auto 自动判断，labelme 为 JSON，yolo 为 TXT",
     )
+    parser.add_argument(
+        "--class-ref",
+        default=None,
+        help="参考类别文件（data.yaml / classes.txt），输出将使用其中的完整类别列表和 ID 映射",
+    )
     return parser.parse_args()
 
 
@@ -453,10 +458,36 @@ def normalize_label(label: str) -> str:
     return str(label).strip()
 
 
+def load_class_ref(ref_path: Path) -> Dict[str, int]:
+    """从参考文件（data.yaml / dataset.yaml / classes.txt）加载完整类别映射。"""
+    text = ref_path.read_text(encoding="utf-8")
+    names = None
+    # classes.txt 格式：每行一个类别名
+    if ref_path.suffix == ".txt" or "names:" not in text:
+        names = [line.strip() for line in text.splitlines() if line.strip()]
+        if names and any(":" in n for n in names):
+            # 可能是 YAML，回退到 YAML 解析
+            names = None
+    # YAML 格式
+    if not names:
+        names = parse_names_from_yaml_text(text)
+    if not names:
+        print(f"[ERROR] 无法从参考文件解析类别: {ref_path}")
+        sys.exit(1)
+    print(f"[INFO] 从参考文件加载 {len(names)} 个类别: {ref_path}")
+    return {str(name): idx for idx, name in enumerate(names)}
+
+
 def collect_classes(source_root: Path, splits: List[str]) -> Dict[str, int]:
     if FIXED_CLASS_MAP:
         print("[INFO] 使用固定 FIXED_CLASS_MAP")
         return FIXED_CLASS_MAP.copy()
+
+    # 优先从源目录的 data.yaml / classes.txt 读取类别名
+    metadata_names = load_yolo_class_names_from_metadata(source_root)
+    if metadata_names:
+        print(f"[INFO] 从 metadata 文件读取 {len(metadata_names)} 个类别")
+        return {str(name): idx for idx, name in enumerate(metadata_names)}
 
     class_names: set = set()
     for split in splits:
@@ -571,16 +602,36 @@ def parse_names_from_yaml_text(text: str) -> Optional[List[str]]:
         after = stripped[len("names:"):].strip()
         if not after:
             break
+        # Try quoted format first: names: ["a", "b"] or names: {0: "a", 1: "b"}
         try:
             parsed = ast.literal_eval(after)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed]
+            if isinstance(parsed, dict):
+                return [str(parsed[k]) for k in sorted(parsed)]
         except Exception:
-            parsed = None
-        if isinstance(parsed, list):
-            return [str(x) for x in parsed]
-        if isinstance(parsed, dict):
-            return [str(parsed[k]) for k in sorted(parsed)]
+            pass
+        # Try unquoted list: names: [a, b, c]
+        if after.startswith("[") and after.endswith("]"):
+            items = [s.strip().strip("\"'") for s in after[1:-1].split(",") if s.strip()]
+            if items:
+                return items
+        # Try unquoted dict: names: {0: a, 1: b}
+        if after.startswith("{") and after.endswith("}"):
+            try:
+                pairs = {}
+                for pair in after[1:-1].split(","):
+                    pair = pair.strip()
+                    if ":" in pair:
+                        k, v = pair.split(":", 1)
+                        pairs[int(k.strip())] = v.strip().strip("\"'")
+                if pairs:
+                    return [pairs[i] for i in sorted(pairs)]
+            except Exception:
+                pass
         break
 
+    # Block-style dict parsing (each entry on its own line)
     collecting = False
     items: Dict[int, str] = {}
     for line in lines:
@@ -604,6 +655,10 @@ def parse_names_from_yaml_text(text: str) -> Optional[List[str]]:
 
 
 def collect_classes_from_yolo(source_root: Path, splits: List[str]) -> Dict[str, int]:
+    if FIXED_CLASS_MAP:
+        print("[INFO] 使用固定 FIXED_CLASS_MAP")
+        return FIXED_CLASS_MAP.copy()
+
     metadata_names = load_yolo_class_names_from_metadata(source_root)
     if metadata_names:
         return {str(name): idx for idx, name in enumerate(metadata_names)}
@@ -1180,6 +1235,14 @@ def main() -> None:
     source_root = Path(args.source_root)
     output_root = Path(args.output_root)
     selected_tasks = normalize_selected_tasks(args.task)
+
+    if args.class_ref:
+        ref_path = Path(args.class_ref)
+        if not ref_path.exists():
+            print(f"[ERROR] --class-ref 文件不存在: {ref_path}")
+            sys.exit(1)
+        global FIXED_CLASS_MAP
+        FIXED_CLASS_MAP = load_class_ref(ref_path)
     target_det = output_root / "dataset_det"
     target_cls = output_root / "dataset_cls"
     target_seg = output_root / "dataset_seg"
