@@ -1364,8 +1364,16 @@ def resume_from_checkpoint(
     # Resume only works properly when loading with fabric.load(path, state)!
     # Need context manager because fabric.load doesn't expose weights_only parameter and
     # the checkpoint contains more than just model weights.
+    #
+    # NOTE: `best_agg_metric_values` is intentionally NOT part of the `state` passed to
+    # fabric.load. It is not a stateful object and is absent in checkpoints created before
+    # it was persisted; including it in `state` would make fabric's strict key check fail
+    # when resuming such checkpoints. Instead we restore it from the returned `remainder`
+    # (the checkpoint keys not consumed by `state`), falling back to None when missing.
     with _torch_weights_only_false():
-        fabric.load(path=checkpoint_path, state=state)  # type: ignore[arg-type]
+        remainder = fabric.load(path=checkpoint_path, state=state)  # type: ignore[arg-type]
+    if "best_agg_metric_values" in remainder:
+        state["best_agg_metric_values"] = remainder["best_agg_metric_values"]
 
 
 def finetune_from_checkpoint(

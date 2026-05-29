@@ -45,7 +45,9 @@ class ModelEMA(Module):
 
         self.decay = decay
         self.warmups = warmups
-        self.updates = 0  # number of EMA updates
+        # Registered as a buffer so it is saved in state_dict and restored on resume.
+        # A plain int would reset to 0, restarting the EMA warmup and wiping the average.
+        self.register_buffer("updates", torch.tensor(0, dtype=torch.long))
         self.decay_fn = decay_fn  # decay exponential ramp (to help early epochs)
 
         for p in self.model.parameters():
@@ -56,7 +58,7 @@ class ModelEMA(Module):
         with torch.no_grad():
             self.updates += 1
             d = self.decay_fn(
-                decay=self.decay, warmup_steps=self.warmups, step=self.updates
+                decay=self.decay, warmup_steps=self.warmups, step=int(self.updates)
             )
             msd = model.state_dict()
             for k, v in self.model.state_dict().items():
