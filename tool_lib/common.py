@@ -97,6 +97,14 @@ INFER_DEFAULT_METRIC_CLASSWISE = False
 INFER_DEFAULT_SAVE_TEST_REPORT = True
 INFER_DEFAULT_REPORT_PATH = INFER_DEFAULT_OUTPUT_DIR / "test_report.json"
 
+# SAHI 切片推理默认参数（仅 infer --sahi 时生效）
+INFER_DEFAULT_SAHI = False
+INFER_DEFAULT_SAHI_OVERLAP = 0.2
+INFER_DEFAULT_SAHI_NMS_IOU = 0.3
+INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU = 0.1
+# True 时：短边 < 模型 tile 的小图自动跳过 SAHI、回退普通 predict（小图上 SAHI 会更差）。
+INFER_DEFAULT_SAHI_SKIP_SMALL = True
+
 EVAL_DEFAULT_DATA = DATASET_DIR / "data.yaml"
 EVAL_DEFAULT_OUTPUT_DIR = EXPERIMENT_DIR / "infer-test"
 EVAL_DEFAULT_REPORT_PATH = EVAL_DEFAULT_OUTPUT_DIR / "test_report.json"
@@ -316,6 +324,11 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global DEFAULT_SCORE_THRESHOLD
     global INFER_DEFAULT_SCORE_THRESHOLD
     global INFER_DEFAULT_REPORT_IOU_THRESHOLD
+    global INFER_DEFAULT_SAHI
+    global INFER_DEFAULT_SAHI_OVERLAP
+    global INFER_DEFAULT_SAHI_NMS_IOU
+    global INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU
+    global INFER_DEFAULT_SAHI_SKIP_SMALL
 
     def _path(key: str, current: Path) -> Path:
         value = settings.get(key)
@@ -348,6 +361,19 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     INFER_DEFAULT_SCORE_THRESHOLD = DEFAULT_SCORE_THRESHOLD
     INFER_DEFAULT_REPORT_IOU_THRESHOLD = float(
         settings.get("det_report_iou_threshold", INFER_DEFAULT_REPORT_IOU_THRESHOLD)
+    )
+    INFER_DEFAULT_SAHI = bool(settings.get("det_sahi_enabled", INFER_DEFAULT_SAHI))
+    INFER_DEFAULT_SAHI_OVERLAP = float(
+        settings.get("det_sahi_overlap", INFER_DEFAULT_SAHI_OVERLAP)
+    )
+    INFER_DEFAULT_SAHI_NMS_IOU = float(
+        settings.get("det_sahi_nms_iou", INFER_DEFAULT_SAHI_NMS_IOU)
+    )
+    INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU = float(
+        settings.get("det_sahi_global_local_iou", INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU)
+    )
+    INFER_DEFAULT_SAHI_SKIP_SMALL = bool(
+        settings.get("det_sahi_skip_small_images", INFER_DEFAULT_SAHI_SKIP_SMALL)
     )
 
     default_data_yaml = DATASET_DIR / "data.yaml"
@@ -1297,7 +1323,7 @@ def render_scalar_plot_matplotlib(
     temp_path = _temporary_image_output_path(output_path)
 
     fig, ax = plt.subplots(figsize=(12.8, 7.2), dpi=120)
-    fig.patch.set_facecolor("#fafbfc")
+    fig.set_facecolor("#fafbfc")
     ax.set_facecolor("#ffffff")
     palette = ["#2c7bb6", "#d73027", "#27ae60", "#8e44ad", "#e67e22"]
 
@@ -1321,7 +1347,7 @@ def render_scalar_plot_matplotlib(
     ax.legend(loc="best", frameon=False, fontsize=10)
     try:
         fig.tight_layout()
-        fig.savefig(temp_path, bbox_inches="tight")
+        fig.savefig(str(temp_path), bbox_inches="tight")
     finally:
         plt.close(fig)
     return _finalize_image_output(temp_path, output_path)

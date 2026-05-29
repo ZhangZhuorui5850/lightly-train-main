@@ -2248,6 +2248,12 @@ def build_interactive_args() -> argparse.Namespace | None:
             if use_custom
             else False,
             infer_config_mode=config_mode,
+            # SAHI 开关：由 launcher.py 的 det_sahi_enabled 决定，不在菜单里提问。
+            sahi=rt.INFER_DEFAULT_SAHI,
+            sahi_overlap=rt.INFER_DEFAULT_SAHI_OVERLAP,
+            sahi_nms_iou=rt.INFER_DEFAULT_SAHI_NMS_IOU,
+            sahi_global_local_iou=rt.INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU,
+            sahi_skip_small=rt.INFER_DEFAULT_SAHI_SKIP_SMALL,
         )
         if mode == "dataset":
             args.split = prompt_det_infer_split(
@@ -2447,6 +2453,20 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     infer_parser.add_argument("--metric-classwise", action="store_true", default=rt.INFER_DEFAULT_METRIC_CLASSWISE)
     infer_parser.add_argument("--save-test-report", action="store_true", default=rt.INFER_DEFAULT_SAVE_TEST_REPORT)
     infer_parser.add_argument("--report-path", type=Path, default=None)
+    # SAHI 切片推理：仅 --task det 时生效；不加 --sahi 时流程与旧版完全一致。
+    infer_parser.add_argument("--sahi", action="store_true", default=rt.INFER_DEFAULT_SAHI)
+    infer_parser.add_argument("--sahi-overlap", dest="sahi_overlap", type=float, default=rt.INFER_DEFAULT_SAHI_OVERLAP)
+    infer_parser.add_argument("--sahi-nms-iou", dest="sahi_nms_iou", type=float, default=rt.INFER_DEFAULT_SAHI_NMS_IOU)
+    infer_parser.add_argument(
+        "--sahi-global-local-iou",
+        dest="sahi_global_local_iou",
+        type=float,
+        default=rt.INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU,
+    )
+    # 短边 < tile 的小图是否跳过 SAHI、回退普通 predict（小图上 SAHI 会更差）。
+    infer_parser.add_argument("--sahi-skip-small", dest="sahi_skip_small", action="store_true")
+    infer_parser.add_argument("--no-sahi-skip-small", dest="sahi_skip_small", action="store_false")
+    infer_parser.set_defaults(sahi_skip_small=rt.INFER_DEFAULT_SAHI_SKIP_SMALL)
     infer_parser.add_argument("--overwrite", action="store_true", default=rt.INFER_DEFAULT_OVERWRITE)
     infer_parser.add_argument("--dry-run", action="store_true", default=False)
     infer_parser.add_argument("--skip-important-artifacts", action="store_true", default=False, help=argparse.SUPPRESS)
