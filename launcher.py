@@ -197,6 +197,11 @@ SEG_SETTINGS = {
     "seg_export_max_instances_per_image": 0,
     "seg_export_max_instances_per_class_per_image": 0,
     "seg_export_instance_density_penalty": 0.0,
+    # seg_export_size_ratio: 目标掩码尺寸占比 小:中:大（排除 tiny）。默认 "30:40:30"，"" 关闭。
+    "seg_export_size_ratio": "30:40:30",
+    "seg_export_size_balance_weight": 1.0,
+    "seg_export_avg_instances_per_image_min": 5,
+    "seg_export_avg_instances_per_image_max": 15,
     "seg_export_suffix": "_A",
 }
 

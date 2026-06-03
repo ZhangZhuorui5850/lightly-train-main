@@ -585,6 +585,11 @@ def print_seg_export_preview(args: argparse.Namespace) -> None:
     print(_seg_export_strategy_text("max_instances_per_image", args.max_instances_per_image, enabled=args.auto_balance))
     print(_seg_export_strategy_text("max_instances_per_class_per_image", args.max_instances_per_class_per_image, enabled=args.auto_balance))
     print(_seg_export_strategy_text("instance_density_penalty", args.instance_density_penalty, enabled=args.auto_balance))
+    print(f"  size_ratio: {compact_display_value(args.size_ratio)}")
+    size_enabled = bool(str(args.size_ratio).strip())
+    print(_seg_export_strategy_text("size_balance_weight", args.size_balance_weight, enabled=size_enabled))
+    print(_seg_export_strategy_text("avg_instances_per_image_min", args.avg_instances_per_image_min, enabled=size_enabled))
+    print(_seg_export_strategy_text("avg_instances_per_image_max", args.avg_instances_per_image_max, enabled=size_enabled))
 
 
 def confirm_args(title: str, args: argparse.Namespace) -> argparse.Namespace | None:
@@ -745,6 +750,10 @@ def build_seg_export_cli_preview(args: argparse.Namespace) -> str:
     parts.extend(["--max-instances-per-image", str(args.max_instances_per_image)])
     parts.extend(["--max-instances-per-class-per-image", str(args.max_instances_per_class_per_image)])
     parts.extend(["--instance-density-penalty", str(args.instance_density_penalty)])
+    parts.extend(["--size-ratio", str(args.size_ratio)])
+    parts.extend(["--size-balance-weight", str(args.size_balance_weight)])
+    parts.extend(["--avg-instances-per-image-min", str(args.avg_instances_per_image_min)])
+    parts.extend(["--avg-instances-per-image-max", str(args.avg_instances_per_image_max)])
     parts.extend(["--export-suffix", str(args.export_suffix)])
     return " ".join(parts)
 
@@ -2223,6 +2232,10 @@ def build_interactive_args() -> argparse.Namespace | None:
             max_instances_per_image=rt.SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_IMAGE,
             max_instances_per_class_per_image=rt.SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_CLASS_PER_IMAGE,
             instance_density_penalty=rt.SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY,
+            size_ratio=rt.SEG_EXPORT_DEFAULT_SIZE_RATIO,
+            size_balance_weight=rt.SEG_EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT,
+            avg_instances_per_image_min=rt.SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MIN,
+            avg_instances_per_image_max=rt.SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MAX,
             export_suffix=rt.SEG_EXPORT_DEFAULT_EXPORT_SUFFIX,
         )
         print("\n导出策略: 只询问总图数，其余阈值基于 EDA 和目标图数自动联合推导。")
@@ -2693,6 +2706,10 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=rt.SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY,
     )
+    seg_export_parser.add_argument("--size-ratio", type=str, default=rt.SEG_EXPORT_DEFAULT_SIZE_RATIO)
+    seg_export_parser.add_argument("--size-balance-weight", type=float, default=rt.SEG_EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT)
+    seg_export_parser.add_argument("--avg-instances-per-image-min", type=float, default=rt.SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MIN)
+    seg_export_parser.add_argument("--avg-instances-per-image-max", type=float, default=rt.SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MAX)
     seg_export_parser.add_argument(
         "--export-suffix", type=str, default=rt.SEG_EXPORT_DEFAULT_EXPORT_SUFFIX
     )
