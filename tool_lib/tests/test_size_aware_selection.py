@@ -8,6 +8,7 @@ from tool_lib.det_analysis import (
     size_deficit_score,
     density_steer_term,
     select_balanced_train_candidates,
+    allocate_size_bucket_targets_per_split,
 )
 from tool_lib.det_shared import ExportImageCandidate
 
@@ -98,3 +99,23 @@ def test_size_ratio_off_uses_legacy_celf():
         size_balance_weight=0.0,
     )
     assert summary["selection_algorithm"] == "celf_lazy_greedy"
+
+
+def test_split_size_targets_proportional_and_exclude_tiny():
+    cands = [_cand(f"c{i}", {0: 1}) for i in range(10)]
+    buckets = {}
+    for i, c in enumerate(cands):
+        # 每图 1 个 small 框；外加前 5 张各 1 个 tiny（tiny 不计目标）
+        b = {"tiny": 1 if i < 5 else 0, "small": 1, "medium": 0, "large": 0}
+        buckets[c.rel_path.as_posix() + "|train"] = b
+    targets = allocate_size_bucket_targets_per_split(
+        selected_candidates=cands,
+        size_buckets_by_candidate=buckets,
+        split_image_targets={"train": 8, "val": 1, "test": 1},
+    )
+    # small 总数 10，按 8:1:1 → train 8 / val 1 / test 1
+    assert targets["train"]["small"] == 8
+    assert targets["val"]["small"] == 1
+    assert targets["test"]["small"] == 1
+    # tiny 不进目标
+    assert "tiny" not in targets["train"]
