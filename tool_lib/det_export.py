@@ -117,6 +117,11 @@ def _select_balanced_train_candidates_compat(
     target_images_per_class,
     box_density_penalty,
     progress_callback,
+    size_buckets_by_candidate=None,
+    target_size_ratio=None,
+    size_balance_weight=0.0,
+    avg_boxes_per_image_min=0.0,
+    avg_boxes_per_image_max=0.0,
 ):
     kwargs = {
         "candidates": candidates,
@@ -129,6 +134,12 @@ def _select_balanced_train_candidates_compat(
     }
     if _supports_keyword_arg(select_balanced_train_candidates, "progress_callback"):
         kwargs["progress_callback"] = progress_callback
+    if _supports_keyword_arg(select_balanced_train_candidates, "size_buckets_by_candidate"):
+        kwargs["size_buckets_by_candidate"] = size_buckets_by_candidate
+        kwargs["target_size_ratio"] = target_size_ratio
+        kwargs["size_balance_weight"] = size_balance_weight
+        kwargs["avg_boxes_per_image_min"] = avg_boxes_per_image_min
+        kwargs["avg_boxes_per_image_max"] = avg_boxes_per_image_max
     return select_balanced_train_candidates(**kwargs)
 
 
@@ -770,6 +781,10 @@ def export_filtered_dataset(
     max_boxes_per_image: int,
     max_boxes_per_class_per_image: int,
     box_density_penalty: float,
+    size_ratio: str = "",
+    size_balance_weight: float = 1.0,
+    avg_boxes_per_image_min: float = 0.0,
+    avg_boxes_per_image_max: float = 0.0,
 ) -> Path:
     """异常安全的对外入口：rename 之前任何步骤失败都会清理 __export_tmp。"""
     state: dict[str, Any] = {"temp_dir": None, "renamed": False}
@@ -793,6 +808,10 @@ def export_filtered_dataset(
             max_boxes_per_image=max_boxes_per_image,
             max_boxes_per_class_per_image=max_boxes_per_class_per_image,
             box_density_penalty=box_density_penalty,
+            size_ratio=size_ratio,
+            size_balance_weight=size_balance_weight,
+            avg_boxes_per_image_min=avg_boxes_per_image_min,
+            avg_boxes_per_image_max=avg_boxes_per_image_max,
             _state=state,
         )
     except BaseException:
@@ -822,6 +841,10 @@ def _export_filtered_dataset_impl(
     max_boxes_per_image: int,
     max_boxes_per_class_per_image: int,
     box_density_penalty: float,
+    size_ratio: str = "",
+    size_balance_weight: float = 1.0,
+    avg_boxes_per_image_min: float = 0.0,
+    avg_boxes_per_image_max: float = 0.0,
     _state: dict[str, Any],
 ) -> Path:
     total_stage_count = 11
@@ -1118,6 +1141,16 @@ def _export_filtered_dataset_impl(
     kept_names = {idx: safe_class_name(class_names, class_id) for class_id, idx in class_id_mapping.items()}
 
     pooled_candidates = pool_candidates(filtered_candidates_by_split)
+
+    # 尺寸感知：解析比例并扫描候选尺寸桶
+    from .det_size_supplement import parse_size_ratio
+    target_size_ratio = parse_size_ratio(size_ratio) if size_ratio.strip() else None
+    size_buckets_by_candidate = None
+    if target_size_ratio is not None:
+        size_buckets_by_candidate = scan_candidate_size_buckets(
+            pooled_candidates, class_id_mapping, cache_dir=source_root,
+        )
+
     selected_pooled_candidates, selection_summary = _select_balanced_train_candidates_compat(
         candidates=pooled_candidates,
         kept_class_ids=kept_class_ids,
@@ -1127,6 +1160,11 @@ def _export_filtered_dataset_impl(
         target_images_per_class=effective_target_images_per_class,
         box_density_penalty=effective_box_density_penalty,
         progress_callback=_make_live_progress_callback("Balanced Selection", single_line=True),
+        size_buckets_by_candidate=size_buckets_by_candidate,
+        target_size_ratio=target_size_ratio,
+        size_balance_weight=size_balance_weight,
+        avg_boxes_per_image_min=avg_boxes_per_image_min,
+        avg_boxes_per_image_max=avg_boxes_per_image_max,
     )
     stage_idx += 1
     _log_export_stage(
@@ -1152,6 +1190,7 @@ def _export_filtered_dataset_impl(
         split_image_targets=split_image_targets,
         desired_box_targets_by_split=desired_box_targets_by_split,
         kept_class_ids=kept_class_ids,
+        size_buckets_by_candidate=size_buckets_by_candidate,
     )
     stage_idx += 1
     missing_coverage_counts = cast(dict[str, int], repartition_summary.get("missing_image_coverage_counts", {}))
@@ -1344,6 +1383,12 @@ def _export_filtered_dataset_impl(
                 "borderline_kept_class_analysis": borderline_kept_class_analysis,
                 "filter_summary": filter_summary,
                 "selection_summary": selection_summary,
+                "size_ratio_requested": size_ratio,
+                "target_size_ratio": target_size_ratio,
+                "size_balance_weight": size_balance_weight,
+                "avg_boxes_per_image_min": avg_boxes_per_image_min,
+                "avg_boxes_per_image_max": avg_boxes_per_image_max,
+                "size_selection_summary": selection_summary if target_size_ratio else None,
                 "repartition_summary": repartition_summary,
                 "split_image_targets": split_image_targets_compact,
                 "selected_split_stats": exported_split_stats,
@@ -1422,5 +1467,9 @@ def run_export(args) -> None:
         max_boxes_per_image=args.max_boxes_per_image,
         max_boxes_per_class_per_image=args.max_boxes_per_class_per_image,
         box_density_penalty=args.box_density_penalty,
+        size_ratio=args.size_ratio,
+        size_balance_weight=args.size_balance_weight,
+        avg_boxes_per_image_min=args.avg_boxes_per_image_min,
+        avg_boxes_per_image_max=args.avg_boxes_per_image_max,
     )
     print(f"Filtered dataset exported to: {export_root}")
