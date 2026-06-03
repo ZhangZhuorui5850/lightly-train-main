@@ -537,6 +537,11 @@ def print_det_export_preview(args: argparse.Namespace) -> None:
     print(_det_export_strategy_text("max_boxes_per_image", args.max_boxes_per_image, enabled=args.auto_balance))
     print(_det_export_strategy_text("max_boxes_per_class_per_image", args.max_boxes_per_class_per_image, enabled=args.auto_balance))
     print(_det_export_strategy_text("box_density_penalty", args.box_density_penalty, enabled=args.auto_balance))
+    print(f"  size_ratio: {compact_display_value(args.size_ratio)}")
+    size_enabled = bool(str(args.size_ratio).strip())
+    print(_det_export_strategy_text("size_balance_weight", args.size_balance_weight, enabled=size_enabled))
+    print(_det_export_strategy_text("avg_boxes_per_image_min", args.avg_boxes_per_image_min, enabled=size_enabled))
+    print(_det_export_strategy_text("avg_boxes_per_image_max", args.avg_boxes_per_image_max, enabled=size_enabled))
 
 
 def _seg_export_strategy_text(label: str, value, *, enabled: bool = True) -> str:
@@ -702,6 +707,10 @@ def build_det_cli_preview(args: argparse.Namespace) -> str:
         parts.extend(["--max-boxes-per-image", str(args.max_boxes_per_image)])
         parts.extend(["--max-boxes-per-class-per-image", str(args.max_boxes_per_class_per_image)])
         parts.extend(["--box-density-penalty", str(args.box_density_penalty)])
+        parts.extend(["--size-ratio", str(args.size_ratio)])
+        parts.extend(["--size-balance-weight", str(args.size_balance_weight)])
+        parts.extend(["--avg-boxes-per-image-min", str(args.avg_boxes_per_image_min)])
+        parts.extend(["--avg-boxes-per-image-max", str(args.avg_boxes_per_image_max)])
         parts.extend(["--export-suffix", str(args.export_suffix)])
     elif args.command == "eda":
         parts.extend(["--data", str(args.data)])
@@ -1952,11 +1961,85 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
     return None
 
 
+def _build_clean_args() -> argparse.Namespace | None:
+    """实验清理交互流程。"""
+    from . import exp_cleaner
+
+    # Step 1: 扫描并生成报告
+    print("\n正在扫描实验目录...")
+    analyses = exp_cleaner.scan_experiments()
+    if not analyses:
+        print("未扫描到任何实验目录，无需清理。")
+        return None
+
+    exp_cleaner.print_clean_report(analyses)
+
+    # Step 2: 用户标记重要实验
+    print("请输入要保留完整文件的重要实验编号（逗号分隔，如 1,4；留空表示全部清理）:")
+    raw = read_input("> ").strip()
+
+    important_indices: set[int] = set()
+    if raw:
+        for part in raw.split(","):
+            part = part.strip()
+            if part.isdigit():
+                idx = int(part) - 1
+                if 0 <= idx < len(analyses):
+                    important_indices.add(idx)
+                else:
+                    print(f"  警告: 编号 {part} 超出范围，已忽略。")
+
+    if important_indices:
+        print("\n已标记为重要（跳过清理）:")
+        for idx in sorted(important_indices):
+            print(f"  ✅ {exp_cleaner.compact_display(analyses[idx].exp_dir)}")
+        print()
+
+    # 过滤出待清理的实验
+    to_clean = [a for i, a in enumerate(analyses) if i not in important_indices]
+    if not to_clean:
+        print("所有实验都已标记为重要，无需清理。")
+        return None
+
+    # Step 3: 展示清理预览
+    exp_cleaner.print_clean_preview(to_clean)
+
+    total_cleanable = sum(a.cleanable_size for a in to_clean)
+    print(f"总计释放: {exp_cleaner.format_size(total_cleanable)}")
+    print()
+
+    # Step 4: 确认
+    confirm = prompt_yes_no("确认执行清理吗", False)
+    if not confirm:
+        print("已取消清理。")
+        return None
+
+    # Step 5: 执行清理
+    print("\n正在清理...")
+    entries = exp_cleaner.execute_clean(to_clean)
+
+    # Step 6: 写日志
+    if entries:
+        exp_cleaner.write_clean_log(entries)
+
+    released = sum(e.size_bytes for e in entries)
+    print(f"\n清理完成！释放空间: {exp_cleaner.format_size(released)}")
+
+    args = argparse.Namespace(
+        tool_task="clean",
+        tool_action="clean",
+        analyses=to_clean,
+    )
+    return args
+
+
 def build_interactive_args() -> argparse.Namespace | None:
     task = prompt_choice(
         "请选择任务类型",
-        [("cls", "cls 分类"), ("det", "det 检测"), ("seg", "seg 分割"), ("data", "data 数据集转换")],
+        [("cls", "cls 分类"), ("det", "det 检测"), ("seg", "seg 分割"), ("data", "data 数据集转换"), ("clean", "clean 实验清理（释放磁盘空间）")],
     )
+    if task == "clean":
+        return _build_clean_args()
     if task == "data":
         source_dir = prompt_convert_source_dir()
         output_name = prompt_directory_name("输出数据集目录名", source_dir.name)
@@ -2173,6 +2256,10 @@ def build_interactive_args() -> argparse.Namespace | None:
             max_boxes_per_image=rt.EXPORT_DEFAULT_MAX_BOXES_PER_IMAGE,
             max_boxes_per_class_per_image=rt.EXPORT_DEFAULT_MAX_BOXES_PER_CLASS_PER_IMAGE,
             box_density_penalty=rt.EXPORT_DEFAULT_BOX_DENSITY_PENALTY,
+            size_ratio=rt.EXPORT_DEFAULT_SIZE_RATIO,
+            size_balance_weight=rt.EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT,
+            avg_boxes_per_image_min=rt.EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN,
+            avg_boxes_per_image_max=rt.EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX,
             export_suffix=rt.EXPORT_DEFAULT_EXPORT_SUFFIX,
         )
         print("\n导出策略: 只询问总图数，其余阈值基于 EDA 和目标图数自动联合推导。")
@@ -2529,6 +2616,10 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=rt.EXPORT_DEFAULT_MAX_BOXES_PER_CLASS_PER_IMAGE,
     )
     export_parser.add_argument("--box-density-penalty", type=float, default=rt.EXPORT_DEFAULT_BOX_DENSITY_PENALTY)
+    export_parser.add_argument("--size-ratio", type=str, default=rt.EXPORT_DEFAULT_SIZE_RATIO)
+    export_parser.add_argument("--size-balance-weight", type=float, default=rt.EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT)
+    export_parser.add_argument("--avg-boxes-per-image-min", type=float, default=rt.EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN)
+    export_parser.add_argument("--avg-boxes-per-image-max", type=float, default=rt.EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX)
     export_parser.add_argument("--export-suffix", type=str, default=rt.EXPORT_DEFAULT_EXPORT_SUFFIX)
 
     seg_export_parser = subparsers.add_parser("seg-export")

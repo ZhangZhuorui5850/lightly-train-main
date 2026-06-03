@@ -124,6 +124,10 @@ EXPORT_DEFAULT_TARGET_BOXES_PER_CLASS = 0
 EXPORT_DEFAULT_MAX_BOXES_PER_IMAGE = 0
 EXPORT_DEFAULT_MAX_BOXES_PER_CLASS_PER_IMAGE = 0
 EXPORT_DEFAULT_BOX_DENSITY_PENALTY = 0.0
+EXPORT_DEFAULT_SIZE_RATIO = "30:40:30"
+EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT = 1.0
+EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN = 5.0
+EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX = 15.0
 EXPORT_DEFAULT_EXPORT_SUFFIX = "_A"
 
 SEG_DATASET_DIR = ROOT_DIR / "datasets" / "neu_dataset" / "dataset_seg"
@@ -293,6 +297,10 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global EXPORT_DEFAULT_MAX_BOXES_PER_IMAGE
     global EXPORT_DEFAULT_MAX_BOXES_PER_CLASS_PER_IMAGE
     global EXPORT_DEFAULT_BOX_DENSITY_PENALTY
+    global EXPORT_DEFAULT_SIZE_RATIO
+    global EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT
+    global EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN
+    global EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX
     global EXPORT_DEFAULT_EXPORT_SUFFIX
     global SEG_DATASET_DIR
     global SEMANTIC_SEG_DATASET_DIR
@@ -445,6 +453,18 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     )
     EXPORT_DEFAULT_BOX_DENSITY_PENALTY = float(
         settings.get("det_export_box_density_penalty", EXPORT_DEFAULT_BOX_DENSITY_PENALTY)
+    )
+    EXPORT_DEFAULT_SIZE_RATIO = str(
+        settings.get("det_export_size_ratio", EXPORT_DEFAULT_SIZE_RATIO)
+    )
+    EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT = float(
+        settings.get("det_export_size_balance_weight", EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT)
+    )
+    EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN = float(
+        settings.get("det_export_avg_boxes_per_image_min", EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN)
+    )
+    EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX = float(
+        settings.get("det_export_avg_boxes_per_image_max", EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX)
     )
     EXPORT_DEFAULT_EXPORT_SUFFIX = str(
         settings.get("det_export_suffix", EXPORT_DEFAULT_EXPORT_SUFFIX)

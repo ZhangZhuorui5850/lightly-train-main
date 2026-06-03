@@ -106,6 +106,14 @@ DET_SETTINGS = {
     "det_export_max_boxes_per_image": 0,
     "det_export_max_boxes_per_class_per_image": 0,
     "det_export_box_density_penalty": 0.0,
+    # det_export_size_ratio:
+    #   目标尺寸占比 小:中:大（排除 tiny<16²）。默认 "30:40:30"，填 "" 关闭尺寸感知、回退旧选图。
+    "det_export_size_ratio": "30:40:30",
+    # det_export_size_balance_weight: 尺寸赤字相对类别赤字的联合权重，默认 1.0。
+    "det_export_size_balance_weight": 1.0,
+    # det_export_avg_boxes_per_image_min/max: 平均每图框数软目标区间，默认 5~15；都填 0 关闭。
+    "det_export_avg_boxes_per_image_min": 5,
+    "det_export_avg_boxes_per_image_max": 15,
     "det_export_suffix": "_A",
 }
 
