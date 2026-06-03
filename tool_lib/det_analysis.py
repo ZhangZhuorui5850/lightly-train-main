@@ -1221,6 +1221,56 @@ def score_export_candidate(
     density_weight = 1.0 / (1.0 + max(candidate.total_boxes - 1, 0) * max(box_density_penalty, 0.0))
     return (shortage_score + (0.1 * rarity_bonus)) * density_weight
 
+
+RATIO_BUCKET_NAMES = ("small", "medium", "large")
+
+
+def ratio_bucket_props(buckets: dict[str, int]) -> dict[str, float]:
+    """small/medium/large 占比（分母排除 tiny）。"""
+    total = sum(int(buckets.get(name, 0)) for name in RATIO_BUCKET_NAMES)
+    if total <= 0:
+        return {name: 0.0 for name in RATIO_BUCKET_NAMES}
+    return {name: buckets.get(name, 0) / total for name in RATIO_BUCKET_NAMES}
+
+
+def size_deficit_score(
+    cand_buckets: dict[str, int],
+    current_buckets: dict[str, int],
+    target_ratio: dict[str, float],
+    *,
+    over_penalty: float = 1.0,
+) -> float:
+    """候选图对"当前亏空尺寸桶"的贡献减去对超标桶的惩罚（赤字驱动）。"""
+    props = ratio_bucket_props(current_buckets)
+    score = 0.0
+    for name in RATIO_BUCKET_NAMES:
+        deficit = max(0.0, target_ratio.get(name, 0.0) - props[name])
+        over = max(0.0, props[name] - target_ratio.get(name, 0.0))
+        boxes = cand_buckets.get(name, 0)
+        score += deficit * boxes - over_penalty * over * boxes
+    return score
+
+
+def density_steer_term(
+    *,
+    total_boxes: int,
+    current_avg: float,
+    lo: float,
+    hi: float,
+) -> float:
+    """平均框数软导向：低于 lo 奖励多框图，高于 hi 奖励少框图，带内为 0。
+
+    返回带符号的方向项，量纲为"框数"，由调用方乘以内置权重后并入总分。
+    """
+    if lo <= 0.0 and hi <= 0.0:
+        return 0.0
+    if current_avg < lo:
+        return float(total_boxes)
+    if hi > 0.0 and current_avg > hi:
+        return -float(total_boxes)
+    return 0.0
+
+
 def fallback_fill_score(
     *,
     candidate: ExportImageCandidate,
@@ -1429,6 +1479,11 @@ def select_balanced_train_candidates(
     target_images_per_class: int,
     box_density_penalty: float,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    size_buckets_by_candidate: dict[str, dict[str, int]] | None = None,
+    target_size_ratio: dict[str, float] | None = None,
+    size_balance_weight: float = 0.0,
+    avg_boxes_per_image_min: float = 0.0,
+    avg_boxes_per_image_max: float = 0.0,
 ) -> tuple[list[ExportImageCandidate], dict[str, Any]]:
     """CELF (Cost-Effective Lazy Forward) 懒贪心平衡选图。
 
@@ -1455,6 +1510,22 @@ def select_balanced_train_candidates(
     复杂度：Phase 1 ≈ O((N+K) log N)；Phase 2 ≤ O(R log R)。
     内存：O(N + 已推回的过期堆条目)。
     """
+    if target_size_ratio:
+        return _select_size_aware_candidates(
+            candidates=candidates,
+            kept_class_ids=kept_class_ids,
+            target_total_images=target_total_images,
+            target_boxes_per_class=target_boxes_per_class,
+            balance_ratio=balance_ratio,
+            target_images_per_class=target_images_per_class,
+            box_density_penalty=box_density_penalty,
+            size_buckets_by_candidate=size_buckets_by_candidate or {},
+            target_size_ratio=target_size_ratio,
+            size_balance_weight=size_balance_weight,
+            avg_boxes_per_image_min=avg_boxes_per_image_min,
+            avg_boxes_per_image_max=avg_boxes_per_image_max,
+            progress_callback=progress_callback,
+        )
     effective_target_total_images, target_total_images_summary = derive_effective_target_total_images(
         requested_target_total_images=target_total_images,
         available_total_images=len(candidates),
@@ -1685,6 +1756,109 @@ def select_balanced_train_candidates(
     return selected, summary
 
 
+DENSITY_STEER_WEIGHT = 0.5
+
+
+def _candidate_size_key(candidate: ExportImageCandidate) -> str:
+    return candidate.rel_path.as_posix() + "|" + candidate.split_name
+
+
+def _select_size_aware_candidates(
+    *,
+    candidates: list[ExportImageCandidate],
+    kept_class_ids: list[int],
+    target_total_images: int,
+    target_boxes_per_class: int,
+    balance_ratio: float,
+    target_images_per_class: int,
+    box_density_penalty: float,
+    size_buckets_by_candidate: dict[str, dict[str, int]],
+    target_size_ratio: dict[str, float],
+    size_balance_weight: float,
+    avg_boxes_per_image_min: float,
+    avg_boxes_per_image_max: float,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    batch_size: int = 200,
+) -> tuple[list[ExportImageCandidate], dict[str, Any]]:
+    """分批赤字贪心：类别赤字 + size_balance_weight·尺寸赤字 + 密度软导向。
+
+    每批按当前已选状态重算尺寸占比与平均框数，对剩余候选打分取 top，直到达
+    target_total_images（>0）或候选耗尽。target_total_images<=0 时退化为"取尽
+    所有正分候选"。
+    """
+    available_box_counts = count_candidate_boxes_per_class(candidates, kept_class_ids)
+    n = len(candidates)
+    target_n = target_total_images if target_total_images > 0 else n
+
+    selected: list[ExportImageCandidate] = []
+    selected_box_counts = {class_id: 0 for class_id in kept_class_ids}
+    current_buckets = {name: 0 for name in ("tiny", "small", "medium", "large")}
+    total_selected_boxes = 0
+    remaining = list(candidates)
+    chosen_keys: set[str] = set()
+
+    def _class_deficit_score(c: ExportImageCandidate) -> float:
+        s = 0.0
+        for class_id, cnt in c.class_box_counts.items():
+            avail = max(available_box_counts.get(class_id, 0), 1)
+            s += cnt / avail
+        return s
+
+    def _score(c: ExportImageCandidate) -> float:
+        key = _candidate_size_key(c)
+        buckets = size_buckets_by_candidate.get(key, {})
+        class_score = _class_deficit_score(c)
+        size_score = size_deficit_score(buckets, current_buckets, target_size_ratio)
+        cur_avg = (total_selected_boxes / len(selected)) if selected else 0.0
+        density = density_steer_term(
+            total_boxes=c.total_boxes,
+            current_avg=cur_avg,
+            lo=avg_boxes_per_image_min,
+            hi=avg_boxes_per_image_max,
+        )
+        return class_score + size_balance_weight * size_score + DENSITY_STEER_WEIGHT * density
+
+    while remaining and len(selected) < target_n:
+        ranked = sorted(remaining, key=lambda c: (-_score(c), c.total_boxes, c.rel_path.as_posix()))
+        took_any = False
+        for c in ranked:
+            if len(selected) >= target_n or (len(selected) % batch_size == 0 and took_any):
+                break
+            key = _candidate_size_key(c)
+            buckets = size_buckets_by_candidate.get(key, {})
+            for name in ("tiny", "small", "medium", "large"):
+                current_buckets[name] += buckets.get(name, 0)
+            for class_id, cnt in c.class_box_counts.items():
+                selected_box_counts[class_id] += cnt
+            total_selected_boxes += c.total_boxes
+            selected.append(c)
+            chosen_keys.add(key)
+            took_any = True
+        remaining = [c for c in remaining if _candidate_size_key(c) not in chosen_keys]
+        if not took_any:
+            break
+        if progress_callback is not None:
+            progress_callback(min(len(selected), target_n), max(target_n, 1),
+                              f"size-aware pick={len(selected)}/{target_n}")
+
+    selected.sort(key=lambda item: item.rel_path.as_posix())
+    achieved = ratio_bucket_props(current_buckets)
+    summary = {
+        "selection_algorithm": "size_aware_greedy",
+        "available_total_images": n,
+        "effective_target_total_images": target_n,
+        "selected_boxes_per_class": selected_box_counts,
+        "achieved_size_buckets": dict(current_buckets),
+        "achieved_size_ratio": achieved,
+        "target_size_ratio": dict(target_size_ratio),
+        "size_balance_weight": size_balance_weight,
+        "avg_boxes_per_image_achieved": (total_selected_boxes / len(selected)) if selected else 0.0,
+        "avg_boxes_per_image_min": avg_boxes_per_image_min,
+        "avg_boxes_per_image_max": avg_boxes_per_image_max,
+    }
+    return selected, summary
+
+
 def pool_candidates(candidates_by_split: dict[str, list[ExportImageCandidate]]) -> list[ExportImageCandidate]:
     pooled: list[ExportImageCandidate] = []
     for split_name in ("train", "val", "test"):
@@ -1785,6 +1959,45 @@ def allocate_box_targets_per_split(
             remainders.sort()
         for split_name in ("train", "val", "test"):
             desired[split_name][class_id] = class_targets[split_name]
+    return desired
+
+
+def allocate_size_bucket_targets_per_split(
+    *,
+    selected_candidates: list[ExportImageCandidate],
+    size_buckets_by_candidate: dict[str, dict[str, int]],
+    split_image_targets: dict[str, int],
+) -> dict[str, dict[str, int]]:
+    """按 split 图数比例给每 split 分配 small/medium/large 目标框数（排除 tiny）。"""
+    desired: dict[str, dict[str, int]] = {
+        split_name: {name: 0 for name in RATIO_BUCKET_NAMES}
+        for split_name in ("train", "val", "test")
+    }
+    total_images = len(selected_candidates)
+    if total_images <= 0:
+        return desired
+    bucket_totals = {name: 0 for name in RATIO_BUCKET_NAMES}
+    for c in selected_candidates:
+        b = size_buckets_by_candidate.get(_candidate_size_key(c), {})
+        for name in RATIO_BUCKET_NAMES:
+            bucket_totals[name] += int(b.get(name, 0))
+    for name in RATIO_BUCKET_NAMES:
+        total = bucket_totals[name]
+        raw = {
+            s: total * split_image_targets.get(s, 0) / total_images
+            for s in ("train", "val", "test")
+        }
+        alloc = {s: int(raw[s]) for s in raw}
+        assigned = sum(alloc.values())
+        rema = sorted(((raw[s] - alloc[s], s) for s in ("train", "val", "test")))
+        while assigned < total:
+            _, s = rema.pop()
+            alloc[s] += 1
+            assigned += 1
+            rema.append((0.0, s))
+            rema.sort()
+        for s in ("train", "val", "test"):
+            desired[s][name] = alloc[s]
     return desired
 
 
@@ -1900,6 +2113,7 @@ def assign_candidates_to_new_splits(
     split_image_targets: dict[str, int],
     desired_box_targets_by_split: dict[str, dict[int, int]],
     kept_class_ids: list[int],
+    size_buckets_by_candidate: dict[str, dict[str, int]] | None = None,
 ) -> tuple[dict[str, list[ExportImageCandidate]], dict[str, Any]]:
     assigned_candidates: dict[str, list[ExportImageCandidate]] = {
         "train": [],
@@ -1927,6 +2141,18 @@ def assign_candidates_to_new_splits(
         "test": {class_id: 0 for class_id in kept_class_ids},
     }
     remaining_image_targets = dict(split_image_targets)
+    size_targets_by_split = (
+        allocate_size_bucket_targets_per_split(
+            selected_candidates=selected_candidates,
+            size_buckets_by_candidate=size_buckets_by_candidate,
+            split_image_targets=split_image_targets,
+        )
+        if size_buckets_by_candidate
+        else None
+    )
+    assigned_size_counts = {
+        s: {name: 0 for name in RATIO_BUCKET_NAMES} for s in ("train", "val", "test")
+    }
     ordered_candidates = sorted(
         selected_candidates,
         key=lambda item: (-item.total_boxes, -len(item.class_box_counts), item.rel_path.as_posix(), item.split_name),
@@ -1943,6 +2169,16 @@ def assign_candidates_to_new_splits(
         for class_id in kept_class_ids
         if sum(1 for candidate in selected_candidates if class_id in candidate.class_box_counts) < len(active_splits)
     }
+
+    def _size_gain(cand: ExportImageCandidate, split_name: str) -> float:
+        if not size_targets_by_split or not size_buckets_by_candidate:
+            return 0.0
+        b = size_buckets_by_candidate.get(_candidate_size_key(cand), {})
+        g = 0.0
+        for name in RATIO_BUCKET_NAMES:
+            if assigned_size_counts[split_name][name] < size_targets_by_split[split_name][name]:
+                g += int(b.get(name, 0))
+        return g
 
     while remaining_candidates:
         best_candidate_idx = -1
@@ -1977,7 +2213,8 @@ def assign_candidates_to_new_splits(
                     if remaining_box_need > 0:
                         deficit_gain += min(box_count, remaining_box_need)
                 smaller_split_bonus = 1.0 / max(split_image_targets.get(split_name, 0), 1)
-                score = (coverage_gain * 1000.0) + (image_deficit_gain * 100.0) + deficit_gain + smaller_split_bonus
+                size_gain = _size_gain(candidate, split_name) * 0.01  # tie-break 级权重
+                score = (coverage_gain * 1000.0) + (image_deficit_gain * 100.0) + deficit_gain + smaller_split_bonus + size_gain
                 should_take = False
                 if best_split == "" or score > best_score + 1e-12:
                     should_take = True
@@ -2007,6 +2244,10 @@ def assign_candidates_to_new_splits(
         for class_id, box_count in candidate.class_box_counts.items():
             assigned_box_counts[best_split][class_id] += box_count
             assigned_image_counts[best_split][class_id] += 1
+        if size_buckets_by_candidate:
+            b = size_buckets_by_candidate.get(_candidate_size_key(candidate), {})
+            for name in RATIO_BUCKET_NAMES:
+                assigned_size_counts[best_split][name] += int(b.get(name, 0))
 
     for candidate in remaining_candidates:
         best_split = ""
@@ -2051,6 +2292,10 @@ def assign_candidates_to_new_splits(
         for class_id, box_count in candidate.class_box_counts.items():
             assigned_box_counts[best_split][class_id] += box_count
             assigned_image_counts[best_split][class_id] += 1
+        if size_buckets_by_candidate:
+            b = size_buckets_by_candidate.get(_candidate_size_key(candidate), {})
+            for name in RATIO_BUCKET_NAMES:
+                assigned_size_counts[best_split][name] += int(b.get(name, 0))
 
     for split_name in assigned_candidates:
         assigned_candidates[split_name].sort(key=lambda item: (item.rel_path.as_posix(), item.split_name))

@@ -106,7 +106,28 @@ DET_SETTINGS = {
     "det_export_max_boxes_per_image": 0,
     "det_export_max_boxes_per_class_per_image": 0,
     "det_export_box_density_penalty": 0.0,
+    # det_export_size_ratio:
+    #   目标尺寸占比 小:中:大（排除 tiny<16²）。默认 "30:40:30"，填 "" 关闭尺寸感知、回退旧选图。
+    "det_export_size_ratio": "30:40:30",
+    # det_export_size_balance_weight: 尺寸赤字相对类别赤字的联合权重，默认 1.0。
+    "det_export_size_balance_weight": 1.0,
+    # det_export_avg_boxes_per_image_min/max: 平均每图框数软目标区间，默认 5~15；都填 0 关闭。
+    "det_export_avg_boxes_per_image_min": 5,
+    "det_export_avg_boxes_per_image_max": 15,
     "det_export_suffix": "_A",
+}
+
+# SAHI 切片推理配置：只影响 det infer，且仅当命令行带 --sahi 时才启用。
+# 不加 --sahi 时整条 infer 流程与以前完全一致，这里的参数也不会生效。
+# 这里只调默认切片参数；要不要切片由 --sahi 决定，所以 det_sahi_enabled 保持 False。
+SAHI_SETTINGS = {
+    "det_sahi_enabled": False,        # 保持 False：是否切片由命令行 --sahi 决定
+    "det_sahi_overlap": 0.2,          # tile 重叠比例 [0,1)
+    "det_sahi_nms_iou": 0.3,          # tile 间 NMS 的 IoU 阈值
+    "det_sahi_global_local_iou": 0.1, # 全局/局部一致性匹配阈值
+    # True：短边 < 模型 tile(通常640) 的小图自动跳过 SAHI、回退普通推理。
+    # 小图上 SAHI 反而更差，开启后混合尺寸数据集里大图切片、小图走普通推理。
+    "det_sahi_skip_small_images": True,
 }
 
 # 分类配置：后面如果要统一 cls 默认路径，就加在这里
@@ -176,6 +197,11 @@ SEG_SETTINGS = {
     "seg_export_max_instances_per_image": 0,
     "seg_export_max_instances_per_class_per_image": 0,
     "seg_export_instance_density_penalty": 0.0,
+    # seg_export_size_ratio: 目标掩码尺寸占比 小:中:大（排除 tiny）。默认 "30:40:30"，"" 关闭。
+    "seg_export_size_ratio": "30:40:30",
+    "seg_export_size_balance_weight": 1.0,
+    "seg_export_avg_instances_per_image_min": 5,
+    "seg_export_avg_instances_per_image_max": 15,
     "seg_export_suffix": "_A",
 }
 
@@ -185,6 +211,7 @@ def build_user_settings() -> dict[str, object]:
     settings.update(COMMON_SETTINGS)
     settings.update(CLS_SETTINGS)
     settings.update(DET_SETTINGS)
+    settings.update(SAHI_SETTINGS)
     settings.update(SEG_SETTINGS)
     return settings
 

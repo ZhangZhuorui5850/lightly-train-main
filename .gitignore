@@ -284,3 +284,6 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.toptal.com/developers/gitignore/api/macos,windows,linux,python
+backup_resume_fix/
+_git_state.sh
+_do_versioning.sh

@@ -1458,9 +1458,6 @@ def _train_task_from_config(config: TrainTaskConfig) -> None:
             "Contact us at https://www.lightly.ai/contact to discuss the best licensing option for your use case."
         )
 
-        # TODO(Guarin, 02/26): Add best metric to state?
-        best_agg_metric_values: BestAggregatedMetricValues | None = None
-
         state = TrainTaskState(
             train_model=train_model,
             optimizer=optimizer,
@@ -1485,6 +1482,16 @@ def _train_task_from_config(config: TrainTaskConfig) -> None:
 
         # Add license info after loading as it might be missing from the checkpoint.
         state["license_info"] = LICENSE_INFO
+
+        # Best validation metric tracker. It is persisted in `state` (and therefore in the
+        # checkpoint) so resuming does not reset it: otherwise the first validation after
+        # resume would unconditionally be treated as a new best and overwrite the best
+        # checkpoint with a (potentially worse) model. `resume_from_checkpoint` restores it
+        # from the checkpoint when available; otherwise it defaults to None.
+        best_agg_metric_values: BestAggregatedMetricValues | None = state.get(
+            "best_agg_metric_values"
+        )
+        state["best_agg_metric_values"] = best_agg_metric_values
 
         # TODO(Guarin, 07/25): Replace with infinite batch sampler instead to avoid
         # reloading dataloader after every epoch? Is this preferred over persistent workers?
@@ -1672,6 +1679,9 @@ def _train_task_from_config(config: TrainTaskConfig) -> None:
                             step=step,
                             metric_args=config.metric_args,
                         )
+                        # Keep the persisted state in sync so the next checkpoint save
+                        # (last.ckpt) stores the up-to-date best metric for resuming.
+                        state["best_agg_metric_values"] = best_agg_metric_values
 
                         timer_agg = timer.get_aggregated_metrics(fabric)
 

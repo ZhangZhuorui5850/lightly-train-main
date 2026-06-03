@@ -97,6 +97,14 @@ INFER_DEFAULT_METRIC_CLASSWISE = False
 INFER_DEFAULT_SAVE_TEST_REPORT = True
 INFER_DEFAULT_REPORT_PATH = INFER_DEFAULT_OUTPUT_DIR / "test_report.json"
 
+# SAHI 切片推理默认参数（仅 infer --sahi 时生效）
+INFER_DEFAULT_SAHI = False
+INFER_DEFAULT_SAHI_OVERLAP = 0.2
+INFER_DEFAULT_SAHI_NMS_IOU = 0.3
+INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU = 0.1
+# True 时：短边 < 模型 tile 的小图自动跳过 SAHI、回退普通 predict（小图上 SAHI 会更差）。
+INFER_DEFAULT_SAHI_SKIP_SMALL = True
+
 EVAL_DEFAULT_DATA = DATASET_DIR / "data.yaml"
 EVAL_DEFAULT_OUTPUT_DIR = EXPERIMENT_DIR / "infer-test"
 EVAL_DEFAULT_REPORT_PATH = EVAL_DEFAULT_OUTPUT_DIR / "test_report.json"
@@ -116,6 +124,10 @@ EXPORT_DEFAULT_TARGET_BOXES_PER_CLASS = 0
 EXPORT_DEFAULT_MAX_BOXES_PER_IMAGE = 0
 EXPORT_DEFAULT_MAX_BOXES_PER_CLASS_PER_IMAGE = 0
 EXPORT_DEFAULT_BOX_DENSITY_PENALTY = 0.0
+EXPORT_DEFAULT_SIZE_RATIO = "30:40:30"
+EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT = 1.0
+EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN = 5.0
+EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX = 15.0
 EXPORT_DEFAULT_EXPORT_SUFFIX = "_A"
 
 SEG_DATASET_DIR = ROOT_DIR / "datasets" / "neu_dataset" / "dataset_seg"
@@ -137,6 +149,10 @@ SEG_EXPORT_DEFAULT_TARGET_INSTANCES_PER_CLASS = 0
 SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_IMAGE = 0
 SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_CLASS_PER_IMAGE = 0
 SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY = 0.0
+SEG_EXPORT_DEFAULT_SIZE_RATIO = "30:40:30"
+SEG_EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT = 1.0
+SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MIN = 5.0
+SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MAX = 15.0
 SEG_EXPORT_DEFAULT_EXPORT_SUFFIX = "_A"
 
 TRAIN_CLS_SCRIPT = ROOT_DIR / "train_cls.py"
@@ -285,6 +301,10 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global EXPORT_DEFAULT_MAX_BOXES_PER_IMAGE
     global EXPORT_DEFAULT_MAX_BOXES_PER_CLASS_PER_IMAGE
     global EXPORT_DEFAULT_BOX_DENSITY_PENALTY
+    global EXPORT_DEFAULT_SIZE_RATIO
+    global EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT
+    global EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN
+    global EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX
     global EXPORT_DEFAULT_EXPORT_SUFFIX
     global SEG_DATASET_DIR
     global SEMANTIC_SEG_DATASET_DIR
@@ -305,6 +325,10 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_IMAGE
     global SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_CLASS_PER_IMAGE
     global SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY
+    global SEG_EXPORT_DEFAULT_SIZE_RATIO
+    global SEG_EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT
+    global SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MIN
+    global SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MAX
     global SEG_EXPORT_DEFAULT_EXPORT_SUFFIX
     global TRAIN_CLS_SCRIPT
     global TRAIN_DET_SCRIPT
@@ -316,6 +340,11 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global DEFAULT_SCORE_THRESHOLD
     global INFER_DEFAULT_SCORE_THRESHOLD
     global INFER_DEFAULT_REPORT_IOU_THRESHOLD
+    global INFER_DEFAULT_SAHI
+    global INFER_DEFAULT_SAHI_OVERLAP
+    global INFER_DEFAULT_SAHI_NMS_IOU
+    global INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU
+    global INFER_DEFAULT_SAHI_SKIP_SMALL
 
     def _path(key: str, current: Path) -> Path:
         value = settings.get(key)
@@ -348,6 +377,19 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     INFER_DEFAULT_SCORE_THRESHOLD = DEFAULT_SCORE_THRESHOLD
     INFER_DEFAULT_REPORT_IOU_THRESHOLD = float(
         settings.get("det_report_iou_threshold", INFER_DEFAULT_REPORT_IOU_THRESHOLD)
+    )
+    INFER_DEFAULT_SAHI = bool(settings.get("det_sahi_enabled", INFER_DEFAULT_SAHI))
+    INFER_DEFAULT_SAHI_OVERLAP = float(
+        settings.get("det_sahi_overlap", INFER_DEFAULT_SAHI_OVERLAP)
+    )
+    INFER_DEFAULT_SAHI_NMS_IOU = float(
+        settings.get("det_sahi_nms_iou", INFER_DEFAULT_SAHI_NMS_IOU)
+    )
+    INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU = float(
+        settings.get("det_sahi_global_local_iou", INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU)
+    )
+    INFER_DEFAULT_SAHI_SKIP_SMALL = bool(
+        settings.get("det_sahi_skip_small_images", INFER_DEFAULT_SAHI_SKIP_SMALL)
     )
 
     default_data_yaml = DATASET_DIR / "data.yaml"
@@ -419,6 +461,18 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     )
     EXPORT_DEFAULT_BOX_DENSITY_PENALTY = float(
         settings.get("det_export_box_density_penalty", EXPORT_DEFAULT_BOX_DENSITY_PENALTY)
+    )
+    EXPORT_DEFAULT_SIZE_RATIO = str(
+        settings.get("det_export_size_ratio", EXPORT_DEFAULT_SIZE_RATIO)
+    )
+    EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT = float(
+        settings.get("det_export_size_balance_weight", EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT)
+    )
+    EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN = float(
+        settings.get("det_export_avg_boxes_per_image_min", EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN)
+    )
+    EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX = float(
+        settings.get("det_export_avg_boxes_per_image_max", EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX)
     )
     EXPORT_DEFAULT_EXPORT_SUFFIX = str(
         settings.get("det_export_suffix", EXPORT_DEFAULT_EXPORT_SUFFIX)
@@ -500,6 +554,18 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
             "seg_export_instance_density_penalty",
             SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY,
         )
+    )
+    SEG_EXPORT_DEFAULT_SIZE_RATIO = str(
+        settings.get("seg_export_size_ratio", SEG_EXPORT_DEFAULT_SIZE_RATIO)
+    )
+    SEG_EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT = float(
+        settings.get("seg_export_size_balance_weight", SEG_EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT)
+    )
+    SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MIN = float(
+        settings.get("seg_export_avg_instances_per_image_min", SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MIN)
+    )
+    SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MAX = float(
+        settings.get("seg_export_avg_instances_per_image_max", SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MAX)
     )
     SEG_EXPORT_DEFAULT_EXPORT_SUFFIX = str(
         settings.get("seg_export_suffix", SEG_EXPORT_DEFAULT_EXPORT_SUFFIX)
@@ -1297,7 +1363,7 @@ def render_scalar_plot_matplotlib(
     temp_path = _temporary_image_output_path(output_path)
 
     fig, ax = plt.subplots(figsize=(12.8, 7.2), dpi=120)
-    fig.patch.set_facecolor("#fafbfc")
+    fig.set_facecolor("#fafbfc")
     ax.set_facecolor("#ffffff")
     palette = ["#2c7bb6", "#d73027", "#27ae60", "#8e44ad", "#e67e22"]
 
@@ -1321,7 +1387,7 @@ def render_scalar_plot_matplotlib(
     ax.legend(loc="best", frameon=False, fontsize=10)
     try:
         fig.tight_layout()
-        fig.savefig(temp_path, bbox_inches="tight")
+        fig.savefig(str(temp_path), bbox_inches="tight")
     finally:
         plt.close(fig)
     return _finalize_image_output(temp_path, output_path)

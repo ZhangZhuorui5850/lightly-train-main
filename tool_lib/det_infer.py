@@ -555,6 +555,74 @@ def maybe_create_metric(compute_metrics: bool, class_names: dict[int, str], clas
     )
     return metric, label_mapping
 
+# mAP 是基于排序的指标：必须吃全量带分预测，由指标内部用 score 画 PR 曲线。
+# 若在喂指标前按 score 阈值过滤，会截断 PR 曲线、人为压低 mAP，且与训练内部
+# 验证不一致——训练 validation_step 直接把 postprocessor 的全量输出喂给 map_metric，
+# 不做任何 score 阈值过滤。因此推理评估时对预测恒用 0.0 阈值（保留全部预测）。
+# 注意：lightly_train 的 model.predict 使用 `scores > threshold`（严格大于），
+# 0.0 会丢弃恰好为 0 的预测，这对 mAP 无影响（0 分预测排在末尾不改变插值 AP）。
+METRIC_PREDICT_THRESHOLD = 0.0
+
+
+def predict_for_infer(model, predict_path, args):
+    """统一的前向入口：默认走 model.predict；args.sahi 为真时走切片推理。
+
+    普通 predict 用 METRIC_PREDICT_THRESHOLD（0.0）做全量预测，score 过滤交给下游
+    filter_records_by_score，保证不开 --sahi 时行为与旧版完全一致。
+
+    SAHI 不能传 0.0：predict_sahi 内部要做 tile 间 NMS + 全局/局部合并，喂 0.0 会把
+    每个 tile 的几百个近零分框灌进合并逻辑、污染结果（实测比传真实阈值少框且更差）。
+    因此 SAHI 直接传真实 score_threshold，与独立脚本/实际部署行为一致。
+    """
+    if not getattr(args, "sahi", False):
+        return model.predict(predict_path, threshold=METRIC_PREDICT_THRESHOLD)
+
+    sahi_threshold = float(getattr(args, "score_threshold", rt.INFER_DEFAULT_SCORE_THRESHOLD))
+
+    # 小图处理：图比模型 tile 小时有两种策略（由 det_sahi_skip_small_images 开关决定）。
+    #   1) 跳过 SAHI、回退普通 predict（默认）：小图上 SAHI 会更差，直接用整图推理更稳。
+    #   2) 兜底放大：用 PIL 放大到至少一个 tile（保持 uint8，绕开 lightly tile_image 对
+    #      uint8 做 F.interpolate 的 "Byte" 报错），切片后再把框坐标按比例缩回原图。
+    image_arg: Any = str(predict_path)
+    scale = 1.0
+    tile_size = getattr(model, "image_size", (640, 640))
+    with rt.Image.open(predict_path) as im:
+        w, h = im.size
+        tile_h, tile_w = int(tile_size[0]), int(tile_size[1])
+        if h < tile_h or w < tile_w:
+            if getattr(args, "sahi_skip_small", rt.INFER_DEFAULT_SAHI_SKIP_SMALL):
+                return model.predict(predict_path, threshold=METRIC_PREDICT_THRESHOLD)
+            import math
+
+            scale = max(tile_h / h, tile_w / w)
+            new_w, new_h = math.ceil(w * scale), math.ceil(h * scale)
+            image_arg = im.convert("RGB").resize(
+                (new_w, new_h), rt.Image.Resampling.BILINEAR
+            )
+
+    prediction = model.predict_sahi(
+        image=image_arg,
+        threshold=sahi_threshold,
+        overlap=getattr(args, "sahi_overlap", rt.INFER_DEFAULT_SAHI_OVERLAP),
+        nms_iou_threshold=getattr(args, "sahi_nms_iou", rt.INFER_DEFAULT_SAHI_NMS_IOU),
+        global_local_iou_threshold=getattr(
+            args, "sahi_global_local_iou", rt.INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU
+        ),
+    )
+    if scale != 1.0 and len(prediction["bboxes"]) > 0:
+        prediction["bboxes"] = prediction["bboxes"] / scale  # 框坐标缩回原图尺寸
+    return prediction
+
+
+def filter_records_by_score(records: list[dict[str, Any]], score_threshold: float) -> list[dict[str, Any]]:
+    """按 score 阈值过滤记录，供可视化 / JSON / TXT / legacy 报表使用。
+
+    与 model.predict 的 `scores > threshold` 语义保持一致（严格大于），
+    以保证开启该阈值后这些产物的输出与旧行为完全相同。
+    """
+    return [record for record in records if record["score"] > score_threshold]
+
+
 def update_metric(metric, label_mapping: dict[int, int], prediction, gt_boxes, gt_labels) -> None:
     if metric is None:
         return
@@ -776,6 +844,23 @@ def build_parallel_child_command(
         command.append("--save-test-report")
     if args.overwrite:
         command.append("--overwrite")
+    if getattr(args, "sahi", False):
+        command.extend(
+            [
+                "--sahi",
+                "--sahi-overlap",
+                str(getattr(args, "sahi_overlap", rt.INFER_DEFAULT_SAHI_OVERLAP)),
+                "--sahi-nms-iou",
+                str(getattr(args, "sahi_nms_iou", rt.INFER_DEFAULT_SAHI_NMS_IOU)),
+                "--sahi-global-local-iou",
+                str(getattr(args, "sahi_global_local_iou", rt.INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU)),
+            ]
+        )
+        command.append(
+            "--sahi-skip-small"
+            if getattr(args, "sahi_skip_small", rt.INFER_DEFAULT_SAHI_SKIP_SMALL)
+            else "--no-sahi-skip-small"
+        )
     if getattr(args, "dry_run", False):
         command.append("--dry-run")
     if getattr(args, "skip_important_artifacts", False):
@@ -1065,9 +1150,13 @@ def run_multi_split_shard_infer(args) -> None:
                     predict_path = _prepare_rgb_predict_path(image, sample, _rgb_scratch)
 
             infer_start = time.perf_counter()
-            prediction = model.predict(predict_path, threshold=args.score_threshold)
+            # 全量预测（供 mAP 用）；score 阈值过滤只作用于可视化/JSON/TXT/legacy 报表。
+            prediction = predict_for_infer(model, predict_path, args)
             state["infer_time_sum_ms"] += (time.perf_counter() - infer_start) * 1000.0
-            records = prediction_records(prediction, class_names, image_size)
+            records = filter_records_by_score(
+                prediction_records(prediction, class_names, image_size),
+                args.score_threshold,
+            )
 
             gt_boxes, gt_labels, has_label = load_ground_truth(sample.label_path, image_size)
 
@@ -1501,9 +1590,13 @@ def run_single_infer(args) -> None:
                     predict_path = _prepare_rgb_predict_path(image, sample, _rgb_scratch)
 
             infer_start = time.perf_counter()
-            prediction = model.predict(predict_path, threshold=args.score_threshold)
+            # 全量预测（供 mAP 用）；score 阈值过滤只作用于可视化/JSON/TXT/legacy 报表。
+            prediction = predict_for_infer(model, predict_path, args)
             infer_time_sum_ms += (time.perf_counter() - infer_start) * 1000.0
-            records = prediction_records(prediction, class_names, image_size)
+            records = filter_records_by_score(
+                prediction_records(prediction, class_names, image_size),
+                args.score_threshold,
+            )
 
             if sample.label_path is not None:
                 label_path_cur = sample.label_path

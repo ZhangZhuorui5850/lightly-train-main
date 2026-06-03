@@ -367,8 +367,8 @@ def run_conversion(
         print(f"SEG_ROOT     : {(output_root / seg_root_name).resolve()}")
 
     def _invoke_labelme_to_yolo(synced_root: Path, override_task: str | None = None) -> None:
-        original_policy = convert_module.EXISTING_OUTPUT_POLICY
-        convert_module.EXISTING_OUTPUT_POLICY = "clean"
+        original_policy = convert_module.EXISTING_OUTPUT_POLICY  # type: ignore[reportAttributeAccessIssue]
+        convert_module.EXISTING_OUTPUT_POLICY = "clean"  # type: ignore[reportAttributeAccessIssue]
         original_argv = sys.argv[:]
         try:
             sys.argv = [
@@ -387,7 +387,7 @@ def run_conversion(
             convert_module.main()
         finally:
             sys.argv = original_argv
-            convert_module.EXISTING_OUTPUT_POLICY = original_policy
+            convert_module.EXISTING_OUTPUT_POLICY = original_policy  # type: ignore[reportAttributeAccessIssue]
 
     # ── Semantic seg: self-contained path, skips LabelMeToYOLO ──────────
     if need_seg and resolved_seg_type == "semantic":

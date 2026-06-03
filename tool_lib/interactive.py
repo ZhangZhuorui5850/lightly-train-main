@@ -537,6 +537,11 @@ def print_det_export_preview(args: argparse.Namespace) -> None:
     print(_det_export_strategy_text("max_boxes_per_image", args.max_boxes_per_image, enabled=args.auto_balance))
     print(_det_export_strategy_text("max_boxes_per_class_per_image", args.max_boxes_per_class_per_image, enabled=args.auto_balance))
     print(_det_export_strategy_text("box_density_penalty", args.box_density_penalty, enabled=args.auto_balance))
+    print(f"  size_ratio: {compact_display_value(args.size_ratio)}")
+    size_enabled = bool(str(args.size_ratio).strip())
+    print(_det_export_strategy_text("size_balance_weight", args.size_balance_weight, enabled=size_enabled))
+    print(_det_export_strategy_text("avg_boxes_per_image_min", args.avg_boxes_per_image_min, enabled=size_enabled))
+    print(_det_export_strategy_text("avg_boxes_per_image_max", args.avg_boxes_per_image_max, enabled=size_enabled))
 
 
 def _seg_export_strategy_text(label: str, value, *, enabled: bool = True) -> str:
@@ -580,6 +585,11 @@ def print_seg_export_preview(args: argparse.Namespace) -> None:
     print(_seg_export_strategy_text("max_instances_per_image", args.max_instances_per_image, enabled=args.auto_balance))
     print(_seg_export_strategy_text("max_instances_per_class_per_image", args.max_instances_per_class_per_image, enabled=args.auto_balance))
     print(_seg_export_strategy_text("instance_density_penalty", args.instance_density_penalty, enabled=args.auto_balance))
+    print(f"  size_ratio: {compact_display_value(args.size_ratio)}")
+    size_enabled = bool(str(args.size_ratio).strip())
+    print(_seg_export_strategy_text("size_balance_weight", args.size_balance_weight, enabled=size_enabled))
+    print(_seg_export_strategy_text("avg_instances_per_image_min", args.avg_instances_per_image_min, enabled=size_enabled))
+    print(_seg_export_strategy_text("avg_instances_per_image_max", args.avg_instances_per_image_max, enabled=size_enabled))
 
 
 def confirm_args(title: str, args: argparse.Namespace) -> argparse.Namespace | None:
@@ -702,6 +712,10 @@ def build_det_cli_preview(args: argparse.Namespace) -> str:
         parts.extend(["--max-boxes-per-image", str(args.max_boxes_per_image)])
         parts.extend(["--max-boxes-per-class-per-image", str(args.max_boxes_per_class_per_image)])
         parts.extend(["--box-density-penalty", str(args.box_density_penalty)])
+        parts.extend(["--size-ratio", str(args.size_ratio)])
+        parts.extend(["--size-balance-weight", str(args.size_balance_weight)])
+        parts.extend(["--avg-boxes-per-image-min", str(args.avg_boxes_per_image_min)])
+        parts.extend(["--avg-boxes-per-image-max", str(args.avg_boxes_per_image_max)])
         parts.extend(["--export-suffix", str(args.export_suffix)])
     elif args.command == "eda":
         parts.extend(["--data", str(args.data)])
@@ -736,6 +750,10 @@ def build_seg_export_cli_preview(args: argparse.Namespace) -> str:
     parts.extend(["--max-instances-per-image", str(args.max_instances_per_image)])
     parts.extend(["--max-instances-per-class-per-image", str(args.max_instances_per_class_per_image)])
     parts.extend(["--instance-density-penalty", str(args.instance_density_penalty)])
+    parts.extend(["--size-ratio", str(args.size_ratio)])
+    parts.extend(["--size-balance-weight", str(args.size_balance_weight)])
+    parts.extend(["--avg-instances-per-image-min", str(args.avg_instances_per_image_min)])
+    parts.extend(["--avg-instances-per-image-max", str(args.avg_instances_per_image_max)])
     parts.extend(["--export-suffix", str(args.export_suffix)])
     return " ".join(parts)
 
@@ -1952,11 +1970,85 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
     return None
 
 
+def _build_clean_args() -> argparse.Namespace | None:
+    """实验清理交互流程。"""
+    from . import exp_cleaner
+
+    # Step 1: 扫描并生成报告
+    print("\n正在扫描实验目录...")
+    analyses = exp_cleaner.scan_experiments()
+    if not analyses:
+        print("未扫描到任何实验目录，无需清理。")
+        return None
+
+    exp_cleaner.print_clean_report(analyses)
+
+    # Step 2: 用户标记重要实验
+    print("请输入要保留完整文件的重要实验编号（逗号分隔，如 1,4；留空表示全部清理）:")
+    raw = read_input("> ").strip()
+
+    important_indices: set[int] = set()
+    if raw:
+        for part in raw.split(","):
+            part = part.strip()
+            if part.isdigit():
+                idx = int(part) - 1
+                if 0 <= idx < len(analyses):
+                    important_indices.add(idx)
+                else:
+                    print(f"  警告: 编号 {part} 超出范围，已忽略。")
+
+    if important_indices:
+        print("\n已标记为重要（跳过清理）:")
+        for idx in sorted(important_indices):
+            print(f"  ✅ {exp_cleaner.compact_display(analyses[idx].exp_dir)}")
+        print()
+
+    # 过滤出待清理的实验
+    to_clean = [a for i, a in enumerate(analyses) if i not in important_indices]
+    if not to_clean:
+        print("所有实验都已标记为重要，无需清理。")
+        return None
+
+    # Step 3: 展示清理预览
+    exp_cleaner.print_clean_preview(to_clean)
+
+    total_cleanable = sum(a.cleanable_size for a in to_clean)
+    print(f"总计释放: {exp_cleaner.format_size(total_cleanable)}")
+    print()
+
+    # Step 4: 确认
+    confirm = prompt_yes_no("确认执行清理吗", False)
+    if not confirm:
+        print("已取消清理。")
+        return None
+
+    # Step 5: 执行清理
+    print("\n正在清理...")
+    entries = exp_cleaner.execute_clean(to_clean)
+
+    # Step 6: 写日志
+    if entries:
+        exp_cleaner.write_clean_log(entries)
+
+    released = sum(e.size_bytes for e in entries)
+    print(f"\n清理完成！释放空间: {exp_cleaner.format_size(released)}")
+
+    args = argparse.Namespace(
+        tool_task="clean",
+        tool_action="clean",
+        analyses=to_clean,
+    )
+    return args
+
+
 def build_interactive_args() -> argparse.Namespace | None:
     task = prompt_choice(
         "请选择任务类型",
-        [("cls", "cls 分类"), ("det", "det 检测"), ("seg", "seg 分割"), ("data", "data 数据集转换")],
+        [("cls", "cls 分类"), ("det", "det 检测"), ("seg", "seg 分割"), ("data", "data 数据集转换"), ("clean", "clean 实验清理（释放磁盘空间）")],
     )
+    if task == "clean":
+        return _build_clean_args()
     if task == "data":
         source_dir = prompt_convert_source_dir()
         output_name = prompt_directory_name("输出数据集目录名", source_dir.name)
@@ -2140,6 +2232,10 @@ def build_interactive_args() -> argparse.Namespace | None:
             max_instances_per_image=rt.SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_IMAGE,
             max_instances_per_class_per_image=rt.SEG_EXPORT_DEFAULT_MAX_INSTANCES_PER_CLASS_PER_IMAGE,
             instance_density_penalty=rt.SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY,
+            size_ratio=rt.SEG_EXPORT_DEFAULT_SIZE_RATIO,
+            size_balance_weight=rt.SEG_EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT,
+            avg_instances_per_image_min=rt.SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MIN,
+            avg_instances_per_image_max=rt.SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MAX,
             export_suffix=rt.SEG_EXPORT_DEFAULT_EXPORT_SUFFIX,
         )
         print("\n导出策略: 只询问总图数，其余阈值基于 EDA 和目标图数自动联合推导。")
@@ -2173,6 +2269,10 @@ def build_interactive_args() -> argparse.Namespace | None:
             max_boxes_per_image=rt.EXPORT_DEFAULT_MAX_BOXES_PER_IMAGE,
             max_boxes_per_class_per_image=rt.EXPORT_DEFAULT_MAX_BOXES_PER_CLASS_PER_IMAGE,
             box_density_penalty=rt.EXPORT_DEFAULT_BOX_DENSITY_PENALTY,
+            size_ratio=rt.EXPORT_DEFAULT_SIZE_RATIO,
+            size_balance_weight=rt.EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT,
+            avg_boxes_per_image_min=rt.EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN,
+            avg_boxes_per_image_max=rt.EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX,
             export_suffix=rt.EXPORT_DEFAULT_EXPORT_SUFFIX,
         )
         print("\n导出策略: 只询问总图数，其余阈值基于 EDA 和目标图数自动联合推导。")
@@ -2248,6 +2348,12 @@ def build_interactive_args() -> argparse.Namespace | None:
             if use_custom
             else False,
             infer_config_mode=config_mode,
+            # SAHI 开关：由 launcher.py 的 det_sahi_enabled 决定，不在菜单里提问。
+            sahi=rt.INFER_DEFAULT_SAHI,
+            sahi_overlap=rt.INFER_DEFAULT_SAHI_OVERLAP,
+            sahi_nms_iou=rt.INFER_DEFAULT_SAHI_NMS_IOU,
+            sahi_global_local_iou=rt.INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU,
+            sahi_skip_small=rt.INFER_DEFAULT_SAHI_SKIP_SMALL,
         )
         if mode == "dataset":
             args.split = prompt_det_infer_split(
@@ -2447,6 +2553,20 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     infer_parser.add_argument("--metric-classwise", action="store_true", default=rt.INFER_DEFAULT_METRIC_CLASSWISE)
     infer_parser.add_argument("--save-test-report", action="store_true", default=rt.INFER_DEFAULT_SAVE_TEST_REPORT)
     infer_parser.add_argument("--report-path", type=Path, default=None)
+    # SAHI 切片推理：仅 --task det 时生效；不加 --sahi 时流程与旧版完全一致。
+    infer_parser.add_argument("--sahi", action="store_true", default=rt.INFER_DEFAULT_SAHI)
+    infer_parser.add_argument("--sahi-overlap", dest="sahi_overlap", type=float, default=rt.INFER_DEFAULT_SAHI_OVERLAP)
+    infer_parser.add_argument("--sahi-nms-iou", dest="sahi_nms_iou", type=float, default=rt.INFER_DEFAULT_SAHI_NMS_IOU)
+    infer_parser.add_argument(
+        "--sahi-global-local-iou",
+        dest="sahi_global_local_iou",
+        type=float,
+        default=rt.INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU,
+    )
+    # 短边 < tile 的小图是否跳过 SAHI、回退普通 predict（小图上 SAHI 会更差）。
+    infer_parser.add_argument("--sahi-skip-small", dest="sahi_skip_small", action="store_true")
+    infer_parser.add_argument("--no-sahi-skip-small", dest="sahi_skip_small", action="store_false")
+    infer_parser.set_defaults(sahi_skip_small=rt.INFER_DEFAULT_SAHI_SKIP_SMALL)
     infer_parser.add_argument("--overwrite", action="store_true", default=rt.INFER_DEFAULT_OVERWRITE)
     infer_parser.add_argument("--dry-run", action="store_true", default=False)
     infer_parser.add_argument("--skip-important-artifacts", action="store_true", default=False, help=argparse.SUPPRESS)
@@ -2509,6 +2629,10 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=rt.EXPORT_DEFAULT_MAX_BOXES_PER_CLASS_PER_IMAGE,
     )
     export_parser.add_argument("--box-density-penalty", type=float, default=rt.EXPORT_DEFAULT_BOX_DENSITY_PENALTY)
+    export_parser.add_argument("--size-ratio", type=str, default=rt.EXPORT_DEFAULT_SIZE_RATIO)
+    export_parser.add_argument("--size-balance-weight", type=float, default=rt.EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT)
+    export_parser.add_argument("--avg-boxes-per-image-min", type=float, default=rt.EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN)
+    export_parser.add_argument("--avg-boxes-per-image-max", type=float, default=rt.EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX)
     export_parser.add_argument("--export-suffix", type=str, default=rt.EXPORT_DEFAULT_EXPORT_SUFFIX)
 
     seg_export_parser = subparsers.add_parser("seg-export")
@@ -2582,6 +2706,10 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=rt.SEG_EXPORT_DEFAULT_INSTANCE_DENSITY_PENALTY,
     )
+    seg_export_parser.add_argument("--size-ratio", type=str, default=rt.SEG_EXPORT_DEFAULT_SIZE_RATIO)
+    seg_export_parser.add_argument("--size-balance-weight", type=float, default=rt.SEG_EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT)
+    seg_export_parser.add_argument("--avg-instances-per-image-min", type=float, default=rt.SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MIN)
+    seg_export_parser.add_argument("--avg-instances-per-image-max", type=float, default=rt.SEG_EXPORT_DEFAULT_AVG_INSTANCES_PER_IMAGE_MAX)
     seg_export_parser.add_argument(
         "--export-suffix", type=str, default=rt.SEG_EXPORT_DEFAULT_EXPORT_SUFFIX
     )
