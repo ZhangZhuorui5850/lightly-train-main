@@ -52,6 +52,7 @@ from .seg_shared import (
 )
 
 
+TINY_OBJECT_AREA_THRESHOLD = 16.0 * 16.0
 SMALL_OBJECT_AREA_THRESHOLD = 32.0 * 32.0
 MEDIUM_OBJECT_AREA_THRESHOLD = 96.0 * 96.0
 SEG_DATASET_TAG_PREFIX = "seg"
@@ -188,7 +189,7 @@ def _safe_load_json(path: Path) -> dict[str, Any] | None:
 
 
 def _empty_size_bucket_counts() -> dict[str, int]:
-    return {"small": 0, "medium": 0, "large": 0}
+    return {name: 0 for name in ("tiny", "small", "medium", "large")}
 
 
 def _safe_ratio(numerator: int | float, denominator: int | float) -> float:
@@ -198,6 +199,8 @@ def _safe_ratio(numerator: int | float, denominator: int | float) -> float:
 
 
 def _bucket_mask_area(area_pixels: float) -> str:
+    if area_pixels < TINY_OBJECT_AREA_THRESHOLD:
+        return "tiny"
     if area_pixels < SMALL_OBJECT_AREA_THRESHOLD:
         return "small"
     if area_pixels < MEDIUM_OBJECT_AREA_THRESHOLD:
