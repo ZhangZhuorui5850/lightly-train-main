@@ -1221,6 +1221,56 @@ def score_export_candidate(
     density_weight = 1.0 / (1.0 + max(candidate.total_boxes - 1, 0) * max(box_density_penalty, 0.0))
     return (shortage_score + (0.1 * rarity_bonus)) * density_weight
 
+
+RATIO_BUCKET_NAMES = ("small", "medium", "large")
+
+
+def ratio_bucket_props(buckets: dict[str, int]) -> dict[str, float]:
+    """small/medium/large 占比（分母排除 tiny）。"""
+    total = sum(int(buckets.get(name, 0)) for name in RATIO_BUCKET_NAMES)
+    if total <= 0:
+        return {name: 0.0 for name in RATIO_BUCKET_NAMES}
+    return {name: buckets.get(name, 0) / total for name in RATIO_BUCKET_NAMES}
+
+
+def size_deficit_score(
+    cand_buckets: dict[str, int],
+    current_buckets: dict[str, int],
+    target_ratio: dict[str, float],
+    *,
+    over_penalty: float = 1.0,
+) -> float:
+    """候选图对"当前亏空尺寸桶"的贡献减去对超标桶的惩罚（赤字驱动）。"""
+    props = ratio_bucket_props(current_buckets)
+    score = 0.0
+    for name in RATIO_BUCKET_NAMES:
+        deficit = max(0.0, target_ratio.get(name, 0.0) - props[name])
+        over = max(0.0, props[name] - target_ratio.get(name, 0.0))
+        boxes = cand_buckets.get(name, 0)
+        score += deficit * boxes - over_penalty * over * boxes
+    return score
+
+
+def density_steer_term(
+    *,
+    total_boxes: int,
+    current_avg: float,
+    lo: float,
+    hi: float,
+) -> float:
+    """平均框数软导向：低于 lo 奖励多框图，高于 hi 奖励少框图，带内为 0。
+
+    返回带符号的方向项，量纲为"框数"，由调用方乘以内置权重后并入总分。
+    """
+    if lo <= 0.0 and hi <= 0.0:
+        return 0.0
+    if current_avg < lo:
+        return float(total_boxes)
+    if hi > 0.0 and current_avg > hi:
+        return -float(total_boxes)
+    return 0.0
+
+
 def fallback_fill_score(
     *,
     candidate: ExportImageCandidate,
