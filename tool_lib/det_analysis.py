@@ -1758,6 +1758,12 @@ def select_balanced_train_candidates(
 
 DENSITY_STEER_WEIGHT = 0.5
 
+# 划分阶段次级打分权重。类别覆盖(×1000)、每类图数覆盖(×100)严格优先于这两项；
+# 在它们之下，"每类框数均衡"与"尺寸桶均衡"以归一化分数(各 0~1)同量级竞争，
+# 避免原始 deficit_gain 奖励高框密度、把密集小目标图独占给 train。
+SPLIT_BOX_FILL_WEIGHT = 10.0
+SPLIT_SIZE_FILL_WEIGHT = 10.0
+
 
 def _candidate_size_key(candidate: ExportImageCandidate) -> str:
     return candidate.rel_path.as_posix() + "|" + candidate.split_name
@@ -2170,15 +2176,35 @@ def assign_candidates_to_new_splits(
         if sum(1 for candidate in selected_candidates if class_id in candidate.class_box_counts) < len(active_splits)
     }
 
-    def _size_gain(cand: ExportImageCandidate, split_name: str) -> float:
+    def _box_fill_fraction(cand: ExportImageCandidate, split_name: str) -> float:
+        """该候选有多大比例的框，落进该 split 仍亏空的每类框数配额（0~1，密度无关）。"""
+        total = cand.total_boxes
+        if total <= 0:
+            return 0.0
+        filled = 0.0
+        for class_id, box_count in cand.class_box_counts.items():
+            need = (
+                desired_box_targets_by_split[split_name][class_id]
+                - assigned_box_counts[split_name][class_id]
+            )
+            if need > 0:
+                filled += min(box_count, need)
+        return filled / total
+
+    def _size_fill_fraction(cand: ExportImageCandidate, split_name: str) -> float:
+        """该候选有多大比例的(小/中/大)框，落进该 split 仍亏空的尺寸桶配额（0~1）。"""
         if not size_targets_by_split or not size_buckets_by_candidate:
             return 0.0
         b = size_buckets_by_candidate.get(_candidate_size_key(cand), {})
-        g = 0.0
+        sized_total = sum(int(b.get(name, 0)) for name in RATIO_BUCKET_NAMES)
+        if sized_total <= 0:
+            return 0.0
+        filled = 0.0
         for name in RATIO_BUCKET_NAMES:
-            if assigned_size_counts[split_name][name] < size_targets_by_split[split_name][name]:
-                g += int(b.get(name, 0))
-        return g
+            need = size_targets_by_split[split_name][name] - assigned_size_counts[split_name][name]
+            if need > 0:
+                filled += min(int(b.get(name, 0)), need)
+        return filled / sized_total
 
     while remaining_candidates:
         best_candidate_idx = -1
@@ -2204,17 +2230,16 @@ def assign_candidates_to_new_splits(
                     for class_id in candidate.class_box_counts
                     if assigned_image_counts[split_name][class_id] < desired_image_targets_by_split[split_name][class_id]
                 )
-                deficit_gain = 0.0
-                for class_id, box_count in candidate.class_box_counts.items():
-                    remaining_box_need = (
-                        desired_box_targets_by_split[split_name][class_id]
-                        - assigned_box_counts[split_name][class_id]
-                    )
-                    if remaining_box_need > 0:
-                        deficit_gain += min(box_count, remaining_box_need)
                 smaller_split_bonus = 1.0 / max(split_image_targets.get(split_name, 0), 1)
-                size_gain = _size_gain(candidate, split_name) * 0.01  # tie-break 级权重
-                score = (coverage_gain * 1000.0) + (image_deficit_gain * 100.0) + deficit_gain + smaller_split_bonus + size_gain
+                box_fill = _box_fill_fraction(candidate, split_name)
+                size_fill = _size_fill_fraction(candidate, split_name)
+                score = (
+                    (coverage_gain * 1000.0)
+                    + (image_deficit_gain * 100.0)
+                    + (SPLIT_BOX_FILL_WEIGHT * box_fill)
+                    + (SPLIT_SIZE_FILL_WEIGHT * size_fill)
+                    + smaller_split_bonus
+                )
                 should_take = False
                 if best_split == "" or score > best_score + 1e-12:
                     should_take = True
@@ -2265,18 +2290,13 @@ def assign_candidates_to_new_splits(
                 for class_id in candidate.class_box_counts
                 if assigned_image_counts[split_name][class_id] < desired_image_targets_by_split[split_name][class_id]
             )
-            deficit_gain = 0.0
-            for class_id, box_count in candidate.class_box_counts.items():
-                remaining_box_need = (
-                    desired_box_targets_by_split[split_name][class_id]
-                    - assigned_box_counts[split_name][class_id]
-                )
-                if remaining_box_need > 0:
-                    deficit_gain += min(box_count, remaining_box_need)
+            box_fill = _box_fill_fraction(candidate, split_name)
+            size_fill = _size_fill_fraction(candidate, split_name)
             score = (
                 (coverage_gain * 1000.0)
                 + (image_deficit_gain * 100.0)
-                + deficit_gain
+                + (SPLIT_BOX_FILL_WEIGHT * box_fill)
+                + (SPLIT_SIZE_FILL_WEIGHT * size_fill)
                 + (0.01 * remaining_image_targets[split_name])
             )
             if best_split == "" or score > best_score:

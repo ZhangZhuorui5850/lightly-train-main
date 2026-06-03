@@ -121,6 +121,51 @@ def test_split_size_targets_proportional_and_exclude_tiny():
     assert "tiny" not in targets["train"]
 
 
+def test_split_assignment_balances_size_across_splits():
+    # 复现并防回归：全局池小目标密集图 + 大目标稀疏图各半，划分后
+    # 每个 split 的大目标占比都该接近全局（≈0.14），而不是大目标全漏进 val/test。
+    from tool_lib.det_analysis import (
+        assign_candidates_to_new_splits,
+        allocate_box_targets_per_split,
+    )
+
+    cands, buckets = [], {}
+    for i in range(20):
+        c = _cand(f"sd{i:02d}", {0: 6})  # small-dense：每图 6 个小目标
+        cands.append(c)
+        buckets[c.rel_path.as_posix() + "|train"] = {"tiny": 0, "small": 6, "medium": 0, "large": 0}
+    for i in range(20):
+        c = _cand(f"ls{i:02d}", {0: 1})  # large-sparse：每图 1 个大目标
+        cands.append(c)
+        buckets[c.rel_path.as_posix() + "|train"] = {"tiny": 0, "small": 0, "medium": 0, "large": 1}
+
+    split_image_targets = {"train": 32, "val": 4, "test": 4}
+    desired_box = allocate_box_targets_per_split(
+        selected_candidates=cands,
+        split_image_targets=split_image_targets,
+        kept_class_ids=[0],
+    )
+    assigned, _summary = assign_candidates_to_new_splits(
+        selected_candidates=cands,
+        split_image_targets=split_image_targets,
+        desired_box_targets_by_split=desired_box,
+        kept_class_ids=[0],
+        size_buckets_by_candidate=buckets,
+    )
+
+    def large_frac(split: str) -> float:
+        large = sum(buckets[c.rel_path.as_posix() + "|train"]["large"] for c in assigned[split])
+        small = sum(buckets[c.rel_path.as_posix() + "|train"]["small"] for c in assigned[split])
+        denom = large + small
+        return large / denom if denom else 0.0
+
+    fracs = {s: large_frac(s) for s in ("train", "val", "test")}
+    # 全局大目标占比≈0.14。旧实现把大目标稀疏图偏流给 val/test（≈0.33）。
+    # 修复后每个 split 都应接近全局，val/test 大目标占比不超过 0.25。
+    assert fracs["val"] <= 0.25, fracs
+    assert fracs["test"] <= 0.25, fracs
+
+
 def test_scan_candidate_size_buckets(tmp_path):
     from pathlib import Path as _P
     from tool_lib import common as rt
