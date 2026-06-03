@@ -6,7 +6,7 @@
 
 ## 1. 背景与问题
 
-检测/分割数据集导出（`tool_lib/det_export.py`、`tool_lib/seg_export.py`）当前按**类别**做均衡选图，并对单图框/实例密度做**硬上限**控制（`max_boxes_per_image` 等）。目标尺寸——小 `area < 32²px`、中 `32²px ≤ area < 96²px`、大 `area ≥ 96²px`——在导出流程里**只被统计、写进 EDA 报告，从不作为选图或划分目标**（见 [det_export.py:156-175,440-444](../../../tool_lib/det_export.py)）。
+检测/分割数据集导出（`tool_lib/det_export.py`、`tool_lib/seg_export.py`）当前按**类别**做均衡选图，并对单图框/实例密度做**硬上限**控制（`max_boxes_per_image` 等）。目标尺寸在导出流程里**只被统计、写进 EDA 报告，从不作为选图或划分目标**（见 [det_export.py:156-175,440-444](../../../tool_lib/det_export.py)）。当前分桶只有 3 档（small `<32²` / medium `32²~96²` / large `≥96²`），且把所有 `<32²` 的框都算作 small。
 
 后果：导出的均衡集尺寸分布完全由源数据决定，常见的小目标占比偏低；train/val/test 各 split 的尺寸分布也不受控。
 
@@ -19,6 +19,23 @@
 > 4. "平均 5-15 GT/图"按**数据集平均软目标**落地（保留每图硬上限，新增软导向）。
 > 5. **det + seg 同期实现**，写进同一份 spec。
 > 6. 选图引擎走**方案 A 双引擎**：尺寸目标关闭时走现有 CELF（零行为变化），开启时切到分批赤字贪心。
+
+## 1b. 尺寸分桶口径（4 档，重要）
+
+按框/实例的**像素面积**分 4 档，阈值 16² / 32² / 96²：
+
+| 档 | 面积区间 | 处理 |
+|---|---|---|
+| `tiny` | `< 16²`（<256px） | **只统计，不进比例分母**。极小框基本是噪声/难标，模型也学不动，不让它占小目标配额 |
+| `small` | `16² ≤ area < 32²` | "真·小目标"，进比例 |
+| `medium` | `32² ≤ area < 96²` | 主力，进比例 |
+| `large` | `≥ 96²` | 进比例 |
+
+- `size_ratio="25:50:25"` 的分母 = `small + medium + large` 框数（**排除 tiny**）。
+- tiny 框仍然照常**保留在导出的标签里**（不删框），只是不参与尺寸占比目标。
+- 需要把现有 `_bucket_box_area`（det）/ `_bucket_mask_area`（seg）从 3 档扩成 4 档，并保证依赖它的 EDA、size-supplement 行为相应更新（EDA 表新增 tiny 列）。
+
+> 向后兼容澄清：本设计承诺的"逐字节一致"针对**数据集内容**（选中哪些图、各 split 归属、重映射后的标签）。EDA 报告文本会新增 tiny 列属于**报告外观变化**，不影响数据集本身。
 
 ## 2. 关键技术约束
 
@@ -48,7 +65,7 @@ det 侧（`launcher.py` DEFAULT_SETTINGS）：
 
 | 键 | 默认 | 语义 |
 |---|---|---|
-| `det_export_size_ratio` | `""` | 空=关（现状 CELF）；`"25:50:25"`=小:中:大目标占比。解析复用 `det_size_supplement.parse_size_ratio` |
+| `det_export_size_ratio` | `"30:40:30"` | **默认开启**=小:中:大目标占比；填 `""` 才回退现状 CELF。解析复用 `det_size_supplement.parse_size_ratio` |
 | `det_export_size_balance_weight` | `1.0` | 尺寸赤字相对类别赤字的联合权重 |
 | `det_export_avg_boxes_per_image_min` | `5` | 平均 GT/图 软目标下限；0=关 |
 | `det_export_avg_boxes_per_image_max` | `15` | 平均 GT/图 软目标上限；0=关 |
@@ -64,7 +81,7 @@ seg 侧镜像（关键词"框"→"实例"，"boxes"→"instances"）：
 
 ### 5.1 候选尺寸桶扫描（新增，带缓存）
 
-新增函数（det_export 或新模块），对 filtered 候选逐图计算 `size_buckets={small,medium,large}`：
+新增函数（det_export 或新模块），对 filtered 候选逐图计算 `size_buckets={tiny,small,medium,large}`（tiny 仅统计，比例计算时排除）：
 - 复用 `det_size_supplement.ImageSizeCache`（键=绝对路径+mtime，落盘 `.imgsize_cache.json`）拿图片像素尺寸。
 - 复用 `det_size_supplement.bucket_label_lines` 对 YOLO 行分桶。
 - 产出 `size_buckets_by_candidate: dict[candidate_key, dict[str,int]]`（key 用 `rel_path.as_posix()+split`，与候选稳定对应）。
@@ -94,7 +111,7 @@ score(cand) =  类别赤字项                       # 原 score_export_candidat
              − over_penalty · 尺寸桶超标惩罚      # Σ_b max(0, cur_prop_b − r_b)·buckets_b[cand]
              + density_term(cand)                # §5.4
 ```
-- `cur_prop_b` = 当前已选集合按框数量计的 b 桶占比。
+- `cur_prop_b` = 当前已选集合按框数量计的 b 桶占比，**分母排除 tiny**（b ∈ {small,medium,large}）。
 - 类别赤字项沿用现有口径（`desired_box_counts − selected_box_counts`，availability 归一）。
 - 批大小约 200；每批选 top、更新状态、重算，直到达 `target_total_images`（或类别+尺寸双双达标、或候选耗尽）。
 - 候选耗尽仍未达比例 → 记 `size_shortfall`，不报错，按已选产出。
@@ -124,8 +141,8 @@ score(cand) =  类别赤字项                       # 原 score_export_candidat
 
 ## 8. 报告
 
-- `export_summary.json` 增加：`size_ratio`(requested/effective)、`achieved_size_ratio`、`size_shortfall`、`avg_boxes_per_image`(min/max/achieved)、每 split 尺寸占比。
-- EDA markdown 增加"目标 vs 实际尺寸占比"对照段与平均密度落点（参照 `det_size_supplement._render_supplement_markdown` 风格）。
+- `export_summary.json` 增加：`size_ratio`(requested/effective)、`achieved_size_ratio`（small/medium/large，排除 tiny）、`tiny_box_count`（单列统计）、`size_shortfall`、`avg_boxes_per_image`(min/max/achieved)、每 split 尺寸占比。
+- EDA markdown 增加 tiny 列、"目标 vs 实际尺寸占比"对照段与平均密度落点（参照 `det_size_supplement._render_supplement_markdown` 风格）。
 
 ## 9. 错误处理与兼容
 
@@ -133,12 +150,13 @@ score(cand) =  类别赤字项                       # 原 score_export_candidat
 - `avg_*_min > max`（且都 >0）→ 报错。
 - 源池尺寸供给不足 → **不报错**，记 `size_shortfall` 产出。
 - 缺 Pillow → 复用 `rt.ensure_plot_dependencies()` 报错路径。
-- **向后兼容铁律**：所有新参数留空/为 0 时，det 与 seg 的导出结果与改动前**逐字节一致**（CELF 路径与现有划分完全不走新分支）。
+- **默认行为变化（已确认）**：`size_ratio` 默认 `"30:40:30"`（**默认开启尺寸感知**），所以默认导出结果**会与改动前不同**——这正是本特性的目的。
+- **可退回保证**：把 `size_ratio` 显式填 `""` 时，det 与 seg 的导出结果与改动前**逐字节一致**（CELF 路径与现有划分完全不走新分支）。即旧行为仍可一键取回。
 
 ## 10. 测试策略
 
 用小型合成数据集（十几张图、人工构造已知尺寸的框/多边形）：
-1. 分桶边界正确（32²、96² 临界）。
+1. 分桶边界正确（16²、32²、96² 临界），tiny 不进比例分母。
 2. **回归保护**：`size_ratio` 关闭时，选图与划分结果与现有实现逐字节一致（直接对比 CELF 输出）。
 3. 尺寸模式下，达到的小/中/大占比朝目标**单调推进**，源池受限时正确记 `size_shortfall`。
 4. 每个 split 的尺寸占比近似一致（在容差内）。
