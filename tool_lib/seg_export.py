@@ -125,6 +125,11 @@ def _select_balanced_train_candidates_compat(
     target_images_per_class,
     box_density_penalty,
     progress_callback,
+    size_buckets_by_candidate=None,
+    target_size_ratio=None,
+    size_balance_weight=0.0,
+    avg_boxes_per_image_min=0.0,
+    avg_boxes_per_image_max=0.0,
 ):
     kwargs = {
         "candidates": candidates,
@@ -137,6 +142,12 @@ def _select_balanced_train_candidates_compat(
     }
     if _supports_keyword_arg(select_balanced_train_candidates, "progress_callback"):
         kwargs["progress_callback"] = progress_callback
+    if _supports_keyword_arg(select_balanced_train_candidates, "size_buckets_by_candidate"):
+        kwargs["size_buckets_by_candidate"] = size_buckets_by_candidate
+        kwargs["target_size_ratio"] = target_size_ratio
+        kwargs["size_balance_weight"] = size_balance_weight
+        kwargs["avg_boxes_per_image_min"] = avg_boxes_per_image_min
+        kwargs["avg_boxes_per_image_max"] = avg_boxes_per_image_max
     return select_balanced_train_candidates(**kwargs)
 
 
@@ -217,6 +228,32 @@ def _open_image_size(image_path: Path) -> tuple[int, int]:
     with image_module.open(image_path) as image:
         width, height = image.size
     return int(width), int(height)
+
+
+def scan_candidate_size_buckets(
+    candidates: list[Any],
+    class_id_mapping: dict[int, int],
+    *,
+    cache_dir: Path,
+) -> dict[str, dict[str, int]]:
+    """seg：逐图按掩码面积算 tiny/small/medium/large 实例数，键 rel_path|split。"""
+    from .det_size_supplement import ImageSizeCache
+    cache = ImageSizeCache(Path(cache_dir) / ".imgsize_cache.json")
+    result: dict[str, dict[str, int]] = {}
+    for candidate in candidates:
+        width, height = cache.get(candidate.src_image_path)
+        image_area = max(width * height, 1)
+        buckets = _empty_size_bucket_counts()
+        for line in candidate.filtered_lines:
+            parsed = parse_polygon_line(line)
+            if parsed is None:
+                continue
+            _, coords = parsed
+            pixel_area = polygon_area_normalized(coords) * image_area
+            buckets[_bucket_mask_area(pixel_area)] += 1
+        result[candidate.rel_path.as_posix() + "|" + candidate.split_name] = buckets
+    cache.save()
+    return result
 
 
 def _analyze_candidate_polygons(
@@ -917,6 +954,10 @@ def export_filtered_dataset(
     max_instances_per_image: int,
     max_instances_per_class_per_image: int,
     instance_density_penalty: float,
+    size_ratio: str = "",
+    size_balance_weight: float = 1.0,
+    avg_instances_per_image_min: float = 0.0,
+    avg_instances_per_image_max: float = 0.0,
 ) -> Path:
     """异常安全的对外入口：rename 之前任何步骤失败都会清理 __export_tmp。"""
     state: dict[str, Any] = {"temp_dir": None, "renamed": False}
@@ -940,6 +981,10 @@ def export_filtered_dataset(
             max_instances_per_image=max_instances_per_image,
             max_instances_per_class_per_image=max_instances_per_class_per_image,
             instance_density_penalty=instance_density_penalty,
+            size_ratio=size_ratio,
+            size_balance_weight=size_balance_weight,
+            avg_instances_per_image_min=avg_instances_per_image_min,
+            avg_instances_per_image_max=avg_instances_per_image_max,
             _state=state,
         )
     except BaseException:
@@ -969,6 +1014,10 @@ def _export_filtered_dataset_impl(
     max_instances_per_image: int,
     max_instances_per_class_per_image: int,
     instance_density_penalty: float,
+    size_ratio: str = "",
+    size_balance_weight: float = 1.0,
+    avg_instances_per_image_min: float = 0.0,
+    avg_instances_per_image_max: float = 0.0,
     _state: dict[str, Any],
 ) -> Path:
     """seg 数据集筛选导出主流程。参数命名以"实例"为主，内部复用 det_analysis 的"box" 命名。"""
@@ -1267,6 +1316,16 @@ def _export_filtered_dataset_impl(
     kept_names = {idx: safe_class_name(class_names, class_id) for class_id, idx in class_id_mapping.items()}
 
     pooled_candidates = pool_candidates(filtered_candidates_by_split)
+
+    # 尺寸感知：解析比例并扫描候选尺寸桶（掩码面积）
+    from .det_size_supplement import parse_size_ratio
+    target_size_ratio = parse_size_ratio(size_ratio) if size_ratio.strip() else None
+    size_buckets_by_candidate = None
+    if target_size_ratio is not None:
+        size_buckets_by_candidate = scan_candidate_size_buckets(
+            pooled_candidates, class_id_mapping, cache_dir=source_root,
+        )
+
     selected_pooled_candidates, selection_summary = _select_balanced_train_candidates_compat(
         candidates=pooled_candidates,
         kept_class_ids=kept_class_ids,
@@ -1276,6 +1335,11 @@ def _export_filtered_dataset_impl(
         target_images_per_class=effective_target_images_per_class,
         box_density_penalty=effective_instance_density_penalty,
         progress_callback=_make_live_progress_callback("Balanced Selection", single_line=True),
+        size_buckets_by_candidate=size_buckets_by_candidate,
+        target_size_ratio=target_size_ratio,
+        size_balance_weight=size_balance_weight,
+        avg_boxes_per_image_min=avg_instances_per_image_min,
+        avg_boxes_per_image_max=avg_instances_per_image_max,
     )
     stage_idx += 1
     _log_export_stage(
@@ -1302,6 +1366,7 @@ def _export_filtered_dataset_impl(
         split_image_targets=split_image_targets,
         desired_box_targets_by_split=desired_box_targets_by_split,
         kept_class_ids=kept_class_ids,
+        size_buckets_by_candidate=size_buckets_by_candidate,
     )
     selected_candidates_by_split = _convert_seg_candidates(selected_candidates_by_split)
     stage_idx += 1
@@ -1500,6 +1565,12 @@ def _export_filtered_dataset_impl(
                 "borderline_kept_class_analysis": borderline_kept_class_analysis,
                 "filter_summary": filter_summary,
                 "selection_summary": selection_summary,
+                "size_ratio_requested": size_ratio,
+                "target_size_ratio": target_size_ratio,
+                "size_balance_weight": size_balance_weight,
+                "avg_instances_per_image_min": avg_instances_per_image_min,
+                "avg_instances_per_image_max": avg_instances_per_image_max,
+                "size_selection_summary": selection_summary if target_size_ratio else None,
                 "repartition_summary": repartition_summary,
                 "split_image_targets": split_image_targets_compact,
                 "selected_split_stats": exported_split_stats,
@@ -1584,5 +1655,9 @@ def run_export(args) -> None:
         max_instances_per_image=args.max_instances_per_image,
         max_instances_per_class_per_image=args.max_instances_per_class_per_image,
         instance_density_penalty=args.instance_density_penalty,
+        size_ratio=args.size_ratio,
+        size_balance_weight=args.size_balance_weight,
+        avg_instances_per_image_min=args.avg_instances_per_image_min,
+        avg_instances_per_image_max=args.avg_instances_per_image_max,
     )
     print(f"Filtered seg dataset exported to: {export_root}")
