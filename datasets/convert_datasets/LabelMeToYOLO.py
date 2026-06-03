@@ -45,6 +45,7 @@ import argparse
 import ast
 import io
 import json
+import os
 import re
 import shutil
 import sys
@@ -64,6 +65,17 @@ TARGET_SEG  = OUTPUT_ROOT / "dataset_seg"     # 分割格式输出目录
 SPLITS = ["train", "val", "test"]
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """硬链接优先，失败时回退到 shutil.copy2（跨分区等情况）。"""
+    if dst.exists():
+        return
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
 
 # 固定类别映射（留空则自动从 JSON 收集）
 FIXED_CLASS_MAP: Dict[str, int] = {}
@@ -793,10 +805,10 @@ def convert_split_from_yolo(
         dst_name = stem + img.suffix.lower()
         copied = False
         if dst_img_det is not None:
-            shutil.copy2(img, dst_img_det / dst_name)
+            _link_or_copy(img, dst_img_det / dst_name)
             copied = True
         if dst_img_seg is not None:
-            shutil.copy2(img, dst_img_seg / dst_name)
+            _link_or_copy(img, dst_img_seg / dst_name)
             copied = True
         if copied:
             stats["images_copied"] += 1
@@ -983,10 +995,10 @@ def convert_split(
         dst_name = stem + img.suffix.lower()
         copied = False
         if dst_img_det is not None:
-            shutil.copy2(img, dst_img_det / dst_name)
+            _link_or_copy(img, dst_img_det / dst_name)
             copied = True
         if dst_img_seg is not None:
-            shutil.copy2(img, dst_img_seg / dst_name)
+            _link_or_copy(img, dst_img_seg / dst_name)
             copied = True
         if copied:
             stats["images_copied"] += 1
