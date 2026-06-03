@@ -188,6 +188,24 @@ def _open_image_size(image_path: Path) -> tuple[int, int]:
     return int(width), int(height)
 
 
+def scan_candidate_size_buckets(
+    candidates: list[Any],
+    class_id_mapping: dict[int, int],
+    *,
+    cache_dir: Path,
+) -> dict[str, dict[str, int]]:
+    """对候选逐图算 tiny/small/medium/large 框数，键为 rel_path|split。带 mtime 缓存。"""
+    from .det_size_supplement import ImageSizeCache, bucket_label_lines
+    cache = ImageSizeCache(Path(cache_dir) / ".imgsize_cache.json")
+    result: dict[str, dict[str, int]] = {}
+    for candidate in candidates:
+        width, height = cache.get(candidate.src_image_path)
+        buckets = bucket_label_lines(candidate.filtered_lines, width=width, height=height)
+        result[candidate.rel_path.as_posix() + "|" + candidate.split_name] = buckets
+    cache.save()
+    return result
+
+
 def _analyze_candidate_boxes(candidate, class_id_mapping: dict[int, int]) -> dict[str, Any]:
     width, height = _open_image_size(candidate.src_image_path)
     per_class_label_counts: dict[int, int] = defaultdict(int)

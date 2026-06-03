@@ -119,3 +119,29 @@ def test_split_size_targets_proportional_and_exclude_tiny():
     assert targets["test"]["small"] == 1
     # tiny 不进目标
     assert "tiny" not in targets["train"]
+
+
+def test_scan_candidate_size_buckets(tmp_path):
+    from pathlib import Path as _P
+    from tool_lib import common as rt
+    from tool_lib.det_export import scan_candidate_size_buckets
+    from tool_lib.det_shared import ExportImageCandidate
+    rt.import_runtime_dependencies()
+    img = tmp_path / "a.jpg"
+    rt.Image.new("RGB", (100, 100), (127, 127, 127)).save(img)
+    # 一个 small 框(20x20=400px∈[256,1024)) + 一个 large 框(100x100=10000px≥9216)
+    cand = ExportImageCandidate(
+        split_name="train",
+        rel_split_image_dir=_P("images/train"),
+        rel_split_label_dir=_P("labels/train"),
+        rel_path=_P("a.jpg"),
+        src_image_path=img,
+        src_label_path=tmp_path / "a.txt",
+        filtered_lines=("0 0.5 0.5 0.2 0.2", "0 0.5 0.5 1.0 1.0"),
+        class_box_counts={0: 2},
+    )
+    out = scan_candidate_size_buckets([cand], {0: 0}, cache_dir=tmp_path)
+    key = "a.jpg|train"
+    assert out[key]["small"] == 1
+    assert out[key]["large"] == 1
+    assert out[key]["tiny"] == 0
