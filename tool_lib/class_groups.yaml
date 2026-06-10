@@ -1,0 +1,199 @@
+# 易混层级 / 同义组表
+# 用于冲突检测：同组内 sibling 类别高 IoU 同框 → conflict
+# 关系类型：parent_child（合法同框）/ sibling（同框可疑）/ part_of（部件-整体，不报）
+#
+# 格式：
+#   - group: 组名
+#     relation: sibling | parent_child | part_of
+#     classes: [类名1, 类名2, ...]
+#
+# 通用规则：
+#   - parent_child 同框不报（如 "车辆" + "suv"）
+#   - part_of 同框不报（如 "飞机" + "机翼"）
+#   - sibling 同框高 IoU → conflict（如 "suv" + "轿车"）
+
+# ============================================================
+# COCO 80 类（默认）
+# ============================================================
+coco80:
+  # 交通工具
+  - group: "车辆"
+    relation: sibling
+    classes: ["car", "truck", "bus", "motorcycle", "bicycle"]
+
+  - group: "水上交通"
+    relation: sibling
+    classes: ["boat", "surfboard", "kite"]
+
+  - group: "空中交通"
+    relation: sibling
+    classes: ["airplane", "kite"]
+
+  # 室内家具
+  - group: "坐具"
+    relation: sibling
+    classes: ["chair", "couch", "bench", "bed"]
+
+  - group: "桌面"
+    relation: sibling
+    classes: ["dining table", "desk"]
+
+  # 食物
+  - group: "水果"
+    relation: sibling
+    classes: ["banana", "apple", "orange"]
+
+  - group: "快餐"
+    relation: sibling
+    classes: ["hot dog", "pizza", "sandwich", "donut", "cake"]
+
+  # 餐具
+  - group: "餐具"
+    relation: sibling
+    classes: ["fork", "knife", "spoon", "bowl", "cup", "wine glass"]
+
+  # 电子产品
+  - group: "电子设备"
+    relation: sibling
+    classes: ["laptop", "cell phone", "tv", "remote", "keyboard", "mouse"]
+
+  - group: "家电"
+    relation: sibling
+    classes: ["microwave", "oven", "toaster", "refrigerator"]
+
+  # 动物
+  - group: "宠物"
+    relation: sibling
+    classes: ["cat", "dog"]
+
+  - group: "家畜"
+    relation: sibling
+    classes: ["horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"]
+
+  # 配饰/包
+  - group: "包类"
+    relation: sibling
+    classes: ["backpack", "handbag", "suitcase"]
+
+  # 运动器材
+  - group: "运动器材"
+    relation: sibling
+    classes: ["skis", "snowboard", "sports ball", "baseball bat", "baseball glove", "tennis racket", "skateboard", "surfboard"]
+
+  # 卫浴
+  - group: "卫浴"
+    relation: sibling
+    classes: ["toilet", "sink"]
+
+  # 人 vs 人体部件（如果有的话）
+  - group: "人"
+    relation: parent_child
+    classes: ["person"]
+
+  # 瓶/杯
+  - group: "容器"
+    relation: sibling
+    classes: ["bottle", "cup", "wine glass", "bowl"]
+
+  # 刀具/剪刀
+  - group: "利器"
+    relation: sibling
+    classes: ["knife", "scissors"]
+
+  # 时钟/花瓶/书籍（装饰/文具类）
+  - group: "装饰/文具"
+    relation: sibling
+    classes: ["clock", "vase", "book", "teddy bear"]
+
+  # 交通标志
+  - group: "交通设施"
+    relation: sibling
+    classes: ["traffic light", "fire hydrant", "stop sign", "parking meter"]
+
+
+# ============================================================
+# 军事/工业 299 类（示例，按 plan0603.md 表格）
+# 取消注释并按实际数据集的 names 调整
+# ============================================================
+# military299:
+#   - group: "人员"
+#     relation: parent_child
+#     classes: ["人员", "一般人员", "军事人员", "步兵", "特种部队", "狙击手"]
+#
+#   - group: "民用车"
+#     relation: sibling
+#     classes: ["车辆", "其它类型车辆", "suv", "轿车", "卡车", "皮卡", "客车", "货车",
+#               "面包车", "厢式货车", "半挂车", "拖车", "平板拖车"]
+#
+#   - group: "军用车"
+#     relation: sibling
+#     classes: ["坦克", "装甲战斗车", "自行高炮", "导弹发射车", "布雷车", "扫雷车",
+#               "架桥车", "破障车", "指挥控制车", "电子战与侦察车", "战术突击车"]
+#
+#   - group: "舰船"
+#     relation: parent_child
+#     classes: ["舰船", "航母", "两栖战舰", "主力战舰", "小型战斗舰艇", "补给舰船",
+#               "侦察测量船", "其它辅助船", "客船", "渔船", "散货船", "杂货船",
+#               "矿砂船", "集装箱船", "起重船", "驳船", "潜艇"]
+#
+#   - group: "飞行器"
+#     relation: parent_child
+#     classes: ["飞机", "民用飞机", "战斗机", "轰炸机", "直升机", "攻击直升机",
+#               "运输通用直升机", "无人机", "战术级无人机", "特种无人机"]
+#
+#   - group: "枪炮"
+#     relation: sibling
+#     classes: ["手枪", "步枪", "狙击枪", "机枪", "火箭炮", "火箭筒", "高射炮",
+#               "身管火炮", "炮塔", "炮台"]
+#
+#   - group: "刀具"
+#     relation: sibling
+#     classes: ["剪刀", "PVC管剪刀", "修枝剪", "铁皮剪", "美工刀", "大砍刀",
+#               "雕刻刀", "镰刀", "泥刀", "腻子刀", "抹子"]
+#
+#   - group: "锯"
+#     relation: sibling
+#     classes: ["手锯", "钢锯", "线锯", "气动线锯", "电锯", "油锯", "电动往复锯"]
+#
+#   - group: "钳夹"
+#     relation: sibling
+#     classes: ["剥线钳", "剪线钳", "压接钳", "液压压接钳", "压管钳", "管夹",
+#               "龙门钳", "台钳", "液压钢筋剪"]
+#
+#   - group: "扳手"
+#     relation: sibling
+#     classes: ["扳手", "扭矩扳手", "电子扭矩扳手", "轴承扳手", "套筒"]
+#
+#   - group: "胶带"
+#     relation: sibling
+#     classes: ["胶带", "绝缘胶带", "美纹纸胶带", "胶带切割器"]
+#
+#   - group: "温湿风速"
+#     relation: sibling
+#     classes: ["温度计", "温度湿度计", "数字温度湿度计", "红外线数字温度计",
+#               "风速计", "数字风速仪", "热成像仪"]
+#
+#   - group: "卡尺测微"
+#     relation: sibling
+#     classes: ["游标卡尺", "电子卡尺", "千分尺", "螺旋测微器", "尺子", "卷尺", "水平尺"]
+#
+#   - group: "钻镐"
+#     relation: sibling
+#     classes: ["冲击钻", "电钻", "电锤", "钻头", "钻孔机", "电镐", "风镐", "气铲"]
+#
+#   - group: "紧固件"
+#     relation: sibling
+#     classes: ["螺丝", "螺栓", "螺母", "钉子", "垫圈", "垫片", "螺丝刀", "钉枪"]
+#
+#   - group: "电子元件"
+#     relation: sibling
+#     classes: ["二极管", "发光二极管", "晶体管", "电阻器", "电容器", "电感",
+#               "电位器", "继电器", "保险丝", "磁珠", "蜂鸣器", "IC芯片", "焊盘", "引脚"]
+#
+#   - group: "喷枪"
+#     relation: sibling
+#     classes: ["喷漆", "油漆刷", "滚筒刷", "打胶枪", "热熔胶枪", "灌浆枪", "拉铆枪"]
+#
+#   - group: "场景灾害"
+#     relation: sibling
+#     classes: ["山体滑坡", "洪水", "火灾", "烟尘"]

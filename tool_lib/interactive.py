@@ -2719,6 +2719,48 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     eda_parser.add_argument("--output-dir", type=Path, default=None)
     eda_parser.add_argument("--overwrite", action="store_true", default=False)
 
+    # review-sample 子命令
+    review_sample_parser = subparsers.add_parser("review-sample")
+    review_sample_parser.add_argument("--data", type=Path, default=None)
+    review_sample_parser.add_argument("--experiment-dir", type=Path, default=None)
+    review_sample_parser.add_argument("--infer-output-dir", type=Path, default=None)
+    review_sample_parser.add_argument("--report-path", type=Path, default=None)
+    review_sample_parser.add_argument("--out-dir", type=Path, default=None)
+    # 功能开关
+    review_sample_parser.add_argument("--enable-geometry", dest="enable_geometry", action="store_true", default=True)
+    review_sample_parser.add_argument("--disable-geometry", dest="enable_geometry", action="store_false")
+    review_sample_parser.add_argument("--enable-model-analysis", dest="enable_model_analysis", action="store_true", default=True)
+    review_sample_parser.add_argument("--disable-model-analysis", dest="enable_model_analysis", action="store_false")
+    review_sample_parser.add_argument("--enable-outlier-class", dest="enable_outlier_class", action="store_true", default=True)
+    review_sample_parser.add_argument("--disable-outlier-class", dest="enable_outlier_class", action="store_false")
+    review_sample_parser.add_argument("--enable-visualization", dest="enable_visualization", action="store_true", default=False)
+    review_sample_parser.add_argument("--disable-visualization", dest="enable_visualization", action="store_false")
+    # 选图参数
+    review_sample_parser.add_argument("--k", type=int, default=3)
+    review_sample_parser.add_argument("--alpha", type=float, default=3.0)
+    review_sample_parser.add_argument("--cap", type=int, default=10)
+    review_sample_parser.add_argument("--max-images", type=int, default=500)
+    review_sample_parser.add_argument("--min-only", action="store_true", default=False)
+    review_sample_parser.add_argument("--problems-only", action="store_true", default=False)
+    # 几何检测参数
+    review_sample_parser.add_argument("--iou-dup", type=float, default=0.9)
+    review_sample_parser.add_argument("--iou-conflict", type=float, default=0.5)
+    review_sample_parser.add_argument("--min-box-px", type=float, default=4)
+    review_sample_parser.add_argument("--dense-top-n", type=int, default=None)
+    # 模型分析参数
+    review_sample_parser.add_argument("--match-iou-threshold", type=float, default=0.5)
+    review_sample_parser.add_argument("--low-conf-threshold", type=float, default=0.3)
+    review_sample_parser.add_argument("--outlier-class-ap", type=float, default=0.1)
+    review_sample_parser.add_argument("--outlier-class-gt", type=int, default=5)
+    # 其他
+    review_sample_parser.add_argument("--groups-path", type=Path, default=None)
+    review_sample_parser.add_argument("--groups-section", type=str, default="coco80")
+    review_sample_parser.add_argument("--cache-path", type=Path, default=None)
+    review_sample_parser.add_argument("--seed", type=int, default=42)
+    review_sample_parser.add_argument("--embed-images", action="store_true", default=True)
+    review_sample_parser.add_argument("--no-embed-images", dest="embed_images", action="store_false")
+    review_sample_parser.add_argument("--interactive", action="store_true", default=False)
+
     report_parser = subparsers.add_parser("report")
     report_parser.add_argument("--experiment-dir", type=Path, default=None)
     report_parser.add_argument("--search", type=str, default=None)
@@ -2795,6 +2837,412 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
             if args.output_dir is None:
                 args.output_dir = Path(args.experiment_dir) / "eval"
         return args
+
+    if args.command == "review-sample":
+        args.tool_task = "det"
+        args.tool_action = "review-sample"
+        if args.data is None:
+            args.data = Path(rt.EXPORT_DEFAULT_SOURCE_DATA)
+        return args
+
     args.tool_task = "det"
     args.tool_action = args.command
+    return args
+
+
+def build_review_sample_cli_preview(args: argparse.Namespace) -> str:
+    """构建 review-sample 命令预览"""
+    parts = ["python launcher.py review-sample"]
+    if args.data:
+        parts.append(f"--data {compact_display_path(args.data)}")
+    if args.experiment_dir:
+        parts.append(f"--experiment-dir {compact_display_path(args.experiment_dir)}")
+    if args.k:
+        parts.append(f"--k {args.k}")
+    if args.max_images:
+        parts.append(f"--max-images {args.max_images}")
+    return " ".join(parts)
+
+
+def _prompt_review_sample_experiment_dir(data_path: Path) -> Path | None:
+    """为质检抽样选择实验目录"""
+    from .det_problem_export import discover_infer_runs
+
+    # 扫描所有实验目录
+    all_dirs = list_experiment_dirs(task="det")
+    if not all_dirs:
+        all_dirs = list_experiment_dirs()
+
+    # 过滤有推理结果的实验
+    experiments_with_infer = []
+    for exp_dir in all_dirs[:20]:  # 只检查最近20个
+        runs = discover_infer_runs(exp_dir)
+        if runs:
+            # 获取最新推理结果的摘要
+            latest_run = runs[0]
+            report_path = latest_run.get("report_path")
+            mAP = None
+            if report_path and report_path.exists():
+                try:
+                    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+                    summary = report_payload.get("summary", {})
+                    mAP = summary.get("map") or summary.get("map_50")
+                except Exception:
+                    pass
+
+            experiments_with_infer.append({
+                "dir": exp_dir,
+                "runs": runs,
+                "latest_split": latest_run.get("split", "unknown"),
+                "mAP": mAP,
+            })
+
+    if not experiments_with_infer:
+        print("\n  未发现有推理结果的实验目录。")
+        print("  提示：请先运行 det infer 生成推理结果。")
+        if prompt_yes_no("是否跳过模型分析，仅使用几何检测", True):
+            return None
+        return None
+
+    print("\n  发现以下实验目录（含推理结果）：")
+    for idx, exp in enumerate(experiments_with_infer, 1):
+        dir_name = compact_display_path(exp["dir"])
+        split = exp["latest_split"]
+        mAP_str = f"mAP@0.5: {exp['mAP']:.3f}" if exp["mAP"] else "无报告"
+        n_runs = len(exp["runs"])
+        print(f"    [{idx}] {dir_name} ({split} split, {mAP_str}, {n_runs}个推理结果)")
+
+    print(f"    [0] 跳过模型分析（仅几何检测）")
+
+    while True:
+        raw = read_input(f"\n  请选择实验目录 [0-{len(experiments_with_infer)}, 回车默认 1]: ").strip()
+        if not raw:
+            return experiments_with_infer[0]["dir"]
+        if raw == "0":
+            return None
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(experiments_with_infer):
+                return experiments_with_infer[idx]["dir"]
+        except ValueError:
+            pass
+        print("  无效选择，请重新输入。")
+
+
+def _prompt_review_sample_infer_run(experiment_dir: Path) -> tuple[Path | None, Path | None]:
+    """选择推理结果"""
+    from .det_problem_export import discover_infer_runs
+
+    runs = discover_infer_runs(experiment_dir)
+    if not runs:
+        print(f"\n  实验 {compact_display_path(experiment_dir)} 下未发现推理结果。")
+        return None, None
+
+    if len(runs) == 1:
+        run = runs[0]
+        print(f"\n  使用推理结果: {run['split']} split")
+        return run.get("output_dir"), run.get("report_path")
+
+    print(f"\n  实验目录下发现以下推理结果：")
+    for idx, run in enumerate(runs, 1):
+        split = run.get("split", "unknown")
+        report_path = run.get("report_path")
+        mAP_str = ""
+        if report_path and report_path.exists():
+            try:
+                report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+                summary = report_payload.get("summary", {})
+                mAP = summary.get("map") or summary.get("map_50")
+                if mAP:
+                    mAP_str = f", mAP@0.5: {mAP:.3f}"
+            except Exception:
+                pass
+        print(f"    [{idx}] {split} split{mAP_str}")
+
+    while True:
+        raw = read_input(f"\n  请选择推理结果 [1-{len(runs)}, 回车默认 1]: ").strip()
+        if not raw:
+            run = runs[0]
+            return run.get("output_dir"), run.get("report_path")
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(runs):
+                run = runs[idx]
+                return run.get("output_dir"), run.get("report_path")
+        except ValueError:
+            pass
+        print("  无效选择，请重新输入。")
+
+
+def _auto_detect_datasets() -> list[Path]:
+    """自动检测datasets目录下的data.yaml文件"""
+    datasets_dir = rt.ROOT_DIR / "datasets"
+    if not datasets_dir.exists():
+        return []
+
+    data_yamls = []
+    for data_yaml in datasets_dir.rglob("data.yaml"):
+        # 过滤掉convert_datasets等非数据集目录
+        rel = data_yaml.relative_to(datasets_dir)
+        if "convert" in str(rel).lower() or "backup" in str(rel).lower():
+            continue
+        data_yamls.append(data_yaml)
+
+    # 按修改时间排序，最新的在前
+    data_yamls.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return data_yamls
+
+
+def _auto_detect_experiment_with_infer() -> list[dict[str, Any]]:
+    """自动检测有推理结果的实验目录"""
+    from .det_problem_export import discover_infer_runs
+
+    all_dirs = list_experiment_dirs(task="det")
+    if not all_dirs:
+        all_dirs = list_experiment_dirs()
+
+    experiments_with_infer = []
+    for exp_dir in all_dirs[:30]:  # 检查最近30个
+        runs = discover_infer_runs(exp_dir)
+        if runs:
+            latest_run = runs[0]
+            report_path = latest_run.get("report_path")
+            mAP = None
+            num_images = 0
+            if report_path and report_path.exists():
+                try:
+                    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+                    summary = report_payload.get("summary", {})
+                    mAP = summary.get("map") or summary.get("map_50")
+                    num_images = summary.get("num_images", 0)
+                except Exception:
+                    pass
+
+            experiments_with_infer.append({
+                "dir": exp_dir,
+                "runs": runs,
+                "latest_split": latest_run.get("split", "unknown"),
+                "mAP": mAP,
+                "num_images": num_images,
+            })
+
+    return experiments_with_infer
+
+
+def build_interactive_review_sample_args() -> argparse.Namespace | None:
+    """交互式质检抽样流程 - 自动检测，只问关键开关"""
+    import time
+
+    print("\n" + "=" * 63)
+    print("  数据集质检抽样 v2.0")
+    print("=" * 63)
+
+    # ── Step 0: 自动检测数据集 ──
+    print("\n[Step 0] 自动检测数据集 ...")
+    data_yamls = _auto_detect_datasets()
+
+    if not data_yamls:
+        print("  错误: datasets/ 目录下未找到 data.yaml 文件")
+        return None
+
+    # 选择数据集
+    if len(data_yamls) == 1:
+        data_path = data_yamls[0]
+        print(f"  数据集: {compact_display_path(data_path)}")
+    else:
+        print(f"\n  发现 {len(data_yamls)} 个数据集：")
+        for idx, p in enumerate(data_yamls[:10], 1):
+            # 尝试读取类别数
+            try:
+                cfg = rt.load_data_config(p)
+                names = rt.normalize_names(cfg.get("names"))
+                nc = len(names)
+                print(f"    [{idx}] {compact_display_path(p)} (nc={nc})")
+            except Exception:
+                print(f"    [{idx}] {compact_display_path(p)}")
+        if len(data_yamls) > 10:
+            print(f"    ... 还有 {len(data_yamls) - 10} 个")
+
+        while True:
+            raw = read_input(f"\n  请选择数据集 [1-{min(len(data_yamls), 10)}, 回车默认 1]: ").strip()
+            if not raw:
+                data_path = data_yamls[0]
+                break
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < min(len(data_yamls), 10):
+                    data_path = data_yamls[idx]
+                    break
+            except ValueError:
+                pass
+            print("  无效选择，请重新输入。")
+
+    # 读取数据集信息
+    try:
+        cfg = rt.load_data_config(data_path)
+        class_names = rt.normalize_names(cfg.get("names"))
+        nc = len(class_names)
+
+        # 统计图片数
+        total_images = 0
+        for split in ("train", "val", "test"):
+            split_dir = cfg.get(split)
+            if split_dir:
+                img_dir = Path(cfg["_root_dir"]) / split_dir
+                if img_dir.exists():
+                    total_images += len(list(img_dir.rglob("*.jpg"))) + len(list(img_dir.rglob("*.png")))
+
+        print(f"  类别数: {nc}")
+        print(f"  图片数: {total_images:,}")
+    except Exception as e:
+        print(f"  警告: 无法读取数据集详细信息: {e}")
+        class_names = {}
+        nc = 0
+        total_images = 0
+
+    # ── Step 1: 自动检测实验目录 ──
+    print("\n" + "=" * 63)
+    print("  模型分析配置")
+    print("=" * 63)
+
+    print("\n  自动检测实验目录 ...")
+    experiments = _auto_detect_experiment_with_infer()
+
+    experiment_dir = None
+    infer_output_dir = None
+    report_path = None
+    mAP = None
+
+    if not experiments:
+        print("  未发现有推理结果的实验目录。")
+        print("  将仅使用几何检测模式。")
+    else:
+        print(f"\n  发现 {len(experiments)} 个有推理结果的实验：")
+        for idx, exp in enumerate(experiments[:5], 1):
+            dir_name = compact_display_path(exp["dir"])
+            split = exp["latest_split"]
+            mAP_str = f"mAP={exp['mAP']:.3f}" if exp["mAP"] else "无报告"
+            n_imgs = f"{exp['num_images']}张" if exp["num_images"] else ""
+            print(f"    [{idx}] {dir_name} ({split}, {mAP_str}, {n_imgs})")
+        print(f"    [0] 跳过模型分析（仅几何检测）")
+
+        while True:
+            raw = read_input(f"\n  请选择 [0-{min(len(experiments), 5)}, 回车默认 1]: ").strip()
+            if not raw:
+                exp = experiments[0]
+                experiment_dir = exp["dir"]
+                mAP = exp["mAP"]
+                break
+            if raw == "0":
+                break
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < min(len(experiments), 5):
+                    exp = experiments[idx]
+                    experiment_dir = exp["dir"]
+                    mAP = exp["mAP"]
+                    break
+            except ValueError:
+                pass
+            print("  无效选择，请重新输入。")
+
+        # 自动获取推理结果
+        if experiment_dir:
+            from .det_problem_export import discover_infer_runs
+            runs = discover_infer_runs(experiment_dir)
+            if runs:
+                infer_output_dir = runs[0].get("output_dir")
+                report_path = runs[0].get("report_path")
+                split = runs[0].get("split", "unknown")
+                print(f"\n  使用推理结果: {split} split")
+                if mAP:
+                    print(f"  mAP@0.5: {mAP:.3f}")
+
+    # ── Step 2: 功能开关 ──
+    print("\n  ── 功能开关（回车使用默认值）──")
+    enable_geometry = prompt_yes_no("  [1] 几何检测（重复框/冲突标签/异常框）", True)
+    enable_model = prompt_yes_no("  [2] 模型分析（漏检/错标/误检）", experiment_dir is not None)
+    enable_outlier = prompt_yes_no("  [3] 劣质类别重点抽样", True)
+
+    # ── Step 3: 抽样数量 ──
+    print("\n  ── 抽样数量 ──")
+    k = prompt_int("  每类软下限 k", 3)
+    max_images = prompt_int("  总图数上限（0=不限）", 500)
+
+    # ── 自动生成输出目录 ──
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    dataset_name = data_path.parent.parent.name + "_" + data_path.parent.name
+    out_dir = rt.EXPERIMENT_ROOT_DIR / f"review_{dataset_name}_{timestamp}"
+
+    # ── 确认执行 ──
+    print("\n" + "=" * 63)
+    print("  确认执行")
+    print("=" * 63)
+
+    print("\n  执行计划：")
+    print("  ┌─────────────────────────────────────────────────────────┐")
+    print("  │ 1. 扫描数据集 + 一致性校验                              │")
+    if enable_geometry:
+        print("  │ 2. 几何检测：dup / conflict / bad_box / dense           │")
+    if enable_model and infer_output_dir:
+        print("  │ 3. 模型分析：missing / swapped / false_pos / loc        │")
+    if enable_outlier:
+        print("  │ 4. 劣质类别识别（AP < 0.1 或 GT < 5）                   │")
+    print("  │ 5. 贪心选图（问题优先 + 覆盖均衡）                      │")
+    print("  │ 6. 导出 review_subset/                                  │")
+    print("  └─────────────────────────────────────────────────────────┘")
+
+    print(f"\n  数据源：")
+    print(f"  - 数据集: {compact_display_path(data_path)} (nc={nc}, {total_images}张)")
+    if experiment_dir:
+        print(f"  - 实验目录: {compact_display_path(experiment_dir)}")
+    if infer_output_dir:
+        print(f"  - 推理结果: {compact_display_path(infer_output_dir)}")
+    print(f"  - test_report: {'✓ 已加载' if report_path else '✗ 无'}")
+    print(f"\n  输出目录: {compact_display_path(out_dir)}")
+
+    if not prompt_yes_no("\n  开始执行？", True):
+        print("  已取消。")
+        return None
+
+    # 构建参数
+    args = argparse.Namespace(
+        tool_task="det",
+        tool_action="review-sample",
+        command="review-sample",
+        data=data_path,
+        experiment_dir=experiment_dir,
+        infer_output_dir=infer_output_dir,
+        report_path=report_path,
+        # 功能开关
+        enable_geometry=enable_geometry,
+        enable_model_analysis=enable_model,
+        enable_outlier_class=enable_outlier,
+        enable_visualization=False,
+        # 选图参数
+        k=k,
+        alpha=3.0,
+        cap=10,
+        max_images=max_images if max_images > 0 else None,
+        min_only=False,
+        problems_only=False,
+        # 几何检测参数
+        iou_dup=0.9,
+        iou_conflict=0.5,
+        min_box_px=4,
+        dense_top_n=None,
+        # 模型分析参数
+        match_iou_threshold=0.5,
+        low_conf_threshold=0.3,
+        outlier_class_ap=0.1,
+        outlier_class_gt=5,
+        # 其他
+        groups_path=None,
+        groups_section="coco80",
+        cache_path=None,
+        seed=42,
+        embed_images=True,
+        out_dir=out_dir,
+    )
+
     return args
