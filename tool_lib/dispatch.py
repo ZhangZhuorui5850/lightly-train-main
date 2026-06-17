@@ -15,6 +15,8 @@ from . import cls_tools, det_tools, seg_tools
 from . import convert_tools
 from . import det_optimize
 from . import train_tools
+from . import seg_semantic_eda
+from . import seg_semantic_curate
 
 
 def dispatch(args) -> None:
@@ -28,6 +30,15 @@ def dispatch(args) -> None:
         return
     if args.tool_task == "det" and args.tool_action in {"report", "eda", "optimize", "review-sample"}:
         rt.import_runtime_dependencies()
+    # seg eda / curate：语义分割 EDA 和交互式整理
+    if args.tool_task == "seg" and args.tool_action == "eda":
+        rt.import_runtime_dependencies()
+        seg_semantic_eda.run_semantic_eda(args)
+        return
+    if args.tool_task == "seg" and args.tool_action == "curate":
+        rt.import_runtime_dependencies()
+        seg_semantic_curate.run_semantic_curate(args)
+        return
     if args.tool_task == "det" and args.tool_action == "report":
         det_tools.run_report(args)
         return

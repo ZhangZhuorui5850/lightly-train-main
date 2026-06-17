@@ -266,25 +266,62 @@ def update_metric(metric, label_mapping: dict[int, int], prediction: dict[str, A
     )
 
 
-def run_semantic_eval(args) -> None:
-    checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
-    rt.prepare_output_dir(args.output_dir, args.overwrite)
-    data_path = Path(args.data).expanduser().resolve()
-    data_cfg = train_tools.load_semantic_segmentation_split_config(data_path, args.split)
-    samples, data_class_names, num_classes = _semantic_image_mask_samples(data_path, args.split)
+def _normalize_splits(split: Any) -> list[str]:
+    """把 --split 统一成列表，兼容 CLI 多值 (list) 与交互式单值 (str)。"""
+    if isinstance(split, (list, tuple)):
+        return [str(item) for item in split]
+    return [str(split)]
+
+
+def _print_semantic_metrics(
+    split: str,
+    metrics: dict[str, float],
+    per_class: dict[str, dict[str, float | int]],
+    class_names: dict[int, str],
+) -> None:
+    """把单个 split 的 mIoU / Pixel Accuracy / 逐类 IoU 打印到控制台。"""
+    print(f"\n  {'=' * 50}")
+    print(f"    [{split}] 评估结果")
+    print(f"  {'=' * 50}")
+    print(f"    mIoU          : {metrics['miou']:.4f}")
+    print(f"    Pixel Accuracy: {metrics['pixel_accuracy']:.4f}")
+    print(f"  {'=' * 50}")
+    print(f"    逐类 IoU:")
+    for class_id_str, info in per_class.items():
+        class_name = class_names.get(int(class_id_str), f"class_{class_id_str}")
+        print(f"      {class_name:20s}  IoU={info['iou']:.4f}  TP={info['tp']}  FP={info['fp']}  FN={info['fn']}")
+
+
+def _evaluate_semantic_split(
+    model: Any,
+    data_path: Path,
+    split: str,
+    output_dir: Path,
+    threshold: float,
+    overwrite: bool,
+    checkpoint_path: Path,
+) -> dict[str, Any] | None:
+    """对单个 split 执行语义分割评估，保存 summary/CSV 并打印指标。"""
+    # 先查 yaml 里是否定义了该 split；未定义就跳过（多 split 评估时常见，
+    # 不能让 load_semantic_segmentation_split_config 直接抛异常中断整轮评估）。
+    if train_tools._load_yaml_dict(data_path).get(split) is None:
+        print(f"  ⚠ 数据配置中没有 '{split}' split，跳过。")
+        return None
+    data_cfg = train_tools.load_semantic_segmentation_split_config(data_path, split)
+    samples, data_class_names, num_classes = _semantic_image_mask_samples(data_path, split)
     if not samples:
-        raise ValueError("No image/mask pairs found for semantic segmentation eval.")
+        print(f"  ⚠ {split} split 中没有找到图片/掩码对，跳过。")
+        return None
 
     classes = data_cfg["classes"]
     ignore_classes = {int(item) for item in data_cfg.get("ignore_classes", set()) or set()}
-    model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
-    model.eval()
     class_names = rt.merge_class_names(rt.get_model_class_names(model), data_class_names)
     confusion = rt.np.zeros((len(class_names), len(class_names)), dtype=rt.np.int64)
     rows: list[dict[str, Any]] = []
 
+    print(f"\n  [{split}] 找到 {len(samples)} 个图片/掩码对")
     for idx, (image_path, mask_path) in enumerate(samples, start=1):
-        prediction = predict_model(model, image_path, args.threshold)
+        prediction = predict_model(model, image_path, threshold)
         pred_np = _prediction_to_numpy(prediction)
         target_np = _load_semantic_mask(mask_path, classes, ignore_classes)
         pred_np = _resize_prediction_if_needed(pred_np, target_np.shape)
@@ -302,30 +339,59 @@ def run_semantic_eval(args) -> None:
             print(f"[{idx}/{len(samples)}] processed: {image_path}")
 
     metrics, per_class = _compute_semantic_iou(confusion)
-    summary_path = args.output_dir / "seg_semantic_eval_summary.json"
-    csv_path = args.output_dir / "seg_semantic_eval_samples.csv"
+    rt.prepare_output_dir(output_dir, overwrite)
+    summary_path = output_dir / "seg_semantic_eval_summary.json"
+    csv_path = output_dir / "seg_semantic_eval_samples.csv"
     rt.save_records_csv(csv_path, rows, ["image_path", "mask_path", "valid_pixels"])
+    summary = {
+        "task": "semantic_segmentation",
+        "checkpoint": str(checkpoint_path),
+        "data": str(data_path),
+        "split": split,
+        "num_images": len(samples),
+        "num_classes": num_classes,
+        "class_names": class_names,
+        "metrics": metrics,
+        "per_class": per_class,
+    }
     summary_path.write_text(
-        json.dumps(
-            {
-                "task": "semantic_segmentation",
-                "checkpoint": str(checkpoint_path),
-                "data": str(data_path),
-                "split": args.split,
-                "num_images": len(samples),
-                "num_classes": num_classes,
-                "class_names": class_names,
-                "metrics": metrics,
-                "per_class": per_class,
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-        + "\n",
+        json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    _print_semantic_metrics(split, metrics, per_class, class_names)
     print(f"Summary saved to: {summary_path}")
     print(f"CSV saved to: {csv_path}")
+    return summary
+
+
+def run_semantic_eval(args) -> None:
+    checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
+    data_path = Path(args.data).expanduser().resolve()
+    model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
+    model.eval()
+
+    splits = _normalize_splits(args.split)
+    summaries: dict[str, Any] = {}
+    for split in splits:
+        # 多 split 时各自写入子目录；单 split 时保持原有的直接写入输出目录。
+        split_output_dir = args.output_dir / split if len(splits) > 1 else args.output_dir
+        # 语义分割是逐像素 argmax，没有可过滤的"检测列表"；阈值过滤只会人为
+        # 砍掉低分像素、压低 mIoU，与训练内部验证不一致。故恒用 0.0（不过滤），
+        # 与实例分割 eval 强制 0.0 的做法一致。args.threshold 对语义分割无效。
+        summary = _evaluate_semantic_split(
+            model=model,
+            data_path=data_path,
+            split=split,
+            output_dir=split_output_dir,
+            threshold=0.0,
+            overwrite=args.overwrite,
+            checkpoint_path=checkpoint_path,
+        )
+        if summary is not None:
+            summaries[split] = summary
+
+    if not summaries:
+        raise ValueError("No image/mask pairs found for semantic segmentation eval.")
 
 
 def run_eval(args) -> None:
@@ -335,8 +401,10 @@ def run_eval(args) -> None:
 
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
     rt.prepare_output_dir(args.output_dir, args.overwrite)
+    # --split 现在可能是多值列表（语义分割需要），实例评估只取第一个。
+    split = _normalize_splits(args.split)[0]
     data_cfg = rt.load_data_config(args.data)
-    samples, data_class_names = rt.list_dataset_samples(data_cfg=data_cfg, split=args.split)
+    samples, data_class_names = rt.list_dataset_samples(data_cfg=data_cfg, split=split)
     rt.ensure_image_samples(samples)
     model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
     model.eval()
@@ -366,7 +434,7 @@ def run_eval(args) -> None:
             {
                 "checkpoint": str(checkpoint_path),
                 "data": str(args.data),
-                "split": args.split,
+                "split": split,
                 "num_images": len(samples),
                 "images_with_labels": images_with_labels,
                 "metrics": result,

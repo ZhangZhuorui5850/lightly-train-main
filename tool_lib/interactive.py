@@ -630,6 +630,45 @@ def print_default_det_infer_summary(*, mode: str, data_path: Path | None = None)
     print("  overwrite: False")
 
 
+def print_default_seg_eval_summary(
+    *, seg_train_type: str, data_path: Path | None, splits: list[str]
+) -> None:
+    print("\n默认参数摘要")
+    print(f"  seg_train_type: {seg_train_type}")
+    print(f"  split: {' '.join(splits)}")
+    selected_data = compact_display_path(data_path) if data_path is not None else "(auto)"
+    print(f"  data: {selected_data}")
+    if seg_train_type == "semantic":
+        print("  threshold: 0.0（语义分割不过滤）")
+    else:
+        print(f"  threshold: {rt.DEFAULT_SEG_THRESHOLD}")
+    print("  output_dir: <experiment_dir>/eval")
+    print("  classwise: False")
+    print(f"  device: {rt.DEFAULT_DEVICE}")
+    print("  overwrite: False")
+
+
+def build_seg_eval_cli_preview(args: argparse.Namespace) -> str:
+    parts = ["python", "launcher.py", "eval", "--task", "seg"]
+    parts.extend(["--seg-train-type", str(args.seg_train_type)])
+    parts.extend(["--experiment-dir", str(args.experiment_dir)])
+    if getattr(args, "checkpoint", None) is not None:
+        parts.extend(["--checkpoint", str(args.checkpoint)])
+    if getattr(args, "data", None) is not None:
+        parts.extend(["--data", str(args.data)])
+    splits = args.split if isinstance(args.split, (list, tuple)) else [args.split]
+    parts.extend(["--split", *[str(item) for item in splits]])
+    if getattr(args, "output_dir", None) is not None:
+        parts.extend(["--output-dir", str(args.output_dir)])
+    parts.extend(["--threshold", str(args.threshold)])
+    if getattr(args, "classwise", False):
+        parts.append("--classwise")
+    parts.extend(["--device", str(args.device)])
+    if getattr(args, "overwrite", False):
+        parts.append("--overwrite")
+    return " ".join(parts)
+
+
 def _collect_existing_det_infer_outputs(
     *,
     experiment_dir: Path,
@@ -2110,6 +2149,8 @@ def build_interactive_args() -> argparse.Namespace | None:
     if task in {"cls", "seg"}:
         action_options.append(("eval", "eval 评估"))
     if task == "seg":
+        action_options.append(("eda", "EDA 语义分割数据分析"))
+        action_options.append(("curate", "curate 语义分割交互式整理"))
         action_options.append(("export", "export 数据集筛选"))
     if task == "det":
         action_options.append(("eda", "EDA 数据集分析"))
@@ -2147,6 +2188,36 @@ def build_interactive_args() -> argparse.Namespace | None:
             args.image_dir = prompt_required_path("图片目录")
         return confirm_args("cls/infer", args)
 
+    if task == "seg" and action == "eda":
+        data_path = prompt_dataset_yaml("seg", _default_train_data_yaml("seg", "semantic"))
+        output_dir_raw = prompt_text("输出目录 --output-dir（留空自动生成）", None)
+        min_class_images = prompt_int("推荐删除阈值 --min-class-images（全局图片数低于此值的类推荐删除）", 10)
+        threshold_percentile = prompt_float("压缩阈值百分位 --threshold-percentile", 0.9)
+        args = argparse.Namespace(
+            tool_task="seg",
+            tool_action="eda",
+            data=data_path,
+            output_dir=Path(output_dir_raw).expanduser() if output_dir_raw else None,
+            overwrite=prompt_yes_no("输出目录非空时是否允许覆盖 --overwrite", False),
+            min_class_images=min_class_images,
+            threshold_percentile=threshold_percentile,
+        )
+        return confirm_args("seg/eda", args)
+
+    if task == "seg" and action == "curate":
+        data_path = prompt_dataset_yaml("seg", _default_train_data_yaml("seg", "semantic"))
+        eda_dir_raw = prompt_text("EDA 输出目录 --eda-dir（留空自动查找最近的 EDA）", None)
+        args = argparse.Namespace(
+            tool_task="seg",
+            tool_action="curate",
+            data=data_path,
+            eda_dir=Path(eda_dir_raw).expanduser() if eda_dir_raw else None,
+            drop_classes=None,
+            image_threshold=None,
+            export_suffix="__curated",
+        )
+        return confirm_args("seg/curate", args)
+
     if task == "seg" and action in {"infer", "eval"}:
         seg_train_type = _prompt_seg_train_type()
         experiment_dir = prompt_experiment_dir("seg", rt.EXPERIMENT_ROOT_DIR / "my_experiment_seg")
@@ -2172,20 +2243,60 @@ def build_interactive_args() -> argparse.Namespace | None:
             else:
                 args.image_dir = prompt_required_path("图片目录")
             return confirm_args("seg/infer", args)
+        data_path = prompt_dataset_yaml("seg", _default_train_data_yaml("seg", seg_train_type))
+        if seg_train_type == "semantic":
+            split_value = prompt_choice(
+                "请选择数据集划分 --split",
+                [("test", "test"), ("val", "val"), ("val test", "val + test（两个都评估）")],
+            ).split()
+        else:
+            split_value = [prompt_choice("请选择数据集划分 --split", [("test", "test"), ("val", "val")])]
+        config_mode = prompt_choice(
+            "请选择 eval 配置方式",
+            [
+                ("default", "default 默认配置"),
+                ("custom", "custom 自定义配置"),
+            ],
+        )
+        use_custom = config_mode == "custom"
+        if not use_custom:
+            print_default_seg_eval_summary(
+                seg_train_type=seg_train_type, data_path=data_path, splits=split_value
+            )
+        output_dir_raw = (
+            prompt_text("输出目录 --output-dir，直接回车写入 <experiment_dir>/eval", None)
+            if use_custom
+            else None
+        )
         args = argparse.Namespace(
             tool_task="seg",
             tool_action="eval",
+            command="eval",
             seg_train_type=seg_train_type,
             experiment_dir=experiment_dir,
             checkpoint=None,
-            data=prompt_dataset_yaml("seg", _default_train_data_yaml("seg", seg_train_type)),
-            split=prompt_choice("请选择数据集划分 --split", [("test", "test"), ("val", "val")]),
-            output_dir=Path(prompt_text("输出目录", str(experiment_dir / "eval")) or str(experiment_dir / "eval")),
-            threshold=prompt_float("分割阈值 threshold", rt.DEFAULT_SEG_THRESHOLD),
-            overwrite=prompt_yes_no("输出目录非空时是否允许覆盖", False),
-            classwise=prompt_yes_no("是否输出按类指标", False),
-            device=rt.DEFAULT_DEVICE,
+            data=data_path,
+            split=split_value,
+            output_dir=Path(output_dir_raw).expanduser() if output_dir_raw else experiment_dir / "eval",
+            threshold=0.0
+            if seg_train_type == "semantic"  # 语义分割逐像素 argmax，不过滤
+            else (
+                prompt_float("分割阈值 --threshold", rt.DEFAULT_SEG_THRESHOLD)
+                if use_custom
+                else rt.DEFAULT_SEG_THRESHOLD
+            ),
+            overwrite=prompt_yes_no("输出目录非空时是否允许覆盖 --overwrite", False)
+            if use_custom
+            else False,
+            classwise=prompt_yes_no("是否输出按类指标 --classwise", False)
+            if use_custom
+            else False,
+            device=(prompt_text("推理设备 --device", rt.DEFAULT_DEVICE) or rt.DEFAULT_DEVICE)
+            if use_custom
+            else rt.DEFAULT_DEVICE,
+            infer_config_mode=config_mode,
         )
+        print(f"\n等价命令预览:\n  {build_seg_eval_cli_preview(args)}")
         return confirm_args("seg/eval", args)
 
     if task == "det" and action == "eda":
@@ -2587,7 +2698,13 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     eval_parser.add_argument("--checkpoint", type=Path, default=rt.INFER_DEFAULT_CHECKPOINT)
     eval_parser.add_argument("--data", type=Path, default=None)
     eval_parser.add_argument("--test-dir", type=Path, default=None)
-    eval_parser.add_argument("--split", choices=("train", "val", "test"), default="test")
+    eval_parser.add_argument(
+        "--split",
+        nargs="+",
+        choices=("train", "val", "test"),
+        default=["test"],
+        help="可指定多个 split（语义分割支持一次评估多个，如 --split val test）。",
+    )
     eval_parser.add_argument("--output-dir", type=Path, default=None)
     eval_parser.add_argument("--threshold", type=float, default=None)
     eval_parser.add_argument("--topk", type=int, default=1)
@@ -2714,6 +2831,22 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--export-suffix", type=str, default=rt.SEG_EXPORT_DEFAULT_EXPORT_SUFFIX
     )
 
+    # seg-eda: 语义分割 EDA
+    seg_eda_parser = subparsers.add_parser("seg-eda")
+    seg_eda_parser.add_argument("--data", type=Path, default=rt.SEMANTIC_SEG_DEFAULT_DATA)
+    seg_eda_parser.add_argument("--output-dir", type=Path, default=None)
+    seg_eda_parser.add_argument("--overwrite", action="store_true", default=False)
+    seg_eda_parser.add_argument("--min-class-images", type=int, default=10)
+    seg_eda_parser.add_argument("--threshold-percentile", type=float, default=0.9)
+
+    # seg-curate: 语义分割交互式类别整理
+    seg_curate_parser = subparsers.add_parser("seg-curate")
+    seg_curate_parser.add_argument("--data", type=Path, default=rt.SEMANTIC_SEG_DEFAULT_DATA)
+    seg_curate_parser.add_argument("--eda-dir", type=Path, default=None)
+    seg_curate_parser.add_argument("--drop-classes", type=str, default=None, help="逗号分隔的类别 ID")
+    seg_curate_parser.add_argument("--image-threshold", type=int, default=None, help="train 每类最多保留图片数，0=不压缩")
+    seg_curate_parser.add_argument("--export-suffix", type=str, default="__curated")
+
     eda_parser = subparsers.add_parser("eda")
     eda_parser.add_argument("--data", type=Path, default=rt.INFER_DEFAULT_DATA)
     eda_parser.add_argument("--output-dir", type=Path, default=None)
@@ -2787,12 +2920,29 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
             args.data_yaml = _default_train_data_yaml(args.task, args.seg_train_type)
         if args.model is None:
             args.model = _default_train_model(args.task, args.seg_train_type)
+        if args.resume_interrupted and args.out_dir is None:
+            raise ValueError(
+                "--resume-interrupted 需要 --out-dir 指向已有实验目录"
+                "（续跑会读取该目录里的 checkpoint）；自动生成的新目录无法续跑。"
+            )
         if args.out_dir is None:
             args.out_dir = train_tools.build_default_out_dir(args.data_yaml, args.model)
         return args
     if args.command == "seg-export":
         args.tool_task = "seg"
         args.tool_action = "export"
+        return args
+    if args.command == "seg-eda":
+        args.tool_task = "seg"
+        args.tool_action = "eda"
+        if args.data is None:
+            args.data = rt.SEMANTIC_SEG_DEFAULT_DATA
+        return args
+    if args.command == "seg-curate":
+        args.tool_task = "seg"
+        args.tool_action = "curate"
+        if args.data is None:
+            args.data = rt.SEMANTIC_SEG_DEFAULT_DATA
         return args
     if args.command == "infer":
         args.tool_task = args.task

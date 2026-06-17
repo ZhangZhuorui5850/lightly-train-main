@@ -58,7 +58,12 @@ def _load_yaml_dict(path: Path) -> dict[str, Any]:
 
 
 def _resolve_data_root(cfg: dict[str, Any], data_yaml: Path) -> Path:
-    root = Path(cfg.get("path", data_yaml.parent)).expanduser()
+    raw = cfg.get("path")
+    if raw is None:
+        # 没有 path 字段时根目录就是 yaml 所在目录；不能再和 data_yaml.parent
+        # 二次拼接，否则相对路径的 yaml 会得到 .../parent/.../parent 的重复路径。
+        return data_yaml.parent.expanduser().resolve()
+    root = Path(raw).expanduser()
     if not root.is_absolute():
         root = (data_yaml.parent / root).resolve()
     return root

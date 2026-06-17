@@ -142,8 +142,9 @@ SEG_SETTINGS = {
     # 改 seg 数据集时，下面 seg_export_* 的源数据会自动跟着变
     "seg_dataset_dir": "datasets/neu_dataset/dataset_seg",
     "seg_train_type": "instance",
-    "semantic_seg_dataset_dir": "datasets/neu_dataset/dataset_semantic",
-    "semantic_seg_data_yaml": "datasets/neu_dataset/dataset_semantic/data.yaml",
+    # 语义分割默认指向真实存在的数据集（neu_dataset 下没有 dataset_semantic）。
+    "semantic_seg_dataset_dir": "datasets/aeroscapes/dataset_semantic",
+    "semantic_seg_data_yaml": "datasets/aeroscapes/dataset_semantic/data.yaml",
 
     # 阈值配置
     # seg_threshold:
