@@ -1230,7 +1230,7 @@ def run_parallel_split_infer(args) -> bool:
         return False
 
     shard_output_dirs: list[Path] = []
-    shard_processes: list[tuple[int, str, subprocess.Popen[str]]] = []
+    jobs: list[tuple[int, int, list[str]]] = []
     report_path = build_split_report_path(
         args=args,
         output_dir=final_output_dir,
@@ -1249,23 +1249,16 @@ def run_parallel_split_infer(args) -> bool:
             shard_index=shard_index,
             num_shards=num_shards,
         )
-        child_env = os.environ.copy()
-        child_env["CUDA_VISIBLE_DEVICES"] = str(int(gpu["index"]))
-        process = subprocess.Popen(command, cwd=str(rt.ROOT_DIR), env=child_env)
-        shard_processes.append((shard_index, str(int(gpu["index"])), process))
+        jobs.append((shard_index, int(gpu["index"]), command))
 
     print(f"[det/infer] split={args.split} 已进入 shard 多卡推理模式。")
     selected_gpus = eligible_gpus[:num_shards]
     for gpu in selected_gpus:
         print(f"[det/infer] 保留 {format_gpu_summary(gpu)}")
-    for shard_index, visible_device, _ in shard_processes:
-        print(f"[det/infer] shard={shard_index}/{num_shards} -> CUDA_VISIBLE_DEVICES={visible_device}")
+    for shard_index, gpu_index, _ in jobs:
+        print(f"[det/infer] shard={shard_index}/{num_shards} -> CUDA_VISIBLE_DEVICES={gpu_index}")
 
-    failed_shards: list[str] = []
-    for shard_index, _, process in shard_processes:
-        return_code = process.wait()
-        if return_code != 0:
-            failed_shards.append(f"shard_{shard_index:02d}(exit={return_code})")
+    failed_shards = gpu_parallel.run_sharded_subprocesses(jobs, cwd=rt.ROOT_DIR)
     if failed_shards:
         raise RuntimeError(f"shard infer 失败: {', '.join(failed_shards)}")
 
@@ -1340,7 +1333,7 @@ def run_parallel_all_infer(args, splits: list[str]) -> bool:
 
     shard_root = rt.infer_temp_dir(final_output_root) / "_multi_shards" / str(args.split)
     shard_output_dirs: list[Path] = []
-    shard_processes: list[tuple[int, str, subprocess.Popen[str]]] = []
+    jobs: list[tuple[int, int, list[str]]] = []
     for shard_index, gpu in enumerate(eligible_gpus[:num_shards]):
         shard_output_dir = shard_root / f"shard_{shard_index:02d}"
         shard_output_dirs.append(shard_output_dir)
@@ -1356,10 +1349,7 @@ def run_parallel_all_infer(args, splits: list[str]) -> bool:
             shard_index=shard_index,
             num_shards=num_shards,
         )
-        child_env = os.environ.copy()
-        child_env["CUDA_VISIBLE_DEVICES"] = str(int(gpu["index"]))
-        process = subprocess.Popen(command, cwd=str(rt.ROOT_DIR), env=child_env)
-        shard_processes.append((shard_index, str(int(gpu["index"])), process))
+        jobs.append((shard_index, int(gpu["index"]), command))
 
     print("[det/infer] 已进入自动多卡并行模式。")
     print(
@@ -1367,15 +1357,10 @@ def run_parallel_all_infer(args, splits: list[str]) -> bool:
     )
     for gpu in eligible_gpus:
         print(f"[det/infer] 保留 {format_gpu_summary(gpu)}")
-    for shard_index, visible_device, _ in shard_processes:
-        print(f"[det/infer] shard={shard_index}/{num_shards} -> CUDA_VISIBLE_DEVICES={visible_device}")
+    for shard_index, gpu_index, _ in jobs:
+        print(f"[det/infer] shard={shard_index}/{num_shards} -> CUDA_VISIBLE_DEVICES={gpu_index}")
 
-    failed_shards: list[str] = []
-    for shard_index, _, process in shard_processes:
-        return_code = process.wait()
-        if return_code != 0:
-            failed_shards.append(f"shard_{shard_index:02d}(exit={return_code})")
-
+    failed_shards = gpu_parallel.run_sharded_subprocesses(jobs, cwd=rt.ROOT_DIR)
     if failed_shards:
         raise RuntimeError(f"并行 infer 失败: {', '.join(failed_shards)}")
 

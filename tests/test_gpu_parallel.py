@@ -41,3 +41,27 @@ def test_filter_indices_for_shard_round_robin():
 
 def test_filter_indices_for_shard_single_shard_returns_all():
     assert gpu_parallel.filter_indices_for_shard(4, shard_index=None, num_shards=1) == [0, 1, 2, 3]
+
+
+def test_run_sharded_subprocesses_reports_failures(monkeypatch):
+    calls = []
+
+    class _FakeProc:
+        def __init__(self, returncode):
+            self._rc = returncode
+        def wait(self):
+            return self._rc
+
+    def _fake_popen(command, cwd, env):
+        calls.append((command, env.get("CUDA_VISIBLE_DEVICES")))
+        rc = 1 if "shard-1" in command else 0
+        return _FakeProc(rc)
+
+    monkeypatch.setattr(gpu_parallel.subprocess, "Popen", _fake_popen)
+    jobs = [
+        (0, 3, ["python", "x", "shard-0"]),
+        (1, 5, ["python", "x", "shard-1"]),
+    ]
+    failed = gpu_parallel.run_sharded_subprocesses(jobs, cwd="/tmp")
+    assert failed == ["shard_01(exit=1)"]
+    assert calls[0][1] == "3" and calls[1][1] == "5"

@@ -98,6 +98,30 @@ def select_fallback_single_gpu(gpus: list[dict[str, float]], eligible_gpus: list
     return f"cuda:{int(chosen['index'])}", f"[det/infer] 进入单卡顺序模式，使用 {format_gpu_summary(chosen)}"
 
 
+def run_sharded_subprocesses(
+    jobs: list[tuple[int, int, list[str]]],
+    *,
+    cwd: str | Path,
+) -> list[str]:
+    """起一组子进程，每个 pin 到一张卡，等待全部完成，返回失败 shard 描述列表。
+
+    jobs: (shard_index, gpu_index, command) 列表。
+    """
+    processes: list[tuple[int, subprocess.Popen[str]]] = []
+    for shard_index, gpu_index, command in jobs:
+        child_env = os.environ.copy()
+        child_env["CUDA_VISIBLE_DEVICES"] = str(int(gpu_index))
+        process = subprocess.Popen(command, cwd=str(cwd), env=child_env)
+        processes.append((shard_index, process))
+
+    failed: list[str] = []
+    for shard_index, process in processes:
+        return_code = process.wait()
+        if return_code != 0:
+            failed.append(f"shard_{shard_index:02d}(exit={return_code})")
+    return failed
+
+
 def filter_indices_for_shard(count: int, *, shard_index: int | None, num_shards: int) -> list[int]:
     num_shards = int(num_shards or 1)
     if shard_index is None or num_shards <= 1:
