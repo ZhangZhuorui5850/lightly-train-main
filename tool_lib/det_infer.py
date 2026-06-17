@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from . import common as rt
+from . import gpu_parallel
 from .det_shared import (
     build_legacy_report,
     draw_predictions,
@@ -54,9 +55,10 @@ def is_shard_child(args) -> bool:
 def filter_samples_for_shard(samples: list[Any], args) -> list[Any]:
     if not is_shard_child(args):
         return samples
-    shard_index = int(args.shard_index)
-    num_shards = int(args.num_shards)
-    return [sample for index, sample in enumerate(samples) if index % num_shards == shard_index]
+    indices = gpu_parallel.filter_indices_for_shard(
+        len(samples), shard_index=int(args.shard_index), num_shards=int(args.num_shards)
+    )
+    return [samples[i] for i in indices]
 
 
 def get_input_samples(args) -> tuple[list[rt.ImageSample], dict[int, str], str]:

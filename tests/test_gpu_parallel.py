@@ -31,3 +31,13 @@ def test_select_fallback_single_gpu_handles_empty():
     device, message = gpu_parallel.select_fallback_single_gpu([], [])
     assert device is None
     assert "未检测到可用 GPU" in message
+
+
+def test_filter_indices_for_shard_round_robin():
+    assert gpu_parallel.filter_indices_for_shard(7, shard_index=0, num_shards=3) == [0, 3, 6]
+    assert gpu_parallel.filter_indices_for_shard(7, shard_index=1, num_shards=3) == [1, 4]
+    assert gpu_parallel.filter_indices_for_shard(7, shard_index=2, num_shards=3) == [2, 5]
+
+
+def test_filter_indices_for_shard_single_shard_returns_all():
+    assert gpu_parallel.filter_indices_for_shard(4, shard_index=None, num_shards=1) == [0, 1, 2, 3]

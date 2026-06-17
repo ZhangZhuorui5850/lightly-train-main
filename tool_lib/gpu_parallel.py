@@ -96,3 +96,11 @@ def select_fallback_single_gpu(gpus: list[dict[str, float]], eligible_gpus: list
         return None, "[det/infer] 当前未检测到可用 GPU，进入默认顺序模式。"
     chosen = candidates[0]
     return f"cuda:{int(chosen['index'])}", f"[det/infer] 进入单卡顺序模式，使用 {format_gpu_summary(chosen)}"
+
+
+def filter_indices_for_shard(count: int, *, shard_index: int | None, num_shards: int) -> list[int]:
+    num_shards = int(num_shards or 1)
+    if shard_index is None or num_shards <= 1:
+        return list(range(count))
+    shard_index = int(shard_index)
+    return [i for i in range(count) if i % num_shards == shard_index]
