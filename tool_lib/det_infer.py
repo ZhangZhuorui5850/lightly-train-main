@@ -30,8 +30,13 @@ from .det_shared import (
     update_legacy_report_state,
 )
 from .det_report import generate_report_for_infer_output
-
-GPU_HIGH_MEMORY_RATIO_THRESHOLD = 0.75
+from .gpu_parallel import (
+    GPU_HIGH_MEMORY_RATIO_THRESHOLD,
+    filter_high_memory_gpus,
+    format_gpu_summary,
+    query_gpu_inventory,
+    select_fallback_single_gpu,
+)
 
 
 @dataclass
@@ -689,75 +694,6 @@ def build_split_report_path(
     return args.report_path.with_name(f"{stem}-{split}{suffix}")
 
 
-def query_gpu_inventory() -> tuple[list[dict[str, float]], str]:
-    if rt.torch is None or not rt.torch.cuda.is_available():
-        return [], "CUDA 当前不可用，进入单卡顺序模式。"
-
-    nvidia_smi_path = shutil.which("nvidia-smi")
-    if nvidia_smi_path is None:
-        return [], "当前环境未找到 nvidia-smi，进入单卡顺序模式。"
-
-    result = subprocess.run(
-        [
-            nvidia_smi_path,
-            "--query-gpu=index,memory.used,memory.total,utilization.gpu",
-            "--format=csv,noheader,nounits",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or "nvidia-smi 执行失败。"
-        return [], f"{message} 进入单卡顺序模式。"
-
-    gpus: list[dict[str, float]] = []
-    for raw_line in result.stdout.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 4:
-            continue
-        try:
-            index = int(parts[0])
-            memory_used = int(parts[1])
-            memory_total = int(parts[2])
-            utilization = int(parts[3])
-        except ValueError:
-            continue
-        used_ratio = float(memory_used) / float(max(memory_total, 1))
-        gpus.append(
-            {
-                "index": index,
-                "memory_used": memory_used,
-                "memory_total": memory_total,
-                "utilization": utilization,
-                "used_ratio": used_ratio,
-            }
-        )
-
-    gpus.sort(key=lambda item: (item["used_ratio"], item["memory_used"], item["utilization"], item["index"]))
-    visible_devices_raw = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if visible_devices_raw:
-        visible_indices: set[int] = set()
-        for token in visible_devices_raw.split(","):
-            token = token.strip()
-            if not token:
-                continue
-            try:
-                visible_indices.add(int(token))
-            except ValueError:
-                continue
-        if visible_indices:
-            gpus = [gpu for gpu in gpus if int(gpu["index"]) in visible_indices]
-    return gpus, ""
-
-
-def filter_high_memory_gpus(gpus: list[dict[str, float]]) -> list[dict[str, float]]:
-    return [gpu for gpu in gpus if float(gpu["used_ratio"]) < GPU_HIGH_MEMORY_RATIO_THRESHOLD]
-
-
 def split_gpu_groups_for_parallel(
     gpus: list[dict[str, float]],
     num_splits: int,
@@ -769,22 +705,6 @@ def split_gpu_groups_for_parallel(
     midpoint = (len(gpus) + 1) // 2
     groups = [gpus[:midpoint], gpus[midpoint:]]
     return [group for group in groups if group]
-
-
-def format_gpu_summary(gpu: dict[str, float]) -> str:
-    return (
-        f"GPU {int(gpu['index'])}: "
-        f"memory.used={int(gpu['memory_used'])}/{int(gpu['memory_total'])} MiB "
-        f"({float(gpu['used_ratio']):.1%}), util={int(gpu['utilization'])}%"
-    )
-
-
-def select_fallback_single_gpu(gpus: list[dict[str, float]], eligible_gpus: list[dict[str, float]]) -> tuple[str | None, str]:
-    candidates = eligible_gpus if eligible_gpus else gpus
-    if not candidates:
-        return None, "[det/infer] 当前未检测到可用 GPU，进入默认顺序模式。"
-    chosen = candidates[0]
-    return f"cuda:{int(chosen['index'])}", f"[det/infer] 进入单卡顺序模式，使用 {format_gpu_summary(chosen)}"
 
 
 def build_parallel_child_command(
