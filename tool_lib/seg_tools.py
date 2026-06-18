@@ -114,16 +114,55 @@ def _class_labels(classes: dict[int, Any], class_id: int) -> set[Any]:
 def _load_semantic_mask(mask_path: Path, classes: dict[int, Any], ignore_classes: set[int]) -> Any:
     with rt.Image.open(mask_path) as mask_image:
         mask_np = rt.np.array(mask_image)
-    compare_np = mask_np if mask_np.ndim == 3 else mask_np[:, :, None]
-    target = rt.np.full(mask_np.shape[:2], -100, dtype=rt.np.int64)
     original_to_internal = {
         class_id: internal_id
         for internal_id, class_id in enumerate(sorted(set(classes) - ignore_classes))
     }
+
+    # 收集 (label_tuple, internal_id)；单通道标签长度 1，RGB 长度 3。
+    single_pairs: list[tuple[int, int]] = []
+    rgb_pairs: list[tuple[tuple[int, int, int], int]] = []
     for class_id, internal_id in original_to_internal.items():
         for label in _class_labels(classes, class_id):
-            label_tuple = tuple(int(v) for v in label) if isinstance(label, tuple) else (int(label),)
-            target[rt.np.all(compare_np == rt.np.array(label_tuple), axis=2)] = internal_id
+            values = tuple(int(v) for v in label) if isinstance(label, tuple) else (int(label),)
+            if len(values) == 1:
+                single_pairs.append((values[0], internal_id))
+            else:
+                rgb_pairs.append((tuple(int(v) for v in values[:3]), internal_id))
+
+    if mask_np.ndim == 2 and single_pairs and not rgb_pairs:
+        max_label = max(label for label, _ in single_pairs)
+        lut = rt.np.full(max_label + 1, -100, dtype=rt.np.int64)
+        for label, internal_id in single_pairs:
+            lut[label] = internal_id
+        clipped = rt.np.clip(mask_np, 0, max_label)
+        target = rt.np.where(mask_np <= max_label, lut[clipped], -100).astype(rt.np.int64)
+        return target
+
+    # RGB（或混合）：打包成 int 后用排序键映射。
+    compare_np = mask_np if mask_np.ndim == 3 else rt.np.repeat(mask_np[:, :, None], 3, axis=2)
+    packed = (
+        compare_np[:, :, 0].astype(rt.np.int64) << 16
+    ) | (compare_np[:, :, 1].astype(rt.np.int64) << 8) | compare_np[:, :, 2].astype(rt.np.int64)
+    keys: list[int] = []
+    vals: list[int] = []
+    for (r, g, b), internal_id in rgb_pairs:
+        keys.append((r << 16) | (g << 8) | b)
+        vals.append(internal_id)
+    for label, internal_id in single_pairs:
+        keys.append((label << 16) | (label << 8) | label)
+        vals.append(internal_id)
+    target = rt.np.full(mask_np.shape[:2], -100, dtype=rt.np.int64)
+    if keys:
+        keys_arr = rt.np.array(keys, dtype=rt.np.int64)
+        vals_arr = rt.np.array(vals, dtype=rt.np.int64)
+        order = rt.np.argsort(keys_arr)
+        keys_sorted = keys_arr[order]
+        vals_sorted = vals_arr[order]
+        idx = rt.np.searchsorted(keys_sorted, packed)
+        idx_clipped = rt.np.clip(idx, 0, len(keys_sorted) - 1)
+        match = keys_sorted[idx_clipped] == packed
+        target = rt.np.where(match, vals_sorted[idx_clipped], -100).astype(rt.np.int64)
     return target
 
 
