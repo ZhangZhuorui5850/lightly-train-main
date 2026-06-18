@@ -191,3 +191,21 @@ def test_prefetch_iter_preserves_order_and_payload():
 
 def test_prefetch_iter_empty():
     assert list(seg_tools._prefetch_iter([], lambda x: x)) == []
+
+
+def test_write_seg_run_meta_records_core_fields(tmp_path):
+    args = SimpleNamespace(
+        seg_train_type="semantic", data="d.yaml", split=["test"],
+        device="auto", overwrite=False, threshold=None,
+    )
+    path = tmp_path / "run_meta.json"
+    seg_tools._write_seg_run_meta(
+        path, action="eval", checkpoint_path=tmp_path / "ck.pt",
+        output_dir=tmp_path, args=args, num_images=12, device_mode="cuda:0",
+    )
+    import json as _json
+    payload = _json.loads(path.read_text(encoding="utf-8"))
+    assert payload["task"] == "seg"
+    assert payload["action"] == "eval"
+    assert payload["num_images"] == 12
+    assert payload["settings"]["device_mode"] == "cuda:0"

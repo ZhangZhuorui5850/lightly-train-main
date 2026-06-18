@@ -264,11 +264,39 @@ def save_instance_visualization(image_path: Path, output_path: Path, prediction:
 
 
 def run_infer(args) -> None:
+    action = "infer"
     if not _is_seg_shard_child(args) and run_parallel_seg_infer(args):
         return
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
-    rt.prepare_output_dir(args.output_dir, args.overwrite)
-    model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
+    output_dir = args.output_dir
+    if getattr(args, "dry_run", False):
+        print(f"[seg/{action}] dry-run 计划")
+        print(f"  checkpoint: {checkpoint_path}")
+        print(f"  seg_train_type: {_normalize_seg_type(args)}")
+        print(f"  split: {getattr(args, 'split', None)}")
+        print(f"  output_dir: {output_dir}")
+        try:
+            print(f"  num_images: {len(_seg_infer_image_paths(args))}")
+        except Exception:  # noqa: BLE001 dry-run 仅尽力打印，拿不到数量就跳过
+            pass
+        return
+    rt.prepare_output_dir(output_dir, args.overwrite)
+
+    device_mode = args.device
+    resolved_device_arg = args.device
+    if args.device == "auto" and not _is_seg_shard_child(args):
+        all_gpus, message = gpu_parallel.query_gpu_inventory()
+        if message:
+            print(f"[seg/{action}] {message}")
+        else:
+            eligible = gpu_parallel.filter_high_memory_gpus(all_gpus)
+            chosen, choose_msg = gpu_parallel.select_fallback_single_gpu(all_gpus, eligible)
+            print(f"[seg/{action}] {choose_msg}")
+            if chosen is not None:
+                resolved_device_arg = chosen
+                device_mode = chosen
+
+    model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(resolved_device_arg))
     model.eval()
     class_names = rt.get_model_class_names(model)
     image_paths = _seg_infer_image_paths(args)
@@ -281,13 +309,20 @@ def run_infer(args) -> None:
         image_paths = [image_paths[i] for i in subset]
     for idx, image_path in enumerate(image_paths, start=1):
         prediction = predict_model(model, image_path, args.threshold)
-        out_path = args.output_dir / image_path.name
+        out_path = output_dir / image_path.name
         if isinstance(prediction, dict) and "masks" in prediction:
             save_instance_visualization(image_path, out_path, prediction, class_names)
         else:
             save_semantic_visualization(image_path, out_path, prediction, class_names)
         if idx == 1 or idx % 20 == 0 or idx == len(image_paths):
             print(f"[{idx}/{len(image_paths)}] processed: {image_path}")
+
+    if not _is_seg_shard_child(args):
+        _write_seg_run_meta(
+            output_dir / "run_meta.json",
+            action=action, checkpoint_path=checkpoint_path,
+            output_dir=output_dir, args=args, num_images=len(image_paths), device_mode=device_mode,
+        )
 
 
 def load_instance_ground_truth(label_path: Path | None, image_size: tuple[int, int]) -> tuple[dict[str, Any], bool]:
@@ -365,6 +400,31 @@ def _deserialize_instance_entry(entry: dict[str, Any]) -> tuple[dict[str, Any], 
         "masks": _stack_rle(entry["gt_masks_rle"], height_width=hw),
     }
     return prediction, target
+
+
+def _write_seg_run_meta(meta_path, *, action, checkpoint_path, output_dir, args, num_images, device_mode):
+    split_value = getattr(args, "split", None)
+    payload = {
+        "task": "seg",
+        "action": action,
+        "created_at": rt.timestamp_now_iso(),
+        "seg_train_type": str(getattr(args, "seg_train_type", "instance")),
+        "split": split_value if isinstance(split_value, str) else _normalize_splits(split_value or []),
+        "num_images": int(num_images),
+        "paths": {
+            "output_dir": str(output_dir),
+            "checkpoint_path": str(checkpoint_path),
+            "data": str(getattr(args, "data", None)) if getattr(args, "data", None) is not None else None,
+        },
+        "settings": {
+            "device": getattr(args, "device", None),
+            "device_mode": device_mode,
+            "threshold": getattr(args, "threshold", None),
+            "overwrite": getattr(args, "overwrite", None),
+        },
+    }
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def _is_seg_shard_child(args: Any) -> bool:
@@ -779,9 +839,38 @@ def _evaluate_semantic_split(
 
 
 def run_semantic_eval(args) -> None:
+    action = "eval"
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
     data_path = Path(args.data).expanduser().resolve()
-    model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
+    if getattr(args, "dry_run", False):
+        print(f"[seg/{action}] dry-run 计划")
+        print(f"  checkpoint: {checkpoint_path}")
+        print(f"  seg_train_type: {_normalize_seg_type(args)}")
+        print(f"  split: {getattr(args, 'split', None)}")
+        print(f"  output_dir: {args.output_dir}")
+        for split in _normalize_splits(args.split):
+            try:
+                samples, _, _ = _semantic_image_mask_samples(data_path, split)
+                print(f"  num_images[{split}]: {len(samples)}")
+            except Exception:  # noqa: BLE001 dry-run 仅尽力打印，拿不到数量就跳过
+                pass
+        return
+
+    device_mode = args.device
+    resolved_device_arg = args.device
+    if args.device == "auto" and not _is_seg_shard_child(args):
+        all_gpus, message = gpu_parallel.query_gpu_inventory()
+        if message:
+            print(f"[seg/{action}] {message}")
+        else:
+            eligible = gpu_parallel.filter_high_memory_gpus(all_gpus)
+            chosen, choose_msg = gpu_parallel.select_fallback_single_gpu(all_gpus, eligible)
+            print(f"[seg/{action}] {choose_msg}")
+            if chosen is not None:
+                resolved_device_arg = chosen
+                device_mode = chosen
+
+    model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(resolved_device_arg))
     model.eval()
 
     splits = _normalize_splits(args.split)
@@ -818,6 +907,12 @@ def run_semantic_eval(args) -> None:
         )
         if summary is not None:
             summaries[split] = summary
+            _write_seg_run_meta(
+                split_output_dir / "run_meta.json",
+                action=action, checkpoint_path=checkpoint_path,
+                output_dir=split_output_dir, args=args,
+                num_images=summary.get("num_images", 0), device_mode=device_mode,
+            )
 
     if _is_seg_shard_child(args):
         return
@@ -1070,12 +1165,41 @@ def run_eval(args) -> None:
         run_semantic_eval(args)
         return
 
+    action = "eval"
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
-    rt.prepare_output_dir(args.output_dir, args.overwrite)
+    output_dir = args.output_dir
     # --split 现在可能是多值列表（语义分割需要），实例评估只取第一个。
     split = _normalize_splits(args.split)[0]
+    if getattr(args, "dry_run", False):
+        print(f"[seg/{action}] dry-run 计划")
+        print(f"  checkpoint: {checkpoint_path}")
+        print(f"  seg_train_type: {seg_type}")
+        print(f"  split: {getattr(args, 'split', None)}")
+        print(f"  output_dir: {output_dir}")
+        try:
+            samples, _ = rt.list_dataset_samples(data_cfg=rt.load_data_config(args.data), split=split)
+            print(f"  num_images: {len(samples)}")
+        except Exception:  # noqa: BLE001 dry-run 仅尽力打印，拿不到数量就跳过
+            pass
+        return
+    rt.prepare_output_dir(output_dir, args.overwrite)
     data_cfg = rt.load_data_config(args.data)
-    model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
+
+    device_mode = args.device
+    resolved_device_arg = args.device
+    if args.device == "auto" and not _is_seg_shard_child(args):
+        all_gpus, message = gpu_parallel.query_gpu_inventory()
+        if message:
+            print(f"[seg/{action}] {message}")
+        else:
+            eligible = gpu_parallel.filter_high_memory_gpus(all_gpus)
+            chosen, choose_msg = gpu_parallel.select_fallback_single_gpu(all_gpus, eligible)
+            print(f"[seg/{action}] {choose_msg}")
+            if chosen is not None:
+                resolved_device_arg = chosen
+                device_mode = chosen
+
+    model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(resolved_device_arg))
     model.eval()
 
     # 分片子进程：只跑本分片、把序列化预测/标注写盘，由父进程合并出全局 mAP。
@@ -1105,7 +1229,7 @@ def run_eval(args) -> None:
     failed = accumulated["failed"]
 
     result = metric.compute_aggregated_values().metric_values
-    summary_path = args.output_dir / "seg_eval_summary.json"
+    summary_path = output_dir / "seg_eval_summary.json"
     summary_path.write_text(
         json.dumps(
             {
@@ -1125,3 +1249,10 @@ def run_eval(args) -> None:
         encoding="utf-8",
     )
     print(f"Summary saved to: {summary_path}")
+
+    if not _is_seg_shard_child(args):
+        _write_seg_run_meta(
+            output_dir / "run_meta.json",
+            action=action, checkpoint_path=checkpoint_path,
+            output_dir=output_dir, args=args, num_images=num_images, device_mode=device_mode,
+        )
