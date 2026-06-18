@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -1002,6 +1003,7 @@ def _run_parallel_seg_eval_impl(args, eligible) -> bool:
             args, shard_dirs, split=splits[0], final_output_dir=final_output_dir,
             checkpoint_path=checkpoint_path,
         )
+    shutil.rmtree(shard_root, ignore_errors=True)
     return True
 
 
@@ -1087,6 +1089,16 @@ def _run_parallel_seg_infer_impl(args, eligible) -> bool:
 
     for shard_dir in shard_dirs:
         rt.copy_tree_contents(shard_dir, final_output_dir)
+    shutil.rmtree(shard_root, ignore_errors=True)
+    _write_seg_run_meta(
+        final_output_dir / "run_meta.json",
+        action="infer",
+        checkpoint_path=checkpoint_path,
+        output_dir=final_output_dir,
+        args=args,
+        num_images=len(image_paths),
+        device_mode="sharded",
+    )
     return True
 
 
@@ -1121,6 +1133,15 @@ def _merge_parallel_semantic(
             checkpoint_path=checkpoint_path,
             data_path=data_path,
         )
+        _write_seg_run_meta(
+            split_output_dir / "run_meta.json",
+            action="eval",
+            checkpoint_path=checkpoint_path,
+            output_dir=split_output_dir,
+            args=args,
+            num_images=merged["num_samples"],
+            device_mode="sharded",
+        )
         wrote_any = True
     if not wrote_any:
         raise ValueError("No image/mask pairs found for semantic segmentation eval.")
@@ -1152,6 +1173,15 @@ def _merge_parallel_instance(args, shard_dirs, *, split, final_output_dir, check
         encoding="utf-8",
     )
     print(f"Summary saved to: {summary_path}")
+    _write_seg_run_meta(
+        final_output_dir / "run_meta.json",
+        action="eval",
+        checkpoint_path=checkpoint_path,
+        output_dir=final_output_dir,
+        args=args,
+        num_images=merged["num_images"],
+        device_mode="sharded",
+    )
 
 
 def run_eval(args) -> None:
