@@ -156,3 +156,17 @@ def test_run_parallel_seg_eval_falls_back_when_few_gpus(monkeypatch):
 def test_run_parallel_seg_eval_skips_when_device_fixed():
     args = SimpleNamespace(device="cuda:0", shard_index=None, num_shards=1, dry_run=False, data="d.yaml")
     assert seg_tools.run_parallel_seg_eval(args) is False
+
+
+def test_build_seg_eval_child_command_preserves_all_splits():
+    # --split 是 nargs="+"，重复 --split 会被覆盖；子命令必须能解析回全部 split。
+    args = SimpleNamespace(
+        seg_train_type="semantic", experiment_dir=None, checkpoint=None,
+        data="d.yaml", split=["val", "test"], classwise=False, overwrite=False,
+    )
+    command = seg_tools._build_seg_eval_child_command(
+        args, shard_index=0, num_shards=2, output_dir="/tmp/shard_00", device="auto"
+    )
+    parsed = parse_cli_args(command[2:])  # drop [python, launcher.py]; keep "eval" subcommand
+    assert parsed.split == ["val", "test"]
+    assert parsed.shard_index == 0 and parsed.num_shards == 2

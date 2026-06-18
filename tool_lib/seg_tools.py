@@ -781,8 +781,9 @@ def _build_seg_eval_child_command(args, *, shard_index, num_shards, output_dir, 
     if getattr(args, "checkpoint", None) is not None:
         command += ["--checkpoint", str(args.checkpoint)]
     command += ["--data", str(args.data)]
-    for split in _normalize_splits(args.split):
-        command += ["--split", split]
+    # --split 是 nargs="+"：必须用单个多值标志（--split val test），
+    # 重复 --split 会被 argparse 覆盖、只保留最后一个，导致多 split 静默丢失。
+    command += ["--split", *_normalize_splits(args.split)]
     command += ["--output-dir", str(output_dir), "--device", device]
     command += ["--shard-index", str(shard_index), "--num-shards", str(num_shards)]
     command += ["--skip-important-artifacts"]
