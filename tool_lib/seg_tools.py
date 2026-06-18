@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 from . import common as rt
+from . import gpu_parallel
 from . import train_tools
 from .seg_export import run_export  # noqa: F401  re-export to keep dispatch wiring simple
 
@@ -331,16 +333,69 @@ def _print_semantic_metrics(
         print(f"      {class_name:20s}  IoU={info['iou']:.4f}  TP={info['tp']}  FP={info['fp']}  FN={info['fn']}")
 
 
-def _evaluate_semantic_split(
+def _write_semantic_shard_result(
+    shard_dir: Path,
+    *,
+    split: str,
+    confusion: Any,
+    rows: list[dict[str, Any]],
+    class_names: dict[int, str],
+    num_samples: int,
+    infer_time_sum_ms: float,
+    failed: int,
+) -> Path:
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "split": split,
+        "confusion": confusion.astype(int).tolist(),
+        "rows": rows,
+        "class_names": {str(k): v for k, v in class_names.items()},
+        "num_samples": int(num_samples),
+        "infer_time_sum_ms": float(infer_time_sum_ms),
+        "failed": int(failed),
+    }
+    path = shard_dir / "seg_semantic_shard_result.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+def _merge_semantic_shard_results(shard_dirs: list[Path], *, split: str) -> dict[str, Any]:
+    confusion = None
+    rows: list[dict[str, Any]] = []
+    class_names: dict[int, str] = {}
+    num_samples = 0
+    infer_time_sum_ms = 0.0
+    failed = 0
+    for shard_dir in shard_dirs:
+        payload = json.loads((shard_dir / "seg_semantic_shard_result.json").read_text(encoding="utf-8"))
+        mat = rt.np.array(payload["confusion"], dtype=rt.np.int64)
+        confusion = mat if confusion is None else confusion + mat
+        rows.extend(payload.get("rows", []))
+        for cid_raw, name in payload.get("class_names", {}).items():
+            class_names[int(cid_raw)] = str(name)
+        num_samples += int(payload.get("num_samples", 0))
+        infer_time_sum_ms += float(payload.get("infer_time_sum_ms", 0.0))
+        failed += int(payload.get("failed", 0))
+    return {
+        "confusion": confusion,
+        "rows": rows,
+        "class_names": class_names,
+        "num_samples": num_samples,
+        "infer_time_sum_ms": infer_time_sum_ms,
+        "failed": failed,
+    }
+
+
+def _accumulate_semantic_confusion(
     model: Any,
     data_path: Path,
     split: str,
-    output_dir: Path,
     threshold: float,
-    overwrite: bool,
-    checkpoint_path: Path,
+    *,
+    shard_index: int | None = None,
+    num_shards: int = 1,
 ) -> dict[str, Any] | None:
-    """对单个 split 执行语义分割评估，保存 summary/CSV 并打印指标。"""
+    """加载样本并累积混淆矩阵，可分片、带容错与计时。无样本/无该 split 时返回 None。"""
     # 先查 yaml 里是否定义了该 split；未定义就跳过（多 split 评估时常见，
     # 不能让 load_semantic_segmentation_split_config 直接抛异常中断整轮评估）。
     if train_tools._load_yaml_dict(data_path).get(split) is None:
@@ -357,10 +412,26 @@ def _evaluate_semantic_split(
     class_names = rt.merge_class_names(rt.get_model_class_names(model), data_class_names)
     confusion = rt.np.zeros((len(class_names), len(class_names)), dtype=rt.np.int64)
     rows: list[dict[str, Any]] = []
+    infer_time_sum_ms = 0.0
+    failed = 0
 
-    print(f"\n  [{split}] 找到 {len(samples)} 个图片/掩码对")
-    for idx, (image_path, mask_path) in enumerate(samples, start=1):
-        prediction = predict_model(model, image_path, threshold)
+    shard_indices = gpu_parallel.filter_indices_for_shard(
+        len(samples), shard_index=shard_index, num_shards=num_shards
+    )
+    shard_samples = [samples[i] for i in shard_indices]
+
+    print(f"\n  [{split}] 找到 {len(samples)} 个图片/掩码对" + (
+        f"（本分片 {len(shard_samples)} 个）" if len(shard_samples) != len(samples) else ""
+    ))
+    for idx, (image_path, mask_path) in enumerate(shard_samples, start=1):
+        try:
+            start = time.perf_counter()
+            prediction = predict_model(model, image_path, threshold)
+            infer_time_sum_ms += (time.perf_counter() - start) * 1000.0
+        except Exception as exc:  # noqa: BLE001 单图失败不应中断整轮评估
+            failed += 1
+            print(f"  ⚠ 跳过 {image_path}: {exc}")
+            continue
         pred_np = _prediction_to_numpy(prediction)
         target_np = _load_semantic_mask(mask_path, classes, ignore_classes)
         pred_np = _resize_prediction_if_needed(pred_np, target_np.shape)
@@ -374,8 +445,41 @@ def _evaluate_semantic_split(
             )
             confusion += bincount.reshape((len(class_names), len(class_names)))
         rows.append({"image_path": str(image_path), "mask_path": str(mask_path), "valid_pixels": int(valid.sum())})
-        if idx == 1 or idx % 20 == 0 or idx == len(samples):
-            print(f"[{idx}/{len(samples)}] processed: {image_path}")
+        if idx == 1 or idx % 20 == 0 or idx == len(shard_samples):
+            print(f"[{idx}/{len(shard_samples)}] processed: {image_path}")
+
+    return {
+        "confusion": confusion,
+        "rows": rows,
+        "class_names": class_names,
+        "num_classes": num_classes,
+        "num_samples": len(rows),
+        "infer_time_sum_ms": infer_time_sum_ms,
+        "failed": failed,
+    }
+
+
+def _evaluate_semantic_split(
+    model: Any,
+    data_path: Path,
+    split: str,
+    output_dir: Path,
+    threshold: float,
+    overwrite: bool,
+    checkpoint_path: Path,
+) -> dict[str, Any] | None:
+    """对单个 split 执行语义分割评估，保存 summary/CSV 并打印指标。"""
+    accumulated = _accumulate_semantic_confusion(model, data_path, split, threshold)
+    if accumulated is None:
+        return None
+
+    confusion = accumulated["confusion"]
+    rows = accumulated["rows"]
+    class_names = accumulated["class_names"]
+    num_classes = accumulated["num_classes"]
+    num_samples = accumulated["num_samples"]
+    infer_time_sum_ms = accumulated["infer_time_sum_ms"]
+    failed = accumulated["failed"]
 
     metrics, per_class = _compute_semantic_iou(confusion)
     rt.prepare_output_dir(output_dir, overwrite)
@@ -387,11 +491,13 @@ def _evaluate_semantic_split(
         "checkpoint": str(checkpoint_path),
         "data": str(data_path),
         "split": split,
-        "num_images": len(samples),
+        "num_images": num_samples,
         "num_classes": num_classes,
         "class_names": class_names,
         "metrics": metrics,
         "per_class": per_class,
+        "avg_infer_time_ms": infer_time_sum_ms / max(num_samples, 1),
+        "failed_images": failed,
     }
     summary_path.write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n",

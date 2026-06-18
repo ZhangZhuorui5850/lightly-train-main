@@ -83,3 +83,19 @@ def test_load_semantic_mask_rgb_labels_matches_reference(tmp_path):
     expected = _reference_load(p, classes, ignore)
     got = seg_tools._load_semantic_mask(p, classes, ignore)
     assert np.array_equal(got, expected)
+
+
+def test_merge_semantic_confusion_equals_single(tmp_path):
+    rt.import_runtime_dependencies()
+    full = np.array([[5, 1, 0], [0, 4, 2], [1, 0, 6]], dtype=np.int64)
+    a = np.array([[3, 1, 0], [0, 1, 1], [0, 0, 3]], dtype=np.int64)
+    b = full - a
+    d1 = tmp_path / "s0"; d2 = tmp_path / "s1"
+    d1.mkdir(); d2.mkdir()
+    names = {0: "a", 1: "b", 2: "c"}
+    seg_tools._write_semantic_shard_result(d1, split="test", confusion=a, rows=[], class_names=names, num_samples=2, infer_time_sum_ms=10.0, failed=0)
+    seg_tools._write_semantic_shard_result(d2, split="test", confusion=b, rows=[], class_names=names, num_samples=3, infer_time_sum_ms=20.0, failed=0)
+    merged = seg_tools._merge_semantic_shard_results([d1, d2], split="test")
+    assert np.array_equal(merged["confusion"], full)
+    assert merged["num_samples"] == 5
+    assert merged["infer_time_sum_ms"] == 30.0
