@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
 
 from tool_lib import common as rt
@@ -99,3 +100,24 @@ def test_merge_semantic_confusion_equals_single(tmp_path):
     assert np.array_equal(merged["confusion"], full)
     assert merged["num_samples"] == 5
     assert merged["infer_time_sum_ms"] == 30.0
+
+
+def test_serialize_instance_entry_roundtrip():
+    rt.import_runtime_dependencies()
+    prediction = {
+        "labels": torch.tensor([0, 2], dtype=torch.int64),
+        "scores": torch.tensor([0.9, 0.5], dtype=torch.float32),
+        "masks": torch.tensor(
+            np.stack([np.eye(4, dtype=bool), np.ones((4, 4), dtype=bool)]),
+        ),
+    }
+    target = {
+        "labels": torch.tensor([0], dtype=torch.int64),
+        "masks": torch.tensor(np.eye(4, dtype=bool)[None]),
+    }
+    entry = seg_tools._serialize_instance_entry(prediction, target)
+    pred2, tgt2 = seg_tools._deserialize_instance_entry(entry)
+    assert torch.equal(pred2["labels"], prediction["labels"])
+    assert torch.allclose(pred2["scores"], prediction["scores"])
+    assert torch.equal(pred2["masks"], prediction["masks"])
+    assert torch.equal(tgt2["masks"], target["masks"])

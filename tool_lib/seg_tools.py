@@ -25,6 +25,7 @@ from . import common as rt
 from . import gpu_parallel
 from . import train_tools
 from .seg_export import run_export  # noqa: F401  re-export to keep dispatch wiring simple
+from .seg_shared import rle_decode, rle_encode
 
 
 def color_for_index(index: int) -> tuple[int, int, int]:
@@ -307,6 +308,166 @@ def update_metric(metric, label_mapping: dict[int, int], prediction: dict[str, A
     )
 
 
+def _serialize_instance_entry(prediction: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+    pred_masks = prediction["masks"].detach().cpu().numpy().astype(bool)
+    gt_masks = target["masks"].detach().cpu().numpy().astype(bool)
+    return {
+        "pred_labels": prediction["labels"].detach().cpu().to(rt.torch.int64).tolist(),
+        "pred_scores": prediction["scores"].detach().cpu().to(rt.torch.float32).tolist(),
+        "pred_masks_rle": [rle_encode(m) for m in pred_masks],
+        "gt_labels": target["labels"].detach().cpu().to(rt.torch.int64).tolist(),
+        "gt_masks_rle": [rle_encode(m) for m in gt_masks],
+    }
+
+
+def _stack_rle(rle_list: list[dict], *, height_width: tuple[int, int] | None) -> Any:
+    if rle_list:
+        masks = rt.np.stack([rle_decode(rle) for rle in rle_list])
+        return rt.torch.as_tensor(masks, dtype=rt.torch.bool)
+    h, w = height_width if height_width is not None else (1, 1)
+    return rt.torch.zeros((0, h, w), dtype=rt.torch.bool)
+
+
+def _deserialize_instance_entry(entry: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    all_rle = entry.get("pred_masks_rle", []) + entry.get("gt_masks_rle", [])
+    hw = (all_rle[0]["size"][0], all_rle[0]["size"][1]) if all_rle else None
+    prediction = {
+        "labels": rt.torch.as_tensor(entry["pred_labels"], dtype=rt.torch.int64),
+        "scores": rt.torch.as_tensor(entry["pred_scores"], dtype=rt.torch.float32),
+        "masks": _stack_rle(entry["pred_masks_rle"], height_width=hw),
+    }
+    target = {
+        "labels": rt.torch.as_tensor(entry["gt_labels"], dtype=rt.torch.int64),
+        "masks": _stack_rle(entry["gt_masks_rle"], height_width=hw),
+    }
+    return prediction, target
+
+
+def _is_seg_shard_child(args: Any) -> bool:
+    """子进程分片模式判定：显式给了 shard_index 且 num_shards>1 才算分片子进程。"""
+    return getattr(args, "shard_index", None) is not None and int(getattr(args, "num_shards", 1) or 1) > 1
+
+
+def _write_instance_shard_result(
+    shard_dir: Path,
+    *,
+    split: str,
+    class_names: dict[int, str],
+    entries: list[dict[str, Any]],
+    images_with_labels: int,
+    num_images: int,
+    infer_time_sum_ms: float,
+    failed: int,
+) -> Path:
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "split": split,
+        "class_names": {str(k): v for k, v in class_names.items()},
+        "entries": entries,
+        "images_with_labels": int(images_with_labels),
+        "num_images": int(num_images),
+        "infer_time_sum_ms": float(infer_time_sum_ms),
+        "failed": int(failed),
+    }
+    path = shard_dir / "seg_instance_shard_result.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+def _merge_instance_shard_results(shard_dirs: list[Path], *, classwise: bool) -> dict[str, Any]:
+    class_names: dict[int, str] = {}
+    entries: list[dict[str, Any]] = []
+    num_images = 0
+    images_with_labels = 0
+    infer_time_sum_ms = 0.0
+    failed = 0
+    for shard_dir in shard_dirs:
+        payload = json.loads((shard_dir / "seg_instance_shard_result.json").read_text(encoding="utf-8"))
+        for cid_raw, name in payload.get("class_names", {}).items():
+            class_names[int(cid_raw)] = str(name)
+        entries.extend(payload.get("entries", []))
+        num_images += int(payload.get("num_images", 0))
+        images_with_labels += int(payload.get("images_with_labels", 0))
+        infer_time_sum_ms += float(payload.get("infer_time_sum_ms", 0.0))
+        failed += int(payload.get("failed", 0))
+    metric, label_mapping = create_metric(class_names, classwise)
+    for entry in entries:
+        prediction, target = _deserialize_instance_entry(entry)
+        update_metric(metric, label_mapping, prediction, target)
+    metric_values = metric.compute_aggregated_values().metric_values
+    return {
+        "metric_values": metric_values,
+        "class_names": class_names,
+        "num_images": num_images,
+        "images_with_labels": images_with_labels,
+        "infer_time_sum_ms": infer_time_sum_ms,
+        "failed": failed,
+    }
+
+
+def _accumulate_instance_eval(
+    model: Any,
+    data_cfg: Any,
+    split: str,
+    classwise: bool,
+    *,
+    shard_index: int | None = None,
+    num_shards: int = 1,
+) -> dict[str, Any]:
+    """加载样本并累积实例分割评估，可分片、带容错与计时。
+
+    返回 metric/label_mapping（供非分片路径直接 compute）以及每图序列化 entry
+    （供分片路径写盘后由父进程合并）。
+    """
+    samples, data_class_names = rt.list_dataset_samples(data_cfg=data_cfg, split=split)
+    rt.ensure_image_samples(samples)
+    class_names = rt.merge_class_names(rt.get_model_class_names(model), data_class_names)
+    metric, label_mapping = create_metric(class_names, classwise)
+
+    shard_indices = gpu_parallel.filter_indices_for_shard(
+        len(samples), shard_index=shard_index, num_shards=num_shards
+    )
+    shard_samples = [samples[i] for i in shard_indices]
+
+    entries: list[dict[str, Any]] = []
+    images_with_labels = 0
+    infer_time_sum_ms = 0.0
+    failed = 0
+    for idx, sample in enumerate(shard_samples, start=1):
+        with rt.Image.open(sample.image_path) as image:
+            image_size = image.size
+        try:
+            start = time.perf_counter()
+            # mAP 必须吃全量带分预测：阈值过滤会截断 PR 曲线、人为压低指标，
+            # 与训练内部验证（不做阈值过滤）不一致。故评估恒用 0.0。
+            prediction = predict_model(model, sample.image_path, 0.0)
+            infer_time_sum_ms += (time.perf_counter() - start) * 1000.0
+        except Exception as exc:  # noqa: BLE001 单图失败不应中断整轮评估
+            failed += 1
+            print(f"  ⚠ 跳过 {sample.image_path}: {exc}")
+            continue
+        if not isinstance(prediction, dict) or "masks" not in prediction:
+            raise ValueError("当前 seg eval 只支持实例分割模型。")
+        target, has_label = load_instance_ground_truth(sample.label_path, image_size)
+        if has_label:
+            images_with_labels += 1
+        update_metric(metric, label_mapping, prediction, target)
+        entries.append(_serialize_instance_entry(prediction, target))
+        if idx == 1 or idx % 20 == 0 or idx == len(shard_samples):
+            print(f"[{idx}/{len(shard_samples)}] processed: {sample.image_path}")
+
+    return {
+        "class_names": class_names,
+        "entries": entries,
+        "metric": metric,
+        "label_mapping": label_mapping,
+        "num_images": len(shard_samples),
+        "images_with_labels": images_with_labels,
+        "infer_time_sum_ms": infer_time_sum_ms,
+        "failed": failed,
+    }
+
+
 def _normalize_splits(split: Any) -> list[str]:
     """把 --split 统一成列表，兼容 CLI 多值 (list) 与交互式单值 (str)。"""
     if isinstance(split, (list, tuple)):
@@ -549,28 +710,34 @@ def run_eval(args) -> None:
     # --split 现在可能是多值列表（语义分割需要），实例评估只取第一个。
     split = _normalize_splits(args.split)[0]
     data_cfg = rt.load_data_config(args.data)
-    samples, data_class_names = rt.list_dataset_samples(data_cfg=data_cfg, split=split)
-    rt.ensure_image_samples(samples)
     model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
     model.eval()
-    class_names = rt.merge_class_names(rt.get_model_class_names(model), data_class_names)
-    metric, label_mapping = create_metric(class_names, args.classwise)
 
-    images_with_labels = 0
-    for idx, sample in enumerate(samples, start=1):
-        with rt.Image.open(sample.image_path) as image:
-            image_size = image.size
-        # mAP 必须吃全量带分预测：阈值过滤会截断 PR 曲线、人为压低指标，
-        # 与训练内部验证（不做阈值过滤）不一致。故评估恒用 0.0。
-        prediction = predict_model(model, sample.image_path, 0.0)
-        if not isinstance(prediction, dict) or "masks" not in prediction:
-            raise ValueError("当前 seg eval 只支持实例分割模型。")
-        target, has_label = load_instance_ground_truth(sample.label_path, image_size)
-        if has_label:
-            images_with_labels += 1
-        update_metric(metric, label_mapping, prediction, target)
-        if idx == 1 or idx % 20 == 0 or idx == len(samples):
-            print(f"[{idx}/{len(samples)}] processed: {sample.image_path}")
+    # 分片子进程：只跑本分片、把序列化预测/标注写盘，由父进程合并出全局 mAP。
+    # mAP 是全局指标，逐分片各算各的再平均是错的，所以分片模式绝不在此计算最终指标。
+    if _is_seg_shard_child(args):
+        accumulated = _accumulate_instance_eval(
+            model, data_cfg, split, args.classwise,
+            shard_index=args.shard_index, num_shards=args.num_shards,
+        )
+        _write_instance_shard_result(
+            args.output_dir,
+            split=split,
+            class_names=accumulated["class_names"],
+            entries=accumulated["entries"],
+            images_with_labels=accumulated["images_with_labels"],
+            num_images=accumulated["num_images"],
+            infer_time_sum_ms=accumulated["infer_time_sum_ms"],
+            failed=accumulated["failed"],
+        )
+        return
+
+    accumulated = _accumulate_instance_eval(model, data_cfg, split, args.classwise)
+    metric = accumulated["metric"]
+    num_images = accumulated["num_images"]
+    images_with_labels = accumulated["images_with_labels"]
+    infer_time_sum_ms = accumulated["infer_time_sum_ms"]
+    failed = accumulated["failed"]
 
     result = metric.compute_aggregated_values().metric_values
     summary_path = args.output_dir / "seg_eval_summary.json"
@@ -580,9 +747,11 @@ def run_eval(args) -> None:
                 "checkpoint": str(checkpoint_path),
                 "data": str(args.data),
                 "split": split,
-                "num_images": len(samples),
+                "num_images": num_images,
                 "images_with_labels": images_with_labels,
                 "metrics": result,
+                "avg_infer_time_ms": infer_time_sum_ms / max(num_images, 1),
+                "failed_images": failed,
             },
             indent=2,
             ensure_ascii=False,
