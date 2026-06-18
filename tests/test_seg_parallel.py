@@ -179,3 +179,15 @@ def test_run_parallel_seg_infer_falls_back_single_gpu(monkeypatch):
     )
     args = SimpleNamespace(device="auto", shard_index=None, num_shards=1, dry_run=False)
     assert seg_tools.run_parallel_seg_infer(args) is False
+
+
+def test_prefetch_iter_preserves_order_and_payload():
+    def _load(x):
+        return x * 10
+    items = [1, 2, 3, 4]
+    out = list(seg_tools._prefetch_iter(items, _load))
+    assert out == [(1, 10), (2, 20), (3, 30), (4, 40)]
+
+
+def test_prefetch_iter_empty():
+    assert list(seg_tools._prefetch_iter([], lambda x: x)) == []

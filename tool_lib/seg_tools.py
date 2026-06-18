@@ -42,11 +42,27 @@ def color_for_index(index: int) -> tuple[int, int, int]:
     return palette[index % len(palette)]
 
 
-def predict_model(model: Any, image_path: Path, threshold: float) -> Any:
+def _prefetch_iter(items: list[Any], load_fn):
+    """单 worker 预取：消费当前项时后台解码下一项。产出 (item, loaded) 保序。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not items:
+        return
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(load_fn, items[0])
+        for index in range(len(items)):
+            loaded = future.result()
+            if index + 1 < len(items):
+                future = executor.submit(load_fn, items[index + 1])
+            yield items[index], loaded
+
+
+def predict_model(model: Any, image: Any, threshold: float) -> Any:
+    arg = image if not isinstance(image, (str, Path)) else str(image)
     try:
-        return model.predict(str(image_path), threshold=threshold)
+        return model.predict(arg, threshold=threshold)
     except TypeError:
-        return model.predict(str(image_path))
+        return model.predict(arg)
 
 
 def _normalize_seg_type(args: Any) -> str:
@@ -441,14 +457,27 @@ def _accumulate_instance_eval(
     images_with_labels = 0
     infer_time_sum_ms = 0.0
     failed = 0
-    for idx, sample in enumerate(shard_samples, start=1):
-        with rt.Image.open(sample.image_path) as image:
-            image_size = image.size
+    # 后台解码下一张图，与当前图的 GPU 推理重叠。不强制 .convert("RGB")：
+    # 上游 model.predict 对 path/PIL 都不会强制转 RGB；image_size 取自 PIL 的
+    # .size (W, H)，与原先单独打开取 size 等价。解码异常延后到 try 里抛出，
+    # 使坏图计入 failed 并跳过。
+    def _load_image(sample):
         try:
+            return rt.Image.open(sample.image_path), None
+        except Exception as exc:  # noqa: BLE001 解码失败延后到主线程处理
+            return None, exc
+
+    for idx, (sample, (image, load_error)) in enumerate(
+        _prefetch_iter(shard_samples, _load_image), start=1
+    ):
+        try:
+            if load_error is not None:
+                raise load_error
+            image_size = image.size
             start = time.perf_counter()
             # mAP 必须吃全量带分预测：阈值过滤会截断 PR 曲线、人为压低指标，
             # 与训练内部验证（不做阈值过滤）不一致。故评估恒用 0.0。
-            prediction = predict_model(model, sample.image_path, 0.0)
+            prediction = predict_model(model, image, 0.0)
             infer_time_sum_ms += (time.perf_counter() - start) * 1000.0
         except Exception as exc:  # noqa: BLE001 单图失败不应中断整轮评估
             failed += 1
@@ -592,10 +621,26 @@ def _accumulate_semantic_confusion(
     print(f"\n  [{split}] 找到 {len(samples)} 个图片/掩码对" + (
         f"（本分片 {len(shard_samples)} 个）" if len(shard_samples) != len(samples) else ""
     ))
-    for idx, (image_path, mask_path) in enumerate(shard_samples, start=1):
+    # 后台解码下一张图，与当前图的 GPU 推理重叠。不强制 .convert("RGB")：
+    # 上游 model.predict 对 path/PIL 都不会强制转 RGB，强制转换会改变非 RGB
+    # 图的输入张量、进而改变数值结果。保持与上游一致。
+    # 解码异常在 worker 里捕获后随返回值带出，留到循环体的 try 里再抛，
+    # 这样坏图仍被计入 failed 并跳过（保持原有逐图容错语义）。
+    def _load_image(sample):
+        image_path, _mask_path = sample
         try:
+            return rt.Image.open(image_path), None
+        except Exception as exc:  # noqa: BLE001 解码失败延后到主线程处理
+            return None, exc
+
+    for idx, ((image_path, mask_path), (image, load_error)) in enumerate(
+        _prefetch_iter(shard_samples, _load_image), start=1
+    ):
+        try:
+            if load_error is not None:
+                raise load_error
             start = time.perf_counter()
-            prediction = predict_model(model, image_path, threshold)
+            prediction = predict_model(model, image, threshold)
             infer_time_sum_ms += (time.perf_counter() - start) * 1000.0
         except Exception as exc:  # noqa: BLE001 单图失败不应中断整轮评估
             failed += 1
