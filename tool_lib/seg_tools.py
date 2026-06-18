@@ -248,6 +248,8 @@ def save_instance_visualization(image_path: Path, output_path: Path, prediction:
 
 
 def run_infer(args) -> None:
+    if not _is_seg_shard_child(args) and run_parallel_seg_infer(args):
+        return
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
     rt.prepare_output_dir(args.output_dir, args.overwrite)
     model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(args.device))
@@ -256,6 +258,11 @@ def run_infer(args) -> None:
     image_paths = _seg_infer_image_paths(args)
     if not image_paths:
         raise ValueError("没有找到可推理的图片。")
+    if _is_seg_shard_child(args):
+        subset = gpu_parallel.filter_indices_for_shard(
+            len(image_paths), shard_index=args.shard_index, num_shards=args.num_shards
+        )
+        image_paths = [image_paths[i] for i in subset]
     for idx, image_path in enumerate(image_paths, start=1):
         prediction = predict_model(model, image_path, args.threshold)
         out_path = args.output_dir / image_path.name
@@ -855,6 +862,91 @@ def _run_parallel_seg_eval_impl(args, eligible) -> bool:
             args, shard_dirs, split=splits[0], final_output_dir=final_output_dir,
             checkpoint_path=checkpoint_path,
         )
+    return True
+
+
+def _build_seg_infer_child_command(args, *, shard_index, num_shards, output_dir, device="auto") -> list[str]:
+    command = [sys.executable, str(rt.ROOT_DIR / "launcher.py"), "infer", "--task", "seg"]
+    command += ["--seg-train-type", str(getattr(args, "seg_train_type", "instance"))]
+    if getattr(args, "experiment_dir", None) is not None:
+        command += ["--experiment-dir", str(args.experiment_dir)]
+    if getattr(args, "checkpoint", None) is not None:
+        command += ["--checkpoint", str(args.checkpoint)]
+    # 复刻 _seg_infer_image_paths 的输入解析优先级：data > image_dir > image，
+    # 子进程才能重建同一份图片列表再分片。
+    if getattr(args, "data", None) is not None:
+        command += ["--data", str(args.data)]
+        # infer 的 --split 是单值 choices（非 nargs），传单个值即可。
+        command += ["--split", str(args.split)]
+    elif getattr(args, "image_dir", None) is not None:
+        command += ["--image-dir", str(args.image_dir)]
+    elif getattr(args, "image", None) is not None:
+        command += ["--image", str(args.image)]
+    command += ["--output-dir", str(output_dir), "--device", device]
+    command += ["--shard-index", str(shard_index), "--num-shards", str(num_shards)]
+    command += ["--skip-important-artifacts"]
+    if getattr(args, "threshold", None) is not None:
+        command += ["--threshold", str(args.threshold)]
+    if getattr(args, "overwrite", False):
+        command += ["--overwrite"]
+    return command
+
+
+def run_parallel_seg_infer(args) -> bool:
+    if getattr(args, "device", "auto") != "auto":
+        return False
+    if _is_seg_shard_child(args) or getattr(args, "dry_run", False):
+        return False
+    all_gpus, message = gpu_parallel.query_gpu_inventory()
+    if message:
+        print(f"[seg/infer] {message}")
+        return False
+    eligible = gpu_parallel.filter_high_memory_gpus(all_gpus)
+    if len(eligible) < 2:
+        print(f"[seg/infer] 可用 GPU 数量为 {len(eligible)}，进入单卡顺序模式。")
+        return False
+    return _run_parallel_seg_infer_impl(args, eligible)
+
+
+def _run_parallel_seg_infer_impl(args, eligible) -> bool:
+    checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
+    # args.output_dir 在 parse_cli_args 阶段已默认成 <experiment_dir>/infer，
+    # 与顺序路径 run_infer 一致；这里直接沿用，保证并行/顺序写到同一处。
+    final_output_dir = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None
+        else rt.experiment_dir_from_checkpoint_path(checkpoint_path) / "infer"
+    )
+    rt.prepare_output_dir(final_output_dir, args.overwrite)
+
+    image_paths = _seg_infer_image_paths(args)
+    num_shards = min(len(eligible), len(image_paths))
+    if num_shards < 2:
+        print(f"[seg/infer] 待推理图片数量为 {len(image_paths)}，进入单卡顺序模式。")
+        return False
+
+    shard_root = final_output_dir / "_shards"
+    shard_dirs = [shard_root / f"shard_{i:02d}" for i in range(num_shards)]
+
+    jobs: list[tuple[int, int, list[str]]] = []
+    for i in range(num_shards):
+        command = _build_seg_infer_child_command(
+            args, shard_index=i, num_shards=num_shards, output_dir=shard_dirs[i], device="auto"
+        )
+        jobs.append((i, int(eligible[i]["index"]), command))
+
+    print("[seg/infer] 已进入自动多卡并行模式。")
+    for gpu in eligible[:num_shards]:
+        print(f"[seg/infer] 保留 {gpu_parallel.format_gpu_summary(gpu)}")
+    for shard_index, gpu_index, _ in jobs:
+        print(f"[seg/infer] shard={shard_index}/{num_shards} -> CUDA_VISIBLE_DEVICES={gpu_index}")
+
+    failed = gpu_parallel.run_sharded_subprocesses(jobs, cwd=rt.ROOT_DIR)
+    if failed:
+        raise RuntimeError(f"seg infer shard 失败: {', '.join(failed)}")
+
+    for shard_dir in shard_dirs:
+        rt.copy_tree_contents(shard_dir, final_output_dir)
     return True
 
 

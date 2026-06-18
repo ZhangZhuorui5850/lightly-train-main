@@ -170,3 +170,12 @@ def test_build_seg_eval_child_command_preserves_all_splits():
     parsed = parse_cli_args(command[2:])  # drop [python, launcher.py]; keep "eval" subcommand
     assert parsed.split == ["val", "test"]
     assert parsed.shard_index == 0 and parsed.num_shards == 2
+
+
+def test_run_parallel_seg_infer_falls_back_single_gpu(monkeypatch):
+    monkeypatch.setattr(
+        seg_tools.gpu_parallel, "query_gpu_inventory",
+        lambda: ([{"index": 0, "used_ratio": 0.1, "memory_used": 0, "memory_total": 1, "utilization": 0}], ""),
+    )
+    args = SimpleNamespace(device="auto", shard_index=None, num_shards=1, dry_run=False)
+    assert seg_tools.run_parallel_seg_infer(args) is False
