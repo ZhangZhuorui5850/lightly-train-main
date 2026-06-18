@@ -193,6 +193,89 @@ def test_prefetch_iter_empty():
     assert list(seg_tools._prefetch_iter([], lambda x: x)) == []
 
 
+def test_semantic_eval_gapped_class_ids_produces_correct_miou(tmp_path, monkeypatch):
+    """Gapped class IDs {0,2,5} must not cause confusion matrix misalignment.
+
+    _load_semantic_mask compresses GT to contiguous internal IDs (sorted order),
+    while model.predict returns original IDs. Without a unified mapping, the
+    two ID spaces diverge after the first gap, producing mIoU ≈ 0 even for
+    perfect predictions.
+    """
+    rt.import_runtime_dependencies()
+
+    model_class_ids = [0, 2, 5]
+    model_classes = {0: "bg", 2: "cls_a", 5: "cls_b"}
+
+    class _FakeModel:
+        classes = model_classes
+        def eval(self):
+            pass
+
+    model = _FakeModel()
+
+    data_cfg = {
+        "val": {"images": str(tmp_path / "images"), "masks": str(tmp_path / "masks")},
+        "classes": {0: "bg", 1: "ignore", 2: "cls_a", 5: "cls_b"},
+        "ignore_classes": {1},
+    }
+    monkeypatch.setattr(
+        seg_tools.train_tools, "_load_yaml_dict",
+        lambda _dp: {"val": data_cfg["val"]},
+    )
+    monkeypatch.setattr(
+        seg_tools.train_tools, "load_semantic_segmentation_split_config",
+        lambda _dp, _sp: data_cfg,
+    )
+    monkeypatch.setattr(
+        seg_tools, "_semantic_image_mask_samples",
+        lambda _dp, _sp: (
+            [(tmp_path / "images" / "0.png", tmp_path / "masks" / "0.png")],
+            model_classes,
+            len(model_classes),
+        ),
+    )
+
+    # 4×4 mask with original class IDs: 0 (bg), 1 (ignore), 2, 5.
+    mask_arr = np.array([[0, 1, 2, 5],
+                         [1, 0, 5, 2],
+                         [2, 5, 0, 1],
+                         [5, 2, 1, 0]], dtype=np.uint8)
+    mask_path = tmp_path / "masks" / "0.png"
+    mask_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(mask_arr, mode="L").save(mask_path)
+    # Dummy image (must exist on disk; predict_model is monkeypatched).
+    img_path = tmp_path / "images" / "0.png"
+    img_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(img_path)
+
+    # Model predicts exactly the same original IDs — perfect predictions.
+    def _fake_predict(_model, _image, _threshold):
+        return torch.tensor(mask_arr, dtype=torch.int64)
+
+    def _fake_to_numpy(prediction):
+        return prediction.numpy()
+
+    monkeypatch.setattr(seg_tools, "predict_model", _fake_predict)
+    monkeypatch.setattr(seg_tools, "_prediction_to_numpy", _fake_to_numpy)
+
+    result = seg_tools._accumulate_semantic_confusion(
+        model, tmp_path / "data.yaml", "val", threshold=0.0,
+    )
+
+    assert result is not None
+    assert result["class_names"] == model_classes
+    assert result["confusion"].shape == (len(model_class_ids), len(model_class_ids))
+
+    # All non-ignore pixels (12 of 16) should be perfectly predicted.
+    confusion = result["confusion"]
+    assert confusion.sum() == 12
+    for i in range(len(model_class_ids)):
+        assert confusion[i, i] == 4  # 4 pixels per class in the 4×4 mask
+
+    metrics, _ = seg_tools._compute_semantic_iou(confusion)
+    assert metrics["miou"] == 1.0
+
+
 def test_write_seg_run_meta_records_core_fields(tmp_path):
     args = SimpleNamespace(
         seg_train_type="semantic", data="d.yaml", split=["test"],

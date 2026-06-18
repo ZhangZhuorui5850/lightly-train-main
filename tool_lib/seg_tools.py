@@ -580,6 +580,9 @@ def _print_semantic_metrics(
     class_names: dict[int, str],
 ) -> None:
     """把单个 split 的 mIoU / Pixel Accuracy / 逐类 IoU 打印到控制台。"""
+    # per_class 的 key 是混淆矩阵连续下标（0..K-1），class_names 的 key 是
+    # 模型原始类别 ID；用排序后的 ID 列表做下标→名称的映射。
+    sorted_ids = sorted(class_names)
     print(f"\n  {'=' * 50}")
     print(f"    [{split}] 评估结果")
     print(f"  {'=' * 50}")
@@ -588,7 +591,8 @@ def _print_semantic_metrics(
     print(f"  {'=' * 50}")
     print(f"    逐类 IoU:")
     for class_id_str, info in per_class.items():
-        class_name = class_names.get(int(class_id_str), f"class_{class_id_str}")
+        idx = int(class_id_str)
+        class_name = class_names[sorted_ids[idx]] if idx < len(sorted_ids) else f"class_{class_id_str}"
         print(f"      {class_name:20s}  IoU={info['iou']:.4f}  TP={info['tp']}  FP={info['fp']}  FN={info['fn']}")
 
 
@@ -668,8 +672,31 @@ def _accumulate_semantic_confusion(
 
     classes = data_cfg["classes"]
     ignore_classes = {int(item) for item in data_cfg.get("ignore_classes", set()) or set()}
-    class_names = rt.merge_class_names(rt.get_model_class_names(model), data_class_names)
-    confusion = rt.np.zeros((len(class_names), len(class_names)), dtype=rt.np.int64)
+
+    # 以模型类别 ID 为唯一权威类表，构造 → 混淆矩阵下标的映射。
+    # _load_semantic_mask 内部会把 GT 压成 sorted(classes-ignore) 的连续 ID，
+    # 而 model.predict 返回原始类别 ID；两套编号在第一个缺口后错位。
+    # 统一映射确保 GT 和 predictions 都落在同一张混淆矩阵里。
+    class_names = rt.get_model_class_names(model)
+    model_class_ids = sorted(class_names)
+    num_eval_classes = len(model_class_ids)
+    model_class_to_idx = {cid: i for i, cid in enumerate(model_class_ids)}
+
+    # _load_semantic_mask 输出的 internal ID 对应 sorted(data_classes - ignore)，
+    # 需要先还原到原始 ID 再映射到统一索引。
+    data_class_ids_sorted = sorted(set(classes) - ignore_classes)
+    internal_to_model_idx = rt.np.full(len(data_class_ids_sorted) + 1, -1, dtype=rt.np.int64)
+    for internal_id, orig_id in enumerate(data_class_ids_sorted):
+        if orig_id in model_class_to_idx:
+            internal_to_model_idx[internal_id] = model_class_to_idx[orig_id]
+
+    # 预测的原始 ID → 统一索引（不在模型类表中的 ID 得 -1）。
+    pred_lut_size = (max(model_class_ids) + 1) if model_class_ids else 1
+    pred_remap = rt.np.full(pred_lut_size, -1, dtype=rt.np.int64)
+    for cid, idx in model_class_to_idx.items():
+        pred_remap[cid] = idx
+
+    confusion = rt.np.zeros((num_eval_classes, num_eval_classes), dtype=rt.np.int64)
     rows: list[dict[str, Any]] = []
     infer_time_sum_ms = 0.0
     failed = 0
@@ -710,15 +737,31 @@ def _accumulate_semantic_confusion(
         pred_np = _prediction_to_numpy(prediction)
         target_np = _load_semantic_mask(mask_path, classes, ignore_classes)
         pred_np = _resize_prediction_if_needed(pred_np, target_np.shape)
-        valid = target_np != -100
-        valid &= pred_np >= 0
-        valid &= pred_np < len(class_names)
+
+        # GT: internal ID → 统一索引（-100 保持不变用于忽略）
+        target_clipped = rt.np.clip(target_np, 0, len(internal_to_model_idx) - 1)
+        target_remapped = rt.np.where(
+            target_np == -100, -100,
+            rt.np.where(
+                (target_np >= 0) & (target_np < len(internal_to_model_idx)),
+                internal_to_model_idx[target_clipped], -100,
+            ),
+        )
+        # predictions: 原始 ID → 统一索引（越界或不在模型类表中的 → -1）
+        pred_clipped = rt.np.clip(pred_np, 0, pred_lut_size - 1)
+        pred_remapped = rt.np.where(
+            (pred_np >= 0) & (pred_np < pred_lut_size),
+            pred_remap[pred_clipped], -1,
+        )
+
+        valid = target_remapped >= 0
+        valid &= pred_remapped >= 0
         if valid.any():
             bincount = rt.np.bincount(
-                len(class_names) * target_np[valid].astype(rt.np.int64) + pred_np[valid].astype(rt.np.int64),
-                minlength=len(class_names) ** 2,
+                num_eval_classes * target_remapped[valid] + pred_remapped[valid],
+                minlength=num_eval_classes ** 2,
             )
-            confusion += bincount.reshape((len(class_names), len(class_names)))
+            confusion += bincount.reshape((num_eval_classes, num_eval_classes))
         rows.append({"image_path": str(image_path), "mask_path": str(mask_path), "valid_pixels": int(valid.sum())})
         if idx == 1 or idx % 20 == 0 or idx == len(shard_samples):
             print(f"[{idx}/{len(shard_samples)}] processed: {image_path}")
