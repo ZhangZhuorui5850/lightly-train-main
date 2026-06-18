@@ -9,6 +9,26 @@ from PIL import Image
 from tool_lib import common as rt
 from tool_lib import seg_shared
 from tool_lib import seg_tools
+from tool_lib.interactive import parse_cli_args
+
+
+def test_eval_parser_accepts_shard_flags():
+    args = parse_cli_args([
+        "eval", "--task", "seg", "--data", "d.yaml",
+        "--shard-index", "1", "--num-shards", "3", "--dry-run",
+        "--skip-important-artifacts",
+    ])
+    assert args.shard_index == 1
+    assert args.num_shards == 3
+    assert args.dry_run is True
+    assert args.skip_important_artifacts is True
+
+
+def test_eval_parser_shard_defaults():
+    args = parse_cli_args(["eval", "--task", "seg", "--data", "d.yaml"])
+    assert args.shard_index is None
+    assert args.num_shards == 1
+    assert args.dry_run is False
 
 
 def _roundtrip(mask):

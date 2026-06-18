@@ -2295,6 +2295,12 @@ def build_interactive_args() -> argparse.Namespace | None:
             if use_custom
             else rt.DEFAULT_DEVICE,
             infer_config_mode=config_mode,
+            shard_index=None,
+            num_shards=1,
+            dry_run=False,
+            skip_important_artifacts=False,
+            selected_splits=None,
+            multi_output_root=None,
         )
         print(f"\n等价命令预览:\n  {build_seg_eval_cli_preview(args)}")
         return confirm_args("seg/eval", args)
@@ -2711,6 +2717,12 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     eval_parser.add_argument("--classwise", action="store_true", default=False)
     eval_parser.add_argument("--device", type=str, default=rt.INFER_DEFAULT_DEVICE)
     eval_parser.add_argument("--overwrite", action="store_true", default=rt.INFER_DEFAULT_OVERWRITE)
+    eval_parser.add_argument("--dry-run", action="store_true", default=False)
+    eval_parser.add_argument("--skip-important-artifacts", action="store_true", default=False, help=argparse.SUPPRESS)
+    eval_parser.add_argument("--selected-splits", type=str, default=None, help=argparse.SUPPRESS)
+    eval_parser.add_argument("--multi-output-root", type=Path, default=None, help=argparse.SUPPRESS)
+    eval_parser.add_argument("--shard-index", type=int, default=None, help=argparse.SUPPRESS)
+    eval_parser.add_argument("--num-shards", type=int, default=1, help=argparse.SUPPRESS)
 
     export_parser = subparsers.add_parser("export")
     export_parser.add_argument("--report-json", type=Path, default=None)
