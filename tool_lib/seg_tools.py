@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -620,28 +621,22 @@ def _accumulate_semantic_confusion(
     }
 
 
-def _evaluate_semantic_split(
-    model: Any,
-    data_path: Path,
-    split: str,
+def _write_semantic_summary(
     output_dir: Path,
-    threshold: float,
+    *,
+    split: str,
+    confusion: Any,
+    rows: list[dict[str, Any]],
+    class_names: dict[int, str],
+    num_classes: int,
+    num_samples: int,
+    infer_time_sum_ms: float,
+    failed: int,
     overwrite: bool,
     checkpoint_path: Path,
-) -> dict[str, Any] | None:
-    """对单个 split 执行语义分割评估，保存 summary/CSV 并打印指标。"""
-    accumulated = _accumulate_semantic_confusion(model, data_path, split, threshold)
-    if accumulated is None:
-        return None
-
-    confusion = accumulated["confusion"]
-    rows = accumulated["rows"]
-    class_names = accumulated["class_names"]
-    num_classes = accumulated["num_classes"]
-    num_samples = accumulated["num_samples"]
-    infer_time_sum_ms = accumulated["infer_time_sum_ms"]
-    failed = accumulated["failed"]
-
+    data_path: Path,
+) -> dict[str, Any]:
+    """计算 IoU、写 summary/CSV 并打印指标。顺序路径与并行合并路径共用，保证产物字节一致。"""
     metrics, per_class = _compute_semantic_iou(confusion)
     rt.prepare_output_dir(output_dir, overwrite)
     summary_path = output_dir / "seg_semantic_eval_summary.json"
@@ -670,6 +665,67 @@ def _evaluate_semantic_split(
     return summary
 
 
+def _evaluate_semantic_split(
+    model: Any,
+    data_path: Path,
+    split: str,
+    output_dir: Path,
+    threshold: float,
+    overwrite: bool,
+    checkpoint_path: Path,
+    *,
+    shard_index: int | None = None,
+    num_shards: int = 1,
+) -> dict[str, Any] | None:
+    """对单个 split 执行语义分割评估，保存 summary/CSV 并打印指标。
+
+    分片子进程模式（shard_index 给定且 num_shards>1）下不写最终 summary，
+    而是把本分片的混淆矩阵/rows 写成 shard result，留给父进程合并。
+    """
+    accumulated = _accumulate_semantic_confusion(
+        model, data_path, split, threshold, shard_index=shard_index, num_shards=num_shards
+    )
+    if accumulated is None:
+        return None
+
+    confusion = accumulated["confusion"]
+    rows = accumulated["rows"]
+    class_names = accumulated["class_names"]
+    num_classes = accumulated["num_classes"]
+    num_samples = accumulated["num_samples"]
+    infer_time_sum_ms = accumulated["infer_time_sum_ms"]
+    failed = accumulated["failed"]
+
+    if shard_index is not None and int(num_shards or 1) > 1:
+        # 分片子进程：每个 split 写到 output_dir/<split>/，父进程按 split 合并。
+        _write_semantic_shard_result(
+            output_dir / split,
+            split=split,
+            confusion=confusion,
+            rows=rows,
+            class_names=class_names,
+            num_samples=num_samples,
+            infer_time_sum_ms=infer_time_sum_ms,
+            failed=failed,
+        )
+        return None
+
+    return _write_semantic_summary(
+        output_dir,
+        split=split,
+        confusion=confusion,
+        rows=rows,
+        class_names=class_names,
+        num_classes=num_classes,
+        num_samples=num_samples,
+        infer_time_sum_ms=infer_time_sum_ms,
+        failed=failed,
+        overwrite=overwrite,
+        checkpoint_path=checkpoint_path,
+        data_path=data_path,
+    )
+
+
 def run_semantic_eval(args) -> None:
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
     data_path = Path(args.data).expanduser().resolve()
@@ -684,6 +740,21 @@ def run_semantic_eval(args) -> None:
         # 语义分割是逐像素 argmax，没有可过滤的"检测列表"；阈值过滤只会人为
         # 砍掉低分像素、压低 mIoU，与训练内部验证不一致。故恒用 0.0（不过滤），
         # 与实例分割 eval 强制 0.0 的做法一致。args.threshold 对语义分割无效。
+        # 分片子进程：每个 split 写到 args.output_dir/<split>/（无论单/多 split），
+        # 父进程统一按 split 在该目录下合并。故 shard 模式不走多 split 子目录分支。
+        if _is_seg_shard_child(args):
+            summary = _evaluate_semantic_split(
+                model=model,
+                data_path=data_path,
+                split=split,
+                output_dir=args.output_dir,
+                threshold=0.0,
+                overwrite=args.overwrite,
+                checkpoint_path=checkpoint_path,
+                shard_index=args.shard_index,
+                num_shards=args.num_shards,
+            )
+            continue
         summary = _evaluate_semantic_split(
             model=model,
             data_path=data_path,
@@ -696,12 +767,168 @@ def run_semantic_eval(args) -> None:
         if summary is not None:
             summaries[split] = summary
 
+    if _is_seg_shard_child(args):
+        return
     if not summaries:
         raise ValueError("No image/mask pairs found for semantic segmentation eval.")
 
 
+def _build_seg_eval_child_command(args, *, shard_index, num_shards, output_dir, device="auto") -> list[str]:
+    command = [sys.executable, str(rt.ROOT_DIR / "launcher.py"), "eval", "--task", "seg"]
+    command += ["--seg-train-type", str(getattr(args, "seg_train_type", "instance"))]
+    if getattr(args, "experiment_dir", None) is not None:
+        command += ["--experiment-dir", str(args.experiment_dir)]
+    if getattr(args, "checkpoint", None) is not None:
+        command += ["--checkpoint", str(args.checkpoint)]
+    command += ["--data", str(args.data)]
+    for split in _normalize_splits(args.split):
+        command += ["--split", split]
+    command += ["--output-dir", str(output_dir), "--device", device]
+    command += ["--shard-index", str(shard_index), "--num-shards", str(num_shards)]
+    command += ["--skip-important-artifacts"]
+    if getattr(args, "classwise", False):
+        command += ["--classwise"]
+    if getattr(args, "overwrite", False):
+        command += ["--overwrite"]
+    return command
+
+
+def run_parallel_seg_eval(args) -> bool:
+    if getattr(args, "device", "auto") != "auto":
+        return False
+    if _is_seg_shard_child(args) or getattr(args, "dry_run", False):
+        return False
+    all_gpus, message = gpu_parallel.query_gpu_inventory()
+    if message:
+        print(f"[seg/eval] {message}")
+        return False
+    eligible = gpu_parallel.filter_high_memory_gpus(all_gpus)
+    if len(eligible) < 2:
+        print(f"[seg/eval] 可用 GPU 数量为 {len(eligible)}，进入单卡顺序模式。")
+        return False
+    return _run_parallel_seg_eval_impl(args, eligible)
+
+
+def _run_parallel_seg_eval_impl(args, eligible) -> bool:
+    semantic = _normalize_seg_type(args) == "semantic"
+    checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
+    data_path = Path(args.data).expanduser().resolve()
+    # args.output_dir 在 parse_cli_args 阶段已默认成 <experiment_dir>/eval，
+    # 与顺序路径一致；这里直接沿用，保证并行/顺序写到同一处。
+    final_output_dir = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None
+        else rt.experiment_dir_from_checkpoint_path(checkpoint_path) / "eval"
+    )
+    splits = _normalize_splits(args.split)
+    rt.prepare_output_dir(final_output_dir, args.overwrite)
+
+    num_shards = len(eligible)
+    shard_root = final_output_dir / "_shards"
+    shard_dirs = [shard_root / f"shard_{i:02d}" for i in range(num_shards)]
+
+    jobs: list[tuple[int, int, list[str]]] = []
+    for i, gpu in enumerate(eligible):
+        command = _build_seg_eval_child_command(
+            args, shard_index=i, num_shards=num_shards, output_dir=shard_dirs[i], device="auto"
+        )
+        jobs.append((i, int(gpu["index"]), command))
+
+    print("[seg/eval] 已进入自动多卡并行模式。")
+    for gpu in eligible:
+        print(f"[seg/eval] 保留 {gpu_parallel.format_gpu_summary(gpu)}")
+    for shard_index, gpu_index, _ in jobs:
+        print(f"[seg/eval] shard={shard_index}/{num_shards} -> CUDA_VISIBLE_DEVICES={gpu_index}")
+
+    failed = gpu_parallel.run_sharded_subprocesses(jobs, cwd=rt.ROOT_DIR)
+    if failed:
+        raise RuntimeError(f"seg eval shard 失败: {', '.join(failed)}")
+
+    if semantic:
+        _merge_parallel_semantic(
+            args, shard_dirs, splits=splits, final_output_dir=final_output_dir,
+            checkpoint_path=checkpoint_path, data_path=data_path,
+        )
+    else:
+        _merge_parallel_instance(
+            args, shard_dirs, split=splits[0], final_output_dir=final_output_dir,
+            checkpoint_path=checkpoint_path,
+        )
+    return True
+
+
+def _merge_parallel_semantic(
+    args, shard_dirs, *, splits, final_output_dir, checkpoint_path, data_path
+) -> None:
+    """按 split 合并各分片的语义混淆矩阵，写出与顺序路径字节一致的 summary/CSV。"""
+    wrote_any = False
+    for split in splits:
+        # 每个子进程把该 split 写到 shard_dir/<split>/seg_semantic_shard_result.json。
+        split_shard_dirs = [
+            sd / split for sd in shard_dirs
+            if (sd / split / "seg_semantic_shard_result.json").exists()
+        ]
+        if not split_shard_dirs:
+            continue
+        merged = _merge_semantic_shard_results(split_shard_dirs, split=split)
+        # num_classes 不在 shard result 里，从数据配置取（与顺序路径一致：len(classes)）。
+        _, _, num_classes = _semantic_image_mask_samples(data_path, split)
+        split_output_dir = final_output_dir / split if len(splits) > 1 else final_output_dir
+        _write_semantic_summary(
+            split_output_dir,
+            split=split,
+            confusion=merged["confusion"],
+            rows=merged["rows"],
+            class_names=merged["class_names"],
+            num_classes=num_classes,
+            num_samples=merged["num_samples"],
+            infer_time_sum_ms=merged["infer_time_sum_ms"],
+            failed=merged["failed"],
+            overwrite=args.overwrite,
+            checkpoint_path=checkpoint_path,
+            data_path=data_path,
+        )
+        wrote_any = True
+    if not wrote_any:
+        raise ValueError("No image/mask pairs found for semantic segmentation eval.")
+
+
+def _merge_parallel_instance(args, shard_dirs, *, split, final_output_dir, checkpoint_path) -> None:
+    """合并各分片的实例分割 entry，重算全局 mAP，写出与顺序路径一致的 summary。"""
+    split_shard_dirs = [
+        sd for sd in shard_dirs if (sd / "seg_instance_shard_result.json").exists()
+    ]
+    merged = _merge_instance_shard_results(split_shard_dirs, classwise=args.classwise)
+    summary_path = final_output_dir / "seg_eval_summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "checkpoint": str(checkpoint_path),
+                "data": str(args.data),
+                "split": split,
+                "num_images": merged["num_images"],
+                "images_with_labels": merged["images_with_labels"],
+                "metrics": merged["metric_values"],
+                "avg_infer_time_ms": merged["infer_time_sum_ms"] / max(merged["num_images"], 1),
+                "failed_images": merged["failed"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(f"Summary saved to: {summary_path}")
+
+
 def run_eval(args) -> None:
-    if _normalize_seg_type(args) == "semantic":
+    seg_type = _normalize_seg_type(args)
+    # 自动多卡：device=auto 且 ≥2 张空闲卡时分片到子进程，否则回退顺序模式（返回 False）。
+    # 子进程通过 launcher.py eval 重入本函数，_is_seg_shard_child 为真而跳过并行、直走分片写盘。
+    if not _is_seg_shard_child(args) and run_parallel_seg_eval(args):
+        return
+
+    if seg_type == "semantic":
         run_semantic_eval(args)
         return
 

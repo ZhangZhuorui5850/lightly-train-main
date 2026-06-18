@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -141,3 +142,17 @@ def test_serialize_instance_entry_roundtrip():
     assert torch.allclose(pred2["scores"], prediction["scores"])
     assert torch.equal(pred2["masks"], prediction["masks"])
     assert torch.equal(tgt2["masks"], target["masks"])
+
+
+def test_run_parallel_seg_eval_falls_back_when_few_gpus(monkeypatch):
+    monkeypatch.setattr(
+        seg_tools.gpu_parallel, "query_gpu_inventory",
+        lambda: ([{"index": 0, "used_ratio": 0.1, "memory_used": 0, "memory_total": 1, "utilization": 0}], ""),
+    )
+    args = SimpleNamespace(device="auto", shard_index=None, num_shards=1, dry_run=False, data="d.yaml")
+    assert seg_tools.run_parallel_seg_eval(args) is False
+
+
+def test_run_parallel_seg_eval_skips_when_device_fixed():
+    args = SimpleNamespace(device="cuda:0", shard_index=None, num_shards=1, dry_run=False, data="d.yaml")
+    assert seg_tools.run_parallel_seg_eval(args) is False
