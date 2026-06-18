@@ -128,7 +128,7 @@ def _run_eda(tmp_path: Path, data_yaml: Path, **kwargs) -> Path:
     )
 
 
-def _run_curate(data_yaml: Path, eda_dir: Path, *, drop_classes=None, image_threshold=0) -> Path:
+def _run_curate(data_yaml: Path, eda_dir: Path, *, drop_classes=None, image_threshold=0, contiguous_ids=False) -> Path:
     """运行 curate 并返回新数据集路径。"""
     rt.import_runtime_dependencies()
     from tool_lib.seg_semantic_curate import run_semantic_curate
@@ -139,6 +139,7 @@ def _run_curate(data_yaml: Path, eda_dir: Path, *, drop_classes=None, image_thre
         drop_classes=drop_classes,
         image_threshold=image_threshold,
         export_suffix="__curated",
+        contiguous_ids=contiguous_ids,
     )
     run_semantic_curate(args)
     # 新数据集在 data_yaml.parent (即 dataset 目录) 同级，后缀 __curated
@@ -363,3 +364,77 @@ class TestEdgeCases:
 
         captured = capsys.readouterr()
         assert "跳过导出" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Test 8: contiguous-ids — 类别 ID 连续化
+# ---------------------------------------------------------------------------
+
+class TestContiguousIds:
+    def test_yaml_classes_contiguous_after_drop(self, tmp_path: Path):
+        """删除类后，--contiguous-ids 使 classes 键连续 0..K-1。"""
+        data_yaml = _create_test_dataset(tmp_path / "dataset")
+        eda_dir = _run_eda(tmp_path, data_yaml, min_class_images=2)
+        # 删除 cat(1)，保留 bg(0), dog(2), car(3) → 映射为 0, 1, 2
+        new_root = _run_curate(data_yaml, eda_dir, drop_classes="1", image_threshold=0, contiguous_ids=True)
+
+        new_cfg = yaml.safe_load((new_root / "data.yaml").read_text(encoding="utf-8"))
+        class_keys = sorted(int(k) for k in new_cfg["classes"].keys())
+        assert class_keys == [0, 1, 2]
+
+    def test_yaml_classes_contiguous_no_drop(self, tmp_path: Path):
+        """不删除类，--contiguous-ids 仍使 classes 连续（此处原始已连续，等价变换）。"""
+        data_yaml = _create_test_dataset(tmp_path / "dataset")
+        eda_dir = _run_eda(tmp_path, data_yaml, min_class_images=2)
+        # 仅压缩，不删除
+        new_root = _run_curate(data_yaml, eda_dir, drop_classes="", image_threshold=3, contiguous_ids=True)
+
+        new_cfg = yaml.safe_load((new_root / "data.yaml").read_text(encoding="utf-8"))
+        class_keys = sorted(int(k) for k in new_cfg["classes"].keys())
+        # 原始 0,1,2,3 连续，contiguous 不变
+        assert class_keys == [0, 1, 2, 3]
+
+    def test_mask_pixels_remap(self, tmp_path: Path):
+        """mask 像素值按映射表改写。"""
+        data_yaml = _create_test_dataset(tmp_path / "dataset")
+        eda_dir = _run_eda(tmp_path, data_yaml, min_class_images=2)
+        # 删除 cat(1) → 保留 bg(0), dog(2), car(3) → 0, 1, 2
+        new_root = _run_curate(data_yaml, eda_dir, drop_classes="1", image_threshold=0, contiguous_ids=True)
+
+        import numpy as _np
+        from PIL import Image as _Image
+
+        # 检查 val_002 mask：原始含 bg(0), dog(2), car(3) → 应变为 0, 1, 2
+        mask_path = new_root / "val" / "masks" / "val_002.png"
+        with _Image.open(mask_path) as img:
+            arr = _np.array(img)
+        unique_vals = set(arr.flatten().tolist())
+        # dog(2)→1, car(3)→2, bg(0)→0
+        assert unique_vals == {0, 1, 2}
+
+    def test_manifest_records_mapping(self, tmp_path: Path):
+        """manifest 中记录 contiguous_id_mapping。"""
+        data_yaml = _create_test_dataset(tmp_path / "dataset")
+        eda_dir = _run_eda(tmp_path, data_yaml, min_class_images=2)
+        new_root = _run_curate(data_yaml, eda_dir, drop_classes="1", image_threshold=0, contiguous_ids=True)
+
+        manifest = json.loads((new_root / "curate_manifest.json").read_text(encoding="utf-8"))
+        mapping = manifest["contiguous_id_mapping"]
+        assert mapping["0"] == 0
+        assert mapping["2"] == 1
+        assert mapping["3"] == 2
+
+    def test_no_contiguous_ids_keeps_original(self, tmp_path: Path):
+        """不启用 --contiguous-ids 时保留原始 ID。"""
+        data_yaml = _create_test_dataset(tmp_path / "dataset")
+        eda_dir = _run_eda(tmp_path, data_yaml, min_class_images=2)
+        # 删除 cat(1)
+        new_root = _run_curate(data_yaml, eda_dir, drop_classes="1", image_threshold=0, contiguous_ids=False)
+
+        new_cfg = yaml.safe_load((new_root / "data.yaml").read_text(encoding="utf-8"))
+        class_keys = sorted(int(k) for k in new_cfg["classes"].keys())
+        # 原始保留: 0, 2, 3（有缺口）
+        assert class_keys == [0, 2, 3]
+
+        manifest = json.loads((new_root / "curate_manifest.json").read_text(encoding="utf-8"))
+        assert "contiguous_id_mapping" not in manifest

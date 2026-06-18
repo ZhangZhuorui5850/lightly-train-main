@@ -302,6 +302,39 @@ def _link_or_copy(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+def _build_contiguous_id_mapping(
+    retain_ids: list[int],
+) -> dict[int, int]:
+    """构建 old_id → new_id (0..K-1) 映射。"""
+    return {old_id: new_id for new_id, old_id in enumerate(retain_ids)}
+
+
+def _rewrite_mask_pixels(
+    mask_path: Path,
+    id_mapping: dict[int, int],
+    ignore_source_ids: set[int],
+) -> None:
+    """就地改写 mask 像素值：按映射表重映射，不在映射中的像素设为 255。"""
+    from PIL import Image as _Image
+    import numpy as _np
+
+    with _Image.open(mask_path) as img:
+        arr = _np.array(img)
+
+    # 构建 LUT：映射内→新 ID，源 ignore→255，其余→255
+    max_val = int(arr.max()) if arr.size > 0 else 0
+    lut = _np.full(max_val + 1, 255, dtype=_np.uint8)
+    for old_id, new_id in id_mapping.items():
+        if old_id <= max_val:
+            lut[old_id] = new_id
+    for sid in ignore_source_ids:
+        if sid <= max_val:
+            lut[sid] = 255
+
+    new_arr = lut[_np.clip(arr, 0, max_val)]
+    _Image.fromarray(new_arr).save(mask_path)
+
+
 def _materialize_curated_dataset(
     *,
     source_data_path: Path,
@@ -311,6 +344,7 @@ def _materialize_curated_dataset(
     image_threshold: int,
     curate_manifest: dict[str, Any],
     export_suffix: str = "__curated",
+    contiguous_ids: bool = False,
 ) -> Path:
     """硬链接 materialize 新数据集，返回新数据集根目录。"""
     source_data_path = source_data_path.expanduser().resolve()
@@ -328,11 +362,27 @@ def _materialize_curated_dataset(
     # 保留类
     retain_classes = {cid for cid in classes if cid not in set(drop_class_ids) and cid not in ignore_classes}
 
+    # contiguous_ids 模式：构建 old→new (0..K-1) 映射
+    contiguous_mapping: dict[int, int] | None = None
+    if contiguous_ids:
+        sorted_retain = sorted(retain_classes)
+        contiguous_mapping = _build_contiguous_id_mapping(sorted_retain)
+        curate_manifest["contiguous_id_mapping"] = {
+            str(old): new for old, new in contiguous_mapping.items()
+        }
+
     # 新 classes：只保留保留类（删除类省略 → 加载器自动 ignore）
     new_classes: dict[int, Any] = {}
-    for cid in sorted(classes.keys()):
-        if cid in retain_classes:
-            new_classes[cid] = classes[cid]
+    if contiguous_ids and contiguous_mapping is not None:
+        # classes key 用新编号
+        inv_mapping = {v: k for k, v in contiguous_mapping.items()}
+        for new_id in range(len(inv_mapping)):
+            old_id = inv_mapping[new_id]
+            new_classes[new_id] = classes[old_id]
+    else:
+        for cid in sorted(classes.keys()):
+            if cid in retain_classes:
+                new_classes[cid] = classes[cid]
 
     # 构建 train 图片集合
     train_image_set = {row["image_path"] for row in train_rows}
@@ -378,7 +428,12 @@ def _materialize_curated_dataset(
             continue
 
         _link_or_copy(image_path, new_image_path)
-        _link_or_copy(mask_path, new_mask_path)
+        if contiguous_ids and contiguous_mapping is not None:
+            # 需要改写像素，先拷贝再就地重映射
+            shutil.copy2(mask_path, new_mask_path)
+            _rewrite_mask_pixels(new_mask_path, contiguous_mapping, ignore_classes)
+        else:
+            _link_or_copy(mask_path, new_mask_path)
 
         if split == "train":
             linked_train += 1
@@ -434,6 +489,7 @@ def run_semantic_curate(args: argparse.Namespace) -> None:
     eda_dir = getattr(args, "eda_dir", None)
     eda_dir = Path(eda_dir) if eda_dir else None
     export_suffix = getattr(args, "export_suffix", "__curated")
+    contiguous_ids = bool(getattr(args, "contiguous_ids", False))
 
     # CLI 覆盖交互默认值
     cli_drop_classes = getattr(args, "drop_classes", None)
@@ -553,6 +609,7 @@ def run_semantic_curate(args: argparse.Namespace) -> None:
         image_threshold=image_threshold,
         curate_manifest=curate_manifest,
         export_suffix=export_suffix,
+        contiguous_ids=contiguous_ids,
     )
 
     # 输出

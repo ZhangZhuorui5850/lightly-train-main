@@ -2858,6 +2858,7 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     seg_curate_parser.add_argument("--drop-classes", type=str, default=None, help="逗号分隔的类别 ID")
     seg_curate_parser.add_argument("--image-threshold", type=int, default=None, help="train 每类最多保留图片数，0=不压缩")
     seg_curate_parser.add_argument("--export-suffix", type=str, default="__curated")
+    seg_curate_parser.add_argument("--contiguous-ids", action="store_true", default=False, help="将保留类 ID 重映射为 0..K-1 连续编号（改写 mask 像素值）")
 
     eda_parser = subparsers.add_parser("eda")
     eda_parser.add_argument("--data", type=Path, default=rt.INFER_DEFAULT_DATA)
