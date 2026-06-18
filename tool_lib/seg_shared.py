@@ -199,6 +199,49 @@ def collect_source_image_infos(
     return source_infos_by_split, export_split_paths
 
 
+def rle_encode(mask: Any) -> dict:
+    """列优先（COCO 约定）游程编码二值掩码。
+
+    counts 交替表示 0 段 / 1 段的游程长度，首段始终代表 0。循环从 prev=False、
+    run=0 起步，因此首像素为 True 的掩码会自然产生一个长度 0 的背景段——不要
+    手动预置 0，否则会重复计数并破坏全 1 掩码。
+    """
+    import numpy as np
+
+    mask = np.asfortranarray(mask.astype(bool))
+    flat = mask.flatten(order="F")
+    counts: list[int] = []
+    if flat.size == 0:
+        return {"size": [int(mask.shape[0]), int(mask.shape[1])], "counts": counts}
+    prev = False
+    run = 0
+    for value in flat:
+        if bool(value) == prev:
+            run += 1
+        else:
+            counts.append(run)
+            prev = bool(value)
+            run = 1
+    counts.append(run)
+    return {"size": [int(mask.shape[0]), int(mask.shape[1])], "counts": counts}
+
+
+def rle_decode(rle: dict) -> Any:
+    """rle_encode 的逆操作，返回 H×W 的 bool 掩码。"""
+    import numpy as np
+
+    height, width = int(rle["size"][0]), int(rle["size"][1])
+    flat = np.zeros(height * width, dtype=bool)
+    position = 0
+    value = False
+    for count in rle["counts"]:
+        if value:
+            flat[position : position + count] = True
+        position += count
+        value = not value
+    return flat.reshape((height, width), order="F")
+
+
 __all__ = [
     "SEG_MIN_POLYGON_FIELDS",
     "SegSourceImageInfo",
@@ -209,6 +252,8 @@ __all__ = [
     "polygon_bbox_normalized",
     "read_yolo_seg_label_lines",
     "remap_yolo_seg_label_lines",
+    "rle_decode",
+    "rle_encode",
     "safe_class_name",
     "scan_source_split",
 ]
