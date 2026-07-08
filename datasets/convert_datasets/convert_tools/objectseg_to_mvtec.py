@@ -215,3 +215,19 @@ def convert(
     if verbose:
         _print_report(result)
     return result
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="物体版 YOLO-seg → MVTec AD 转换器")
+    ap.add_argument("--staging", required=True, type=Path,
+                    help="人工分好的物体文件夹根目录(staging/<物体>/*.jpg)")
+    ap.add_argument("--src", required=True, type=Path,
+                    help="YOLO-seg 源数据集(labels/{train,val,test}/*.txt + data.yaml)")
+    ap.add_argument("--out", required=True, type=Path, help="输出 MVTec AD 根目录")
+    ap.add_argument("--clean", action="store_true", help="先清空 --out")
+    args = ap.parse_args()
+    convert(args.staging, args.src, args.out, clean=args.clean, verbose=True)
+
+
+if __name__ == "__main__":
+    main()

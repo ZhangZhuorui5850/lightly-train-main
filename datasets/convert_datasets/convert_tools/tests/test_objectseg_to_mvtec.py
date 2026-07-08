@@ -151,3 +151,19 @@ def test_convert_writes_manifest_csv(tmp_path):
     assert by_stem["b"]["defects"] == "锈蚀;裂纹"
     assert by_stem["c"]["orig_split"] == "val"
     assert by_stem["a"]["src_label"] == "labels/train/a.txt"
+
+
+def test_cli_runs_end_to_end(tmp_path):
+    src = make_src(tmp_path / "src")
+    staging = make_staging(tmp_path / "staging")
+    out = tmp_path / "out"
+    import subprocess
+    script = TOOLS / "objectseg_to_mvtec.py"
+    r = subprocess.run(
+        [sys.executable, str(script),
+         "--staging", str(staging), "--src", str(src), "--out", str(out), "--clean"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert (out / "管道" / "test" / "锈蚀" / "a.png").exists()
+    assert (out / "object_manifest.csv").exists()
