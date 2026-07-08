@@ -73,6 +73,80 @@ except ModuleNotFoundError:  # pragma: no cover
         return it
 
 
+def _render_panel(stem: str, split: str, polys: list, names: list[str],
+                  *, w: int, h: int, font_path: Path | None = None):
+    """右侧信息栏:文件名/来源、缺陷种类数(>1 标 ⚠)、逐类计数带色块、多边形总数。"""
+    from collections import Counter
+
+    panel = Image.new("RGB", (w, h), (255, 255, 255))
+    d = ImageDraw.Draw(panel)
+    title = load_cjk_font(18, font_path)
+    body = load_cjk_font(16, font_path)
+    counts = Counter(cls for cls, _ in polys)
+    n_classes = len(counts)
+    x, y = 12, 12
+
+    def row(text: str, font, fill=(30, 30, 30)):
+        nonlocal y
+        d.text((x, y), text, font=font, fill=fill)
+        _, th = _text_size(d, text or "字", font)
+        y += th + 6
+
+    def divider():
+        nonlocal y
+        d.line([x, y, w - 12, y], fill=(210, 210, 210))
+        y += 8
+
+    row(f"文件: {stem}", title)
+    row(f"来源: {split}", body)
+    divider()
+    warn = " ⚠" if n_classes > 1 else ""
+    row(f"缺陷种类: {n_classes}{warn}", title,
+        fill=(200, 80, 0) if n_classes > 1 else (30, 30, 30))
+    for cls in sorted(counts):
+        d.rectangle([x, y + 3, x + 12, y + 15], fill=class_color(cls))
+        label = f"{_class_name(names, cls)} ×{counts[cls]}"
+        d.text((x + 20, y), label, font=body, fill=(30, 30, 30))
+        _, th = _text_size(d, label, body)
+        y += th + 6
+    divider()
+    row(f"多边形总数: {len(polys)}", body)
+    return panel
+
+
+def render_preview(img_path: Path, polys: list, names: list[str], split: str,
+                   *, font_path: Path | None = None, panel_w: int = 320):
+    """左=原图+缺陷多边形(半透明填充+描边+中文名),右=信息栏。返回拼好的 RGB 图。"""
+    base = Image.open(img_path).convert("RGB")
+    w, h = base.size
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    label_font = load_cjk_font(max(14, h // 28), font_path)
+
+    for cls, poly in polys:
+        color = class_color(cls)
+        pts = [(min(max(float(px), 0.0), 1.0) * w, min(max(float(py), 0.0), 1.0) * h)
+               for px, py in poly]
+        if len(pts) >= 3:
+            od.polygon(pts, fill=color + (70,))
+            od.line(pts + [pts[0]], fill=color + (255,), width=2)
+            # 类别名标在最上顶点附近,带该类色底框
+            tx, ty = min(pts, key=lambda p: p[1])
+            name = _class_name(names, cls)
+            tw, th = _text_size(od, name, label_font)
+            ty0 = max(0, ty - th - 3)
+            od.rectangle([tx, ty0, tx + tw + 4, ty0 + th + 3], fill=color + (220,))
+            od.text((tx + 2, ty0), name, fill=(255, 255, 255), font=label_font)
+
+    annotated = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
+    panel = _render_panel(img_path.stem, split, polys, names,
+                          w=panel_w, h=h, font_path=font_path)
+    canvas = Image.new("RGB", (w + panel.width, h), (255, 255, 255))
+    canvas.paste(annotated, (0, 0))
+    canvas.paste(panel, (w, 0))
+    return canvas
+
+
 def _find_image(src: Path, split: str, stem: str) -> Path | None:
     for ext in IMG_EXTS:
         p = src / "images" / split / f"{stem}{ext}"

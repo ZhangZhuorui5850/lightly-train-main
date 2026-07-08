@@ -230,3 +230,21 @@ def test_class_name_handles_out_of_range():
     import seg_sample_browse as sb
     assert sb._class_name(["锈蚀", "裂纹"], 1) == "裂纹"
     assert sb._class_name(["锈蚀", "裂纹"], 9) == "未知类别9"
+
+
+def test_render_preview_appends_info_panel(tmp_path):
+    import numpy as np
+    import seg_sample_browse as sb
+    from PIL import Image
+
+    img_path = tmp_path / "x.jpg"
+    _img(img_path)  # 64x64 灰图
+    polys = [
+        (0, np.array([[0.2, 0.2], [0.4, 0.2], [0.3, 0.4]])),   # 锈蚀
+        (1, np.array([[0.6, 0.6], [0.8, 0.6], [0.7, 0.8]])),   # 裂纹
+    ]
+    canvas = sb.render_preview(img_path, polys, ["锈蚀", "裂纹", "污迹"], "train")
+    base_w = Image.open(img_path).width
+    assert canvas.height == 64                 # 高度=原图高
+    assert canvas.width > base_w               # 右边拼了信息栏
+    assert canvas.mode == "RGB"
