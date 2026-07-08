@@ -109,6 +109,33 @@ def _ensure_empty_layout(cat: Path) -> None:
     (cat / "test" / "good").mkdir(parents=True, exist_ok=True)
 
 
+_MANIFEST_FIELDS = ["stem", "object", "orig_split", "defects", "src_label"]
+
+
+def _write_manifest(path: Path, rows: list[dict[str, str]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_MANIFEST_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _print_report(result: dict) -> None:
+    stats, missing, conflicts = result["stats"], result["missing"], result["conflicts"]
+    print(f"\n{'物体':<16}{'缺陷/good':<16}{'数量':>8}")
+    print("-" * 40)
+    for obj in sorted(stats):
+        for defect in sorted(stats[obj]):
+            print(f"{obj:<16}{defect:<16}{stats[obj][defect]:>8}")
+    if conflicts:
+        print(f"\n[冲突] {len(conflicts)} 个 stem 被分到多个物体(人工分图请修正):")
+        for stem, objs in conflicts.items():
+            print(f"  {stem}: {objs}")
+    if missing:
+        print(f"\n[跳过] {len(missing)} 张图在源里查不到标签或读不了:")
+        for obj, stem in missing:
+            print(f"  {obj}/{stem}")
+
+
 def convert(
     staging: Path,
     src: Path,
@@ -178,9 +205,13 @@ def convert(
                 "src_label": str(label_path.relative_to(src)),
             })
 
-    return {
+    result = {
         "stats": {o: dict(d) for o, d in stats.items()},
         "missing": missing,
         "conflicts": conflicts,
         "manifest": manifest,
     }
+    _write_manifest(out / "object_manifest.csv", manifest)
+    if verbose:
+        _print_report(result)
+    return result

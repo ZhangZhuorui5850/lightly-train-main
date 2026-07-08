@@ -134,3 +134,20 @@ def test_convert_mask_is_split_per_defect(tmp_path):
 def test_convert_empty_label_goes_to_test_good(tmp_path):
     out, _ = _run(tmp_path)
     assert (out / "阀门" / "test" / "good" / "d.png").exists()
+
+
+def test_convert_writes_manifest_csv(tmp_path):
+    src = make_src(tmp_path / "src")
+    staging = make_staging(tmp_path / "staging")
+    out = tmp_path / "out"
+    om.convert(staging, src, out, clean=True, verbose=False)
+
+    manifest = out / "object_manifest.csv"
+    assert manifest.exists()
+    import csv as _csv
+    rows = list(_csv.DictReader(manifest.open(encoding="utf-8")))
+    by_stem = {r["stem"]: r for r in rows}
+    assert by_stem["b"]["object"] == "管道"
+    assert by_stem["b"]["defects"] == "锈蚀;裂纹"
+    assert by_stem["c"]["orig_split"] == "val"
+    assert by_stem["a"]["src_label"] == "labels/train/a.txt"
