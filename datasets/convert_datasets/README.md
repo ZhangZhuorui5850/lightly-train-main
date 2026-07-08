@@ -16,6 +16,8 @@ convert_datasets/
     ├── LabelMeToYOLO.py
     ├── seg2mvtec_interactive.py
     ├── yoloseg_to_mvtec.py
+    ├── objectseg_to_mvtec.py
+    ├── seg_sample_browse.py
     ├── make_sample_yoloseg.py
     ├── mirror_det_subset_to_seg.py
     └── inspect_labelme_shapes.py
@@ -130,6 +132,8 @@ python convert.py det2seg --det-subset <det子集> --seg-source <seg全量> [--c
 | `../convert.py` | **启动台**：交互菜单 + 命令分发(平时只用这个) |
 | `seg2mvtec_interactive.py` | ③ 入口：扫描 + 交互 |
 | `yoloseg_to_mvtec.py` | ③ 核心库(被上面 import，也可单独 CLI) |
+| `objectseg_to_mvtec.py` | 物体版：按人工分好的物体文件夹 + 源seg 生成 MVTec(category=物体)；对应 `convert.py to-mvtec-obj` |
+| `seg_sample_browse.py` | (可选)抽样摊图，帮人归纳源数据有哪些物体；对应 `convert.py sample-browse` |
 | `make_sample_yoloseg.py` | ③ 造示例数据 |
 | `one_click_convert.py` / `LabelMeToYOLO.py` | ② 转 YOLO 入口 |
 | `sync_picture.py` / `coco_to_synced.py` | ① 采集整理入口 |
