@@ -73,3 +73,19 @@ def test_build_label_index_raises_on_duplicate_stem(tmp_path):
     _write_label(src / "labels" / "test" / "a.txt", [(0, _tri(0.5, 0.5))])  # 与 train/a 重名
     with pytest.raises(om.DuplicateStemError):
         om.build_label_index(src)
+
+
+def test_scan_staging_lists_objects_and_images(tmp_path):
+    staging = make_staging(tmp_path / "staging")
+    objects, conflicts = om.scan_staging(staging)
+    assert set(objects) == {"管道", "阀门"}
+    assert sorted(p.stem for p in objects["管道"]) == ["a", "b"]
+    assert conflicts == {}
+
+
+def test_scan_staging_flags_stem_in_two_objects(tmp_path):
+    staging = make_staging(tmp_path / "staging")
+    _img(staging / "阀门" / "a.jpg")  # a 同时在 管道 和 阀门
+    objects, conflicts = om.scan_staging(staging)
+    assert "a" in conflicts
+    assert set(conflicts["a"]) == {"管道", "阀门"}

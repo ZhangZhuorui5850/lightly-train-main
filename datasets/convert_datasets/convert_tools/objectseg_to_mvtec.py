@@ -80,3 +80,23 @@ def build_label_index(src: Path) -> dict[str, tuple[Path, str]]:
         )
         raise DuplicateStemError("源数据存在重名 stem,无法确定标签归属:\n" + detail)
     return index
+
+
+def scan_staging(staging: Path) -> tuple[dict[str, list[Path]], dict[str, list[str]]]:
+    """扫 staging 下的一级子目录(每个=一个物体)。
+
+    返回:
+      objects   : {物体名: [图片路径, ...]}
+      conflicts : {stem: [物体, ...]}  仅含出现在 >1 个物体里的 stem
+    """
+    objects: dict[str, list[Path]] = {}
+    stem_objs: dict[str, list[str]] = defaultdict(list)
+    for obj_dir in sorted(p for p in staging.iterdir() if p.is_dir()):
+        imgs: list[Path] = []
+        for img in sorted(obj_dir.iterdir()):
+            if img.is_file() and img.suffix.lower() in IMG_EXTS:
+                imgs.append(img)
+                stem_objs[img.stem].append(obj_dir.name)
+        objects[obj_dir.name] = imgs
+    conflicts = {stem: objs for stem, objs in stem_objs.items() if len(objs) > 1}
+    return objects, conflicts
