@@ -72,10 +72,15 @@ DEFAULT_OVERWRITE = False
 DEFAULT_CLS_THRESHOLD = 0.5
 DEFAULT_SEG_THRESHOLD = 0.8
 DEFAULT_SCORE_THRESHOLD = 0.3
+# seg eval 对比图默认最多出多少张（好/差各半，类别尽量全）；0 表示不限制、出全部。
+SEG_EVAL_VIS_MAX_IMAGES = 100
 
 VISUALIZATION_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 
 INFER_DEFAULT_EXPERIMENT_DIR = EXPERIMENT_DIR
+# seg infer/eval 未显式给 --experiment-dir/--checkpoint 时的默认实验目录。
+# 由 launcher.py 的 seg_experiment_dir 配置覆盖（"auto" 时自动发现最近一次含 checkpoint 的 seg 实验）。
+SEG_DEFAULT_EXPERIMENT_DIR = EXPERIMENT_ROOT_DIR / "my_experiment_seg"
 INFER_DEFAULT_IMAGE = None
 INFER_DEFAULT_IMAGE_DIR = DATASET_DIR / "images" / "test"
 INFER_DEFAULT_OUTPUT_DIR = EXPERIMENT_DIR / "infer-test"
@@ -128,6 +133,7 @@ EXPORT_DEFAULT_SIZE_RATIO = "30:40:30"
 EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT = 1.0
 EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN = 5.0
 EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX = 15.0
+EXPORT_DEFAULT_TRIM_BOXES = False
 EXPORT_DEFAULT_EXPORT_SUFFIX = "_A"
 
 SEG_DATASET_DIR = ROOT_DIR / "datasets" / "neu_dataset" / "dataset_seg"
@@ -279,6 +285,7 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global EXPERIMENT_DIR
     global REPORT_ARCHIVE_ROOT_DIR
     global INFER_DEFAULT_EXPERIMENT_DIR
+    global SEG_DEFAULT_EXPERIMENT_DIR
     global INFER_DEFAULT_IMAGE_DIR
     global INFER_DEFAULT_OUTPUT_DIR
     global INFER_DEFAULT_DATA
@@ -305,6 +312,7 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT
     global EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN
     global EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX
+    global EXPORT_DEFAULT_TRIM_BOXES
     global EXPORT_DEFAULT_EXPORT_SUFFIX
     global SEG_DATASET_DIR
     global SEMANTIC_SEG_DATASET_DIR
@@ -337,6 +345,7 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global TEST_DET_SCRIPT
     global DEFAULT_CLS_THRESHOLD
     global DEFAULT_SEG_THRESHOLD
+    global SEG_EVAL_VIS_MAX_IMAGES
     global DEFAULT_SCORE_THRESHOLD
     global INFER_DEFAULT_SCORE_THRESHOLD
     global INFER_DEFAULT_REPORT_IOU_THRESHOLD
@@ -357,6 +366,14 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
 
     OUT_DIR = _path("out_dir", OUT_DIR)
     EXPERIMENT_ROOT_DIR = _path("experiment_root_dir", EXPERIMENT_ROOT_DIR)
+    # seg 默认实验目录：显式路径直接用；None/""/auto 时自动发现最近一次含 checkpoint 的 seg 实验。
+    seg_experiment_value = settings.get("seg_experiment_dir")
+    if seg_experiment_value in {None, "", "auto"}:
+        SEG_DEFAULT_EXPERIMENT_DIR = auto_resolve_experiment_dir(
+            "seg", EXPERIMENT_ROOT_DIR / "my_experiment_seg"
+        )
+    else:
+        SEG_DEFAULT_EXPERIMENT_DIR = _path("seg_experiment_dir", EXPERIMENT_ROOT_DIR / "my_experiment_seg")
     TEST_OUTPUT_ROOT_DIR = _path(
         "infer_output_root_dir",
         _path("test_output_root_dir", TEST_OUTPUT_ROOT_DIR),
@@ -367,6 +384,7 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     DATASET_DIR = _path("det_dataset_dir", DATASET_DIR)
     DEFAULT_CLS_THRESHOLD = float(settings.get("cls_threshold", DEFAULT_CLS_THRESHOLD))
     DEFAULT_SEG_THRESHOLD = float(settings.get("seg_threshold", DEFAULT_SEG_THRESHOLD))
+    SEG_EVAL_VIS_MAX_IMAGES = int(settings.get("seg_eval_vis_max_images", SEG_EVAL_VIS_MAX_IMAGES))
     DEFAULT_SCORE_THRESHOLD = float(settings.get("det_score_threshold", DEFAULT_SCORE_THRESHOLD))
     det_experiment_value = settings.get("det_experiment_dir")
     if det_experiment_value in {None, "", "auto"}:
@@ -473,6 +491,9 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     )
     EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX = float(
         settings.get("det_export_avg_boxes_per_image_max", EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX)
+    )
+    EXPORT_DEFAULT_TRIM_BOXES = bool(
+        settings.get("det_export_trim_boxes", EXPORT_DEFAULT_TRIM_BOXES)
     )
     EXPORT_DEFAULT_EXPORT_SUFFIX = str(
         settings.get("det_export_suffix", EXPORT_DEFAULT_EXPORT_SUFFIX)
@@ -672,9 +693,29 @@ def resolve_checkpoint_path(checkpoint: Path | None, experiment_dir: Path | None
     raise FileNotFoundError(f"No supported checkpoint/model file found under: {experiment_dir}")
 
 
-def prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
+def prepare_output_dir(output_dir: Path, overwrite: bool, *, clean: bool = False) -> None:
+    """准备输出目录。
+
+    overwrite=False 且目录非空时报错（保持原有保护）。
+    overwrite=True 时：
+      - clean=False（默认，向后兼容）：直接复用目录，新文件覆盖/并入旧文件。
+      - clean=True：清空旧产物以避免新旧混杂，但保留缓存目录
+        （_tempfile 的预测 JSON、_temp 的训练曲线等"画图的东西"），方便复用/重绘。
+    """
     if output_dir.exists() and any(output_dir.iterdir()) and not overwrite:
         raise ValueError(f"Output directory is not empty: {output_dir}. Use overwrite to continue.")
+    if clean and overwrite and output_dir.exists():
+        preserve = {INFER_TEMP_DIRNAME, TRAINING_TEMP_DIRNAME}
+        for child in output_dir.iterdir():
+            if child.name in preserve:
+                continue
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+            except OSError:
+                pass
     output_dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -1320,6 +1361,59 @@ def load_scalar_series(event_file: Path, tag: str) -> list[tuple[int, float]]:
 def _safe_text_size(draw, text: str, font) -> tuple[int, int]:
     left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
     return max(0, right - left), max(0, bottom - top)
+
+
+def load_cjk_font(size: int = 15):
+    """加载随仓库自带的中文字体 msyh.ttc；找不到时退回 PIL 默认字体。"""
+    ensure_plot_dependencies()
+    font_path = str(Path(__file__).resolve().parent / "msyh.ttc")
+    try:
+        return ImageFont.truetype(font_path, size)
+    except (OSError, IOError):
+        return ImageFont.load_default()
+
+
+def make_comparison_panel(
+    panels: list[tuple[str, Any]],
+    output_path: Path,
+    *,
+    gap: int = 8,
+    title_height: int = 30,
+    background: tuple[int, int, int] = (245, 245, 245),
+) -> None:
+    """把多张图横向拼成一张对比图，每张上方带标题条。
+
+    panels: [(标题, PIL.Image), ...]，按给定顺序从左到右排列。
+    各图会等比缩放到统一高度后拼接，便于汇报展示。
+    """
+    if not ensure_plot_dependencies() or not panels:
+        return
+    images: list[tuple[str, Any]] = [(title, img.convert("RGB")) for title, img in panels]
+    max_h = max(img.height for _, img in images)
+    normalized: list[tuple[str, Any]] = []
+    for title, img in images:
+        if img.height != max_h:
+            new_w = max(1, round(img.width * max_h / img.height))
+            img = img.resize((new_w, max_h))
+        normalized.append((title, img))
+
+    total_w = sum(img.width for _, img in normalized) + gap * (len(normalized) + 1)
+    total_h = max_h + title_height + gap
+    canvas = Image.new("RGB", (total_w, total_h), background)
+    draw = ImageDraw.Draw(canvas)
+    font = load_cjk_font(18)
+
+    x = gap
+    for title, img in normalized:
+        text_w, text_h = _safe_text_size(draw, title, font)
+        text_x = x + max(0, (img.width - text_w) // 2)
+        text_y = max(0, (title_height - text_h) // 2)
+        draw.text((text_x, text_y), title, fill=(30, 30, 30), font=font)
+        canvas.paste(img, (x, title_height))
+        x += img.width + gap
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path)
 
 
 def _temporary_image_output_path(output_path: Path) -> Path:

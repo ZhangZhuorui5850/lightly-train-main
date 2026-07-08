@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import heapq
 from collections import Counter, defaultdict
 from math import ceil, log1p, sqrt
@@ -211,7 +212,9 @@ def derive_effective_balance_ratio(
     spread_ratio = max(image_spread, box_spread, 1.0)
     base_ratio = 2.0 + (0.9 * log1p(max(budget_images_per_class, 1.0))) + (1.1 * log1p(spread_ratio))
     pressure_scale = max(0.45, 1.0 - (0.55 * selection_pressure))
-    auto_ratio = min(12.0, max(1.5, round(base_ratio * pressure_scale, 4)))
+    # 上限收紧到 4.0：以前允许多数类最多是少数类的 12 倍，对"类别间尽量均衡"
+    # 来说太松。改成 4× 后，多数类会被降采样向尾部类靠拢，而不是放任其膨胀。
+    auto_ratio = min(4.0, max(1.5, round(base_ratio * pressure_scale, 4)))
     return auto_ratio, {
         "requested_balance_ratio": requested,
         "effective_balance_ratio": auto_ratio,
@@ -261,11 +264,14 @@ def derive_effective_min_class_boxes(
         if effective_target_total_images > 0 and average_boxes_per_image > 0.0
         else 0.0
     )
+    # 低分位(p10)锚点：删类的目标不再是"向 p75 多数类看齐"，而是只剔除连均衡
+    # 窗口下沿都够不到的极端少数类。剩余类别由选图阶段把多数类降采样向尾部
+    # 靠拢来实现均衡，而不是把尾部类删掉。同时该下沿 = p10/ratio 也保证保留类
+    # 的最小框数不会把 min_available*ratio 的窗口上限压垮（防坍缩）。
+    low_anchor_boxes = percentile_int(positive_box_counts, 0.10) if positive_box_counts else 0
     auto_min_class_boxes = 0
-    if auto_balance and balance_ratio > 0 and reference_available_boxes > 0:
-        ratio_floor = reference_available_boxes / balance_ratio
-        budget_floor = budget_boxes_per_class * 0.6 if budget_boxes_per_class > 0.0 else ratio_floor
-        auto_min_class_boxes = max(1, int(ceil(min(ratio_floor, budget_floor))))
+    if auto_balance and balance_ratio > 0 and low_anchor_boxes > 0:
+        auto_min_class_boxes = max(1, int(ceil(low_anchor_boxes / balance_ratio)))
     effective_min_class_boxes = max(max(requested_min_class_boxes, 0), auto_min_class_boxes)
     box_tolerance = (
         max(
@@ -292,6 +298,7 @@ def derive_effective_min_class_boxes(
         "max_available_boxes": max_available_boxes,
         "reference_available_boxes": reference_available_boxes,
         "reference_quantile": 0.75,
+        "low_anchor_boxes_p10": low_anchor_boxes,
         "available_total_boxes": available_total_boxes,
         "available_total_images": available_total_images,
         "average_boxes_per_image": average_boxes_per_image,
@@ -349,17 +356,22 @@ def derive_effective_min_class_images(
         split_targets = {split_name: 0 for split_name in ("train", "val", "test")}
         active_splits = {split_name: ratio_values.get(split_name, 0.0) > 0 for split_name in ("train", "val", "test")}
     active_split_count = sum(1 for is_active in active_splits.values() if is_active)
+    # split 地板降到"只需在 train 里出现 1 张"。以前的 train=3/val=1/test=1（合计 5）
+    # 是把"能填满每个 split"误当成"必须保留"的判据，导致只有几张图的尾部类被直接
+    # 删掉。val/test 缺图只是该类在那里不被评测，不构成删类理由。
     split_floor = {
-        "train": 3 if active_splits.get("train", False) else 0,
-        "val": 1 if active_splits.get("val", False) else 0,
-        "test": 1 if active_splits.get("test", False) else 0,
+        "train": 1 if active_splits.get("train", False) else 0,
+        "val": 0,
+        "test": 0,
     }
     auto_min_images_from_split = sum(split_floor.values())
     effective_class_count = max(estimated_class_count, len(positive_image_counts), 1)
+    # 低分位(p10)锚点：与框数下沿同理，只剔除连均衡窗口下沿都够不到的极端少数类，
+    # 而不是按 平均目标/ratio 把大量中小类一并删掉。
+    low_anchor_images = percentile_int(positive_image_counts, 0.10) if positive_image_counts else 0
     auto_min_images_from_budget = 0
-    if auto_balance and balance_ratio > 0 and effective_target_total_images > 0:
-        average_target_images_per_class = effective_target_total_images / effective_class_count
-        auto_min_images_from_budget = max(1, int(ceil(average_target_images_per_class / balance_ratio)))
+    if auto_balance and balance_ratio > 0 and low_anchor_images > 0:
+        auto_min_images_from_budget = max(1, int(ceil(low_anchor_images / balance_ratio)))
     auto_min_class_images = (
         max(auto_min_images_from_split, auto_min_images_from_budget)
         if auto_balance
@@ -375,6 +387,7 @@ def derive_effective_min_class_images(
         "requested_min_class_images": requested,
         "auto_min_images_from_split": auto_min_images_from_split,
         "auto_min_images_from_budget": auto_min_images_from_budget,
+        "low_anchor_images_p10": low_anchor_images,
         "effective_min_class_images": effective_min_class_images,
         "soft_min_class_images": soft_min_class_images,
         "estimated_class_count": effective_class_count,
@@ -1206,20 +1219,35 @@ def score_export_candidate(
     available_box_counts: dict[int, int],
     box_density_penalty: float,
 ) -> float:
-    shortage_score = 0.0
-    rarity_bonus = 0.0
+    """凹覆盖(concave-over-modular)子模目标的边际增益。
+
+    目标 F(S)=Σ_c w_c·g(min(n_c(S), cap_c))，其中 n_c 为已选集合里 c 类的框数，
+    g=√(凹)，cap_c=desired_box_counts(均衡窗口上限)，w_c=1/√availability(逆频
+    权重)。F 单调子模(凹∘截断模函数)，边际增益单调不增——与 CELF 懒贪心假设一致。
+
+    与旧线性打分(usable/availability)的本质区别：g 的边际递减让"给已较满的类
+    加框"几乎不涨分，因此密集共现里的主导类(如油漆剥落)作为"乘客"不再被奖励，
+    贪心转而优先挑能抬升覆盖不足类、且主导类杂框更少的图。这就是"只选图、不改
+    标注地惩罚超配额"。cap_c 仍作硬窗口防止主导类被无限追逐。
+    """
+    gain = 0.0
     for class_id in sorted(candidate.class_box_counts):
-        remaining_need = desired_box_counts[class_id] - selected_box_counts[class_id]
-        if remaining_need <= 0:
+        cap = desired_box_counts.get(class_id, 0)
+        current = selected_box_counts.get(class_id, 0)
+        if current >= cap:
+            # 已满配额：零增益(惩罚超配额)。注意这是抑制"主动追逐"，realized 框数
+            # 仍可能因共现被动超出——那是只选图方案的物理上限，需框级裁剪才能消除。
             continue
-        usable_boxes = min(candidate.class_box_counts[class_id], remaining_need)
-        availability = max(available_box_counts[class_id], 1)
-        shortage_score += usable_boxes / availability
-        rarity_bonus += 1.0 / availability
-    if shortage_score <= 0.0:
+        effective_new = min(current + candidate.class_box_counts[class_id], cap)
+        marginal = sqrt(effective_new) - sqrt(current)
+        if marginal <= 0.0:
+            continue
+        weight = 1.0 / sqrt(max(available_box_counts.get(class_id, 0), 1))
+        gain += weight * marginal
+    if gain <= 0.0:
         return 0.0
     density_weight = 1.0 / (1.0 + max(candidate.total_boxes - 1, 0) * max(box_density_penalty, 0.0))
-    return (shortage_score + (0.1 * rarity_bonus)) * density_weight
+    return gain * density_weight
 
 
 RATIO_BUCKET_NAMES = ("small", "medium", "large")
@@ -1484,16 +1512,23 @@ def select_balanced_train_candidates(
     size_balance_weight: float = 0.0,
     avg_boxes_per_image_min: float = 0.0,
     avg_boxes_per_image_max: float = 0.0,
+    prioritize_balance: bool = False,
 ) -> tuple[list[ExportImageCandidate], dict[str, Any]]:
     """CELF (Cost-Effective Lazy Forward) 懒贪心平衡选图。
+
+    prioritize_balance=True 时把 target_total_images 当作**上限**而非"必须填满"的
+    目标：Phase 1 按每类框数配额（min_available*ratio 的均衡窗口）选完即停，跳过
+    Phase 2 的兜底补齐。否则继续会用多数类的图把数据集填到 target_total_images，
+    重新引入类别不均衡。换言之：均衡优先，数量让步——少数类不再被牺牲。
 
     旧实现每轮 O(N) 扫描所有候选重新算分，整体 O(N*K)。在 7 万张数据集上
     K=5000 时 ~3.4 亿次内层评估，纯 Python 跑十几到几十分钟；K=0（不限）
     时则膨胀到 N²/2 ≈ 24 亿次。
 
     本实现利用 score_export_candidate 的单调不增性（desired_box_counts 是
-    常数、selected_box_counts 只增不减、density_weight 是常数）——这是经典
-    的子模拟最大化结构，标准解法即 CELF：
+    常数、selected_box_counts 只增不减、density_weight 是常数；凹覆盖目标
+    g=√ 的边际随 selected_box_counts 增大而递减，单调不增依然成立）——这是
+    经典的(单调)子模最大化结构，标准解法即 CELF：
       - 维护一个 max-heap，每次 pop 堆顶；
       - 用 class_epoch 记录每个类别的"最后一次被影响的时刻"；候选只要其类别
         集合里有 epoch 比记录值新的，就 stale，需 pop 后重算 + 推回；
@@ -1524,6 +1559,7 @@ def select_balanced_train_candidates(
             size_balance_weight=size_balance_weight,
             avg_boxes_per_image_min=avg_boxes_per_image_min,
             avg_boxes_per_image_max=avg_boxes_per_image_max,
+            prioritize_balance=prioritize_balance,
             progress_callback=progress_callback,
         )
     effective_target_total_images, target_total_images_summary = derive_effective_target_total_images(
@@ -1715,7 +1751,11 @@ def select_balanced_train_candidates(
 
     # ----- Phase 2: fallback 一次性批量补齐 -----
     phase2_picks = 0
-    if effective_target_total_images > 0 and len(selected) < effective_target_total_images:
+    if prioritize_balance and phase1_picks < effective_target_total_images:
+        # 均衡优先：每类配额已满，剩余只能靠多数类的图补齐，会破坏均衡 —— 跳过。
+        # target_total_images 在此模式下是上限，实际可能更少但类间均衡。
+        summary_template["target_treated_as_cap"] = True
+    if not prioritize_balance and effective_target_total_images > 0 and len(selected) < effective_target_total_images:
         need = effective_target_total_images - len(selected)
         fallback_entries: list[tuple[tuple, int]] = []
         for idx in range(n_candidates):
@@ -1769,6 +1809,14 @@ def _candidate_size_key(candidate: ExportImageCandidate) -> str:
     return candidate.rel_path.as_posix() + "|" + candidate.split_name
 
 
+# 尺寸感知选图里"类别均衡"相对"尺寸均衡 / 密度导向"的主导权重。类别覆盖增益
+# (凹、带 cap、覆盖感知，量纲 ~Σ 1/√avail·Δ√) 数值本就远小于按框数计的尺寸 /
+# 密度项；归一化后再乘上该权重，保证"补齐欠覆盖类(尤其稀有类)"严格优先于"凑尺寸
+# 占比"，尺寸与密度只在类别增益相近的候选之间做次级塑形。这把均衡选图的"类别优先、
+# 数量与尺寸让步"落到了尺寸感知路径上。
+SIZE_AWARE_CLASS_WEIGHT = 8.0
+
+
 def _select_size_aware_candidates(
     *,
     candidates: list[ExportImageCandidate],
@@ -1783,18 +1831,46 @@ def _select_size_aware_candidates(
     size_balance_weight: float,
     avg_boxes_per_image_min: float,
     avg_boxes_per_image_max: float,
+    prioritize_balance: bool = False,
     progress_callback: Callable[[int, int, str], None] | None = None,
     batch_size: int = 200,
 ) -> tuple[list[ExportImageCandidate], dict[str, Any]]:
-    """分批赤字贪心：类别赤字 + size_balance_weight·尺寸赤字 + 密度软导向。
+    """类别优先的尺寸感知贪心选图。
 
-    每批按当前已选状态重算尺寸占比与平均框数，对剩余候选打分取 top，直到达
-    target_total_images（>0）或候选耗尽。target_total_images<=0 时退化为"取尽
-    所有正分候选"。
+    评分 = SIZE_AWARE_CLASS_WEIGHT·类别覆盖增益
+            + size_balance_weight·尺寸赤字(归一)
+            + DENSITY_STEER_WEIGHT·密度软导向(归一)
+
+    类别项复用 ``score_export_candidate`` 的"凹覆盖(concave-over-modular)子模"边际
+    增益：**覆盖感知**(读 ``selected_box_counts``)、带**均衡窗口上限 cap**
+    (``derive_target_boxes_per_class``，与框级裁剪同口径)、**逆频权重** 1/√avail。
+    这修复了旧 ``_class_deficit_score`` 的三处缺陷——静态(从不看已选)、无上限(超配额
+    零惩罚)、线性(奖励高框密度图)——它们会让多数类(共现乘客，如油漆剥落)反复中选、
+    把尾部类挤到 0 张。尺寸 / 密度项各自按候选框数归一到 ~[-1,1] 后做次级塑形。
+
+    ``prioritize_balance=True`` 且 ``target_total_images>0`` 时把 target 当**上限**：
+    每类框数配额已满(``_needs_met``)即停，不再用多数类的图把数据集填到 target(那会
+    重新打破均衡)——均衡优先、数量让步。类别赤字阶段**逐张重排**(覆盖反馈要精确)，
+    配额满后的尺寸填充阶段按 ``batch_size`` 批量推进。
     """
     available_box_counts = count_candidate_boxes_per_class(candidates, kept_class_ids)
     n = len(candidates)
-    target_n = target_total_images if target_total_images > 0 else n
+    average_boxes_per_image = (
+        sum(c.total_boxes for c in candidates) / n if n else 0.0
+    )
+    effective_target_total_images, _ = derive_effective_target_total_images(
+        requested_target_total_images=target_total_images,
+        available_total_images=n,
+    )
+    desired_box_counts, box_target_summary = derive_target_boxes_per_class(
+        available_boxes_per_class=available_box_counts,
+        requested_target_boxes_per_class=max(target_boxes_per_class, 0),
+        balance_ratio=balance_ratio,
+        effective_target_total_images=effective_target_total_images,
+        average_boxes_per_image=average_boxes_per_image,
+    )
+    target_n = effective_target_total_images if effective_target_total_images > 0 else n
+    has_caps = any(cap > 0 for cap in desired_box_counts.values())
 
     selected: list[ExportImageCandidate] = []
     selected_box_counts = {class_id: 0 for class_id in kept_class_ids}
@@ -1803,45 +1879,73 @@ def _select_size_aware_candidates(
     remaining = list(candidates)
     chosen_keys: set[str] = set()
 
-    def _class_deficit_score(c: ExportImageCandidate) -> float:
-        s = 0.0
-        for class_id, cnt in c.class_box_counts.items():
-            avail = max(available_box_counts.get(class_id, 0), 1)
-            s += cnt / avail
-        return s
+    def _needs_met() -> bool:
+        if not has_caps:
+            return True
+        for class_id in kept_class_ids:
+            if selected_box_counts[class_id] < desired_box_counts.get(class_id, 0):
+                return False
+        return True
 
     def _score(c: ExportImageCandidate) -> float:
         key = _candidate_size_key(c)
         buckets = size_buckets_by_candidate.get(key, {})
-        class_score = _class_deficit_score(c)
-        size_score = size_deficit_score(buckets, current_buckets, target_size_ratio)
+        class_gain = score_export_candidate(
+            candidate=c,
+            desired_box_counts=desired_box_counts,
+            selected_box_counts=selected_box_counts,
+            available_box_counts=available_box_counts,
+            box_density_penalty=box_density_penalty,
+        )
+        size_raw = size_deficit_score(buckets, current_buckets, target_size_ratio)
+        size_norm = size_raw / max(c.total_boxes, 1)  # ~[-1, 1]
         cur_avg = (total_selected_boxes / len(selected)) if selected else 0.0
-        density = density_steer_term(
+        density_raw = density_steer_term(
             total_boxes=c.total_boxes,
             current_avg=cur_avg,
             lo=avg_boxes_per_image_min,
             hi=avg_boxes_per_image_max,
         )
-        return class_score + size_balance_weight * size_score + DENSITY_STEER_WEIGHT * density
+        density_norm = density_raw / max(c.total_boxes, 1)  # ~{-1, 0, 1}
+        return (
+            SIZE_AWARE_CLASS_WEIGHT * class_gain
+            + size_balance_weight * size_norm
+            + DENSITY_STEER_WEIGHT * density_norm
+        )
+
+    def _accept(c: ExportImageCandidate) -> None:
+        nonlocal total_selected_boxes
+        key = _candidate_size_key(c)
+        buckets = size_buckets_by_candidate.get(key, {})
+        for name in ("tiny", "small", "medium", "large"):
+            current_buckets[name] += buckets.get(name, 0)
+        for class_id, cnt in c.class_box_counts.items():
+            if class_id in selected_box_counts:
+                selected_box_counts[class_id] += cnt
+        total_selected_boxes += c.total_boxes
+        selected.append(c)
+        chosen_keys.add(key)
 
     while remaining and len(selected) < target_n:
-        ranked = sorted(remaining, key=lambda c: (-_score(c), c.total_boxes, c.rel_path.as_posix()))
-        took_any = False
+        needs_met = _needs_met()
+        if prioritize_balance and effective_target_total_images > 0 and needs_met:
+            break  # 均衡优先：配额已满，数量让步，不用多数类把数据集填满
+        ranked = sorted(
+            remaining,
+            key=lambda c: (-_score(c), c.total_boxes, c.rel_path.as_posix()),
+        )
+        # 类别赤字阶段逐张重排(覆盖反馈要精确)；尺寸填充阶段批量推进。
+        max_picks = batch_size if needs_met else 1
+        picks_this_round = 0
         for c in ranked:
-            if len(selected) >= target_n or (len(selected) % batch_size == 0 and took_any):
+            if len(selected) >= target_n or picks_this_round >= max_picks:
                 break
-            key = _candidate_size_key(c)
-            buckets = size_buckets_by_candidate.get(key, {})
-            for name in ("tiny", "small", "medium", "large"):
-                current_buckets[name] += buckets.get(name, 0)
-            for class_id, cnt in c.class_box_counts.items():
-                selected_box_counts[class_id] += cnt
-            total_selected_boxes += c.total_boxes
-            selected.append(c)
-            chosen_keys.add(key)
-            took_any = True
+            if _candidate_size_key(c) in chosen_keys:
+                continue
+            _accept(c)
+            picks_this_round += 1
         remaining = [c for c in remaining if _candidate_size_key(c) not in chosen_keys]
-        if not took_any:
+        if picks_this_round == 0:
             break
         if progress_callback is not None:
             progress_callback(min(len(selected), target_n), max(target_n, 1),
@@ -1853,7 +1957,15 @@ def _select_size_aware_candidates(
         "selection_algorithm": "size_aware_greedy",
         "available_total_images": n,
         "effective_target_total_images": target_n,
+        "desired_boxes_per_class": desired_box_counts,
         "selected_boxes_per_class": selected_box_counts,
+        "effective_target_boxes_per_class": box_target_summary.get("effective_target_boxes_per_class", 0),
+        "class_weight": SIZE_AWARE_CLASS_WEIGHT,
+        "balance_ratio": balance_ratio,
+        "prioritize_balance": prioritize_balance,
+        "target_treated_as_cap": bool(
+            prioritize_balance and effective_target_total_images > 0 and len(selected) < target_n
+        ),
         "achieved_size_buckets": dict(current_buckets),
         "achieved_size_ratio": achieved,
         "target_size_ratio": dict(target_size_ratio),
@@ -1863,6 +1975,102 @@ def _select_size_aware_candidates(
         "avg_boxes_per_image_max": avg_boxes_per_image_max,
     }
     return selected, summary
+
+
+def trim_selected_candidates_to_quota(
+    selected_candidates: list[ExportImageCandidate],
+    kept_class_ids: list[int],
+    box_caps: dict[int, int],
+) -> tuple[list[ExportImageCandidate], dict[str, Any]]:
+    """框级裁剪：把超出均衡窗口(box_caps)的类的多余框从标签里删掉。
+
+    这是"只选图"无法突破共现物理底之后的硬手段：对每个超配额类 c，需删除
+    (realized_c - cap_c) 个框；优先从"当前含 c 框最多的图"里删(用 max-heap 反复
+    削最高)，从而把 c 的框在各图间摊平、优先清掉密集乘客，最大程度保留每张图里
+    其它类的信息。被删的框只是从 .txt 标签里消失(图片照常导出)——代价是这些主导
+    类实例变成无标签(训练时的潜在漏标),换来各类框数真正落入窗口。
+    """
+    realized: dict[int, int] = {class_id: 0 for class_id in kept_class_ids}
+    for candidate in selected_candidates:
+        for class_id, box_count in candidate.class_box_counts.items():
+            realized[class_id] = realized.get(class_id, 0) + box_count
+    remove_target = {
+        class_id: max(realized.get(class_id, 0) - box_caps.get(class_id, realized.get(class_id, 0)), 0)
+        for class_id in kept_class_ids
+    }
+    if not any(remove_target.values()):
+        return selected_candidates, {
+            "trimmed_boxes_per_class": {},
+            "trimmed_total": 0,
+            "realized_before": realized,
+            "box_caps": dict(box_caps),
+        }
+
+    # 每张图的标签行可变副本；删除即置 None。
+    cand_lines: list[list[str | None]] = [list(c.filtered_lines) for c in selected_candidates]
+
+    def _line_class(line: str | None) -> int | None:
+        if line is None:
+            return None
+        try:
+            return int(float(line.split()[0]))
+        except (ValueError, IndexError):
+            return None
+
+    trimmed_per_class: dict[int, int] = {}
+    for class_id in kept_class_ids:
+        need = remove_target.get(class_id, 0)
+        if need <= 0:
+            continue
+        heap: list[tuple[int, str, int]] = []
+        for idx, lines in enumerate(cand_lines):
+            count = sum(1 for line in lines if _line_class(line) == class_id)
+            if count > 0:
+                heap.append((-count, selected_candidates[idx].rel_path.as_posix(), idx))
+        heapq.heapify(heap)
+        removed = 0
+        while removed < need and heap:
+            neg_count, path_key, idx = heapq.heappop(heap)
+            lines = cand_lines[idx]
+            for pos in range(len(lines)):
+                if _line_class(lines[pos]) == class_id:
+                    lines[pos] = None
+                    removed += 1
+                    break
+            remaining = (-neg_count) - 1
+            if remaining > 0:
+                heapq.heappush(heap, (-remaining, path_key, idx))
+        trimmed_per_class[class_id] = removed
+
+    trimmed_candidates: list[ExportImageCandidate] = []
+    for idx, candidate in enumerate(selected_candidates):
+        new_lines = tuple(line for line in cand_lines[idx] if line is not None)
+        if new_lines == candidate.filtered_lines:
+            trimmed_candidates.append(candidate)
+            continue
+        new_class_box_counts: dict[int, int] = {}
+        for line in new_lines:
+            cid = _line_class(line)
+            if cid is not None:
+                new_class_box_counts[cid] = new_class_box_counts.get(cid, 0) + 1
+        trimmed_candidates.append(
+            dataclasses.replace(
+                candidate,
+                filtered_lines=new_lines,
+                class_box_counts=new_class_box_counts,
+            )
+        )
+    realized_after = {class_id: 0 for class_id in kept_class_ids}
+    for candidate in trimmed_candidates:
+        for class_id, box_count in candidate.class_box_counts.items():
+            realized_after[class_id] = realized_after.get(class_id, 0) + box_count
+    return trimmed_candidates, {
+        "trimmed_boxes_per_class": trimmed_per_class,
+        "trimmed_total": sum(trimmed_per_class.values()),
+        "realized_before": realized,
+        "realized_after": realized_after,
+        "box_caps": dict(box_caps),
+    }
 
 
 def pool_candidates(candidates_by_split: dict[str, list[ExportImageCandidate]]) -> list[ExportImageCandidate]:

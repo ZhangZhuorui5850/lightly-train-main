@@ -26,6 +26,7 @@ from .det_export import (
     render_export_dataset_eda_markdown,
 )
 from .det_shared import ExportImageCandidate, collect_source_image_infos
+from .progress import track
 
 BUCKET_NAMES = ("tiny", "small", "medium", "large")
 RATIO_BUCKET_NAMES = ("small", "medium", "large")
@@ -585,7 +586,7 @@ def run_size_supplement(
     deduplicated = 0
     dropped_no_base_boxes = 0
     for split, infos in source_infos_by_split.items():
-        for info in infos:
+        for info in track(infos, label=f"det/size-supp 扫描 {split}", total=len(infos), unit="img"):
             if info.rel_path.stem in base_stems:
                 deduplicated += 1
                 continue

@@ -8,6 +8,7 @@ from __future__ import annotations
 import inspect
 import json
 import shutil
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -25,15 +26,18 @@ from .det_analysis import (
     choose_kept_class_ids,
     collect_candidate_split_stats,
     collect_class_split_stats,
+    count_candidate_boxes_per_class,
     derive_effective_balance_ratio,
     derive_effective_class_threshold,
     derive_effective_density_controls,
     derive_effective_min_class_boxes,
     derive_effective_min_class_images,
     derive_effective_target_images_per_class,
+    derive_target_boxes_per_class,
     pool_candidates,
     resolve_destination_rel_path,
     select_balanced_train_candidates,
+    trim_selected_candidates_to_quota,
 )
 from .det_shared import (
     collect_candidate_class_summary,
@@ -64,19 +68,27 @@ def _print_progress_line(label: str, current: int, total: int, detail: str = "",
 
 def _make_live_progress_callback(label: str, *, single_line: bool = False):
     last_print_at = 0.0
+    try:
+        is_tty = bool(sys.stdout.isatty())
+    except Exception:
+        is_tty = False
 
     def _callback(current: int, total: int, detail: str) -> None:
         nonlocal last_print_at
         now = time.monotonic()
-        should_commit_line = current >= total or ((now - last_print_at) >= 0.8 and not single_line)
+        done = current >= total
+        # 交互终端: 一律 \r 单行原地刷新, 只有结束时才换行 -> 固定一行不刷屏。
+        # 非终端(重定向日志): 每 0.8s 提交一行, 便于日志留痕。
+        periodic_commit = (not is_tty) and (not single_line) and (now - last_print_at) >= 0.8
+        commit_line = done or periodic_commit
         _print_progress_line(
             label,
             current,
             total,
             detail,
-            end="\n" if should_commit_line else "\r",
+            end="\n" if commit_line else "\r",
         )
-        if should_commit_line:
+        if commit_line:
             last_print_at = now
     return _callback
 
@@ -122,6 +134,7 @@ def _select_balanced_train_candidates_compat(
     size_balance_weight=0.0,
     avg_boxes_per_image_min=0.0,
     avg_boxes_per_image_max=0.0,
+    prioritize_balance=False,
 ):
     kwargs = {
         "candidates": candidates,
@@ -140,6 +153,8 @@ def _select_balanced_train_candidates_compat(
         kwargs["size_balance_weight"] = size_balance_weight
         kwargs["avg_boxes_per_image_min"] = avg_boxes_per_image_min
         kwargs["avg_boxes_per_image_max"] = avg_boxes_per_image_max
+    if _supports_keyword_arg(select_balanced_train_candidates, "prioritize_balance"):
+        kwargs["prioritize_balance"] = prioritize_balance
     return select_balanced_train_candidates(**kwargs)
 
 
@@ -785,6 +800,7 @@ def export_filtered_dataset(
     size_balance_weight: float = 1.0,
     avg_boxes_per_image_min: float = 0.0,
     avg_boxes_per_image_max: float = 0.0,
+    trim_boxes: bool = False,
 ) -> Path:
     """异常安全的对外入口：rename 之前任何步骤失败都会清理 __export_tmp。"""
     state: dict[str, Any] = {"temp_dir": None, "renamed": False}
@@ -812,6 +828,7 @@ def export_filtered_dataset(
             size_balance_weight=size_balance_weight,
             avg_boxes_per_image_min=avg_boxes_per_image_min,
             avg_boxes_per_image_max=avg_boxes_per_image_max,
+            trim_boxes=trim_boxes,
             _state=state,
         )
     except BaseException:
@@ -845,6 +862,7 @@ def _export_filtered_dataset_impl(
     size_balance_weight: float = 1.0,
     avg_boxes_per_image_min: float = 0.0,
     avg_boxes_per_image_max: float = 0.0,
+    trim_boxes: bool = False,
     _state: dict[str, Any],
 ) -> Path:
     total_stage_count = 11
@@ -1165,6 +1183,7 @@ def _export_filtered_dataset_impl(
         size_balance_weight=size_balance_weight,
         avg_boxes_per_image_min=avg_boxes_per_image_min,
         avg_boxes_per_image_max=avg_boxes_per_image_max,
+        prioritize_balance=auto_balance,
     )
     stage_idx += 1
     _log_export_stage(
@@ -1176,6 +1195,38 @@ def _export_filtered_dataset_impl(
         current=stage_idx,
         total=total_stage_count,
     )
+
+    # 框级裁剪(可选)：选图无法突破共现物理底后的硬手段，把超出均衡窗口的类的
+    # 多余框从标签里删掉，使各类 realized 框数真正落入窗口。窗口上限以"已选池里
+    # 最少类的 realized 框数 × balance_ratio"为锚，与选图阶段同口径。
+    trim_summary: dict[str, Any] = {"enabled": bool(trim_boxes)}
+    if trim_boxes:
+        selected_box_counts_pre = count_candidate_boxes_per_class(selected_pooled_candidates, kept_class_ids)
+        box_caps, _ = derive_target_boxes_per_class(
+            available_boxes_per_class=selected_box_counts_pre,
+            requested_target_boxes_per_class=max(target_boxes_per_class, 0),
+            balance_ratio=effective_balance_ratio,
+            effective_target_total_images=0,
+            average_boxes_per_image=0.0,
+        )
+        selected_pooled_candidates, trim_detail = trim_selected_candidates_to_quota(
+            selected_pooled_candidates, kept_class_ids, box_caps,
+        )
+        trim_summary.update(trim_detail)
+        stage_idx_trim_hi = max(trim_detail.get("realized_after", {}).values(), default=0)
+        stage_idx_trim_lo = min(
+            (v for v in trim_detail.get("realized_after", {}).values() if v > 0),
+            default=0,
+        )
+        _log_export_stage(
+            "Box Trim",
+            f"trimmed_total={trim_detail.get('trimmed_total', 0)}",
+            f"box_caps_max={max(box_caps.values(), default=0)}",
+            f"realized_after_max={stage_idx_trim_hi}",
+            f"realized_after_min={stage_idx_trim_lo}",
+            f"imbalance_after={(stage_idx_trim_hi / stage_idx_trim_lo):.2f}x" if stage_idx_trim_lo > 0 else "imbalance_after=n/a",
+        )
+
     split_image_targets = allocate_split_targets_from_source(
         total_selected_images=len(selected_pooled_candidates),
         split_ratio=split_ratio,
@@ -1289,6 +1340,14 @@ def _export_filtered_dataset_impl(
         "nc": len(kept_names),
         "names": kept_names,
     }
+    # 透传源 data.yaml 里的非结构性字段(如 format 等判别键)，让导出集与源保持同一
+    # schema。新版 lightly_train 的 data 配置是按 `format` 判别的联合，缺这个键会报
+    # union_tag_not_found；导出重建 data.yaml 时若丢掉 format 就会导致训练校验失败。
+    _structural_keys = {"path", "train", "val", "test", "task", "nc", "names", "classes"}
+    for key, value in source_cfg.items():
+        if key in _structural_keys or str(key).startswith("_"):
+            continue
+        export_cfg.setdefault(key, value)
     rt.dump_yaml(export_root / "data.yaml", export_cfg)
     (export_root / "classes.txt").write_text("\n".join(kept_names[idx] for idx in range(len(kept_names))) + "\n", encoding="utf-8")
     export_dataset_tag = rt.dataset_tag_from_dir(source_root)
@@ -1383,6 +1442,7 @@ def _export_filtered_dataset_impl(
                 "borderline_kept_class_analysis": borderline_kept_class_analysis,
                 "filter_summary": filter_summary,
                 "selection_summary": selection_summary,
+                "trim_summary": trim_summary,
                 "size_ratio_requested": size_ratio,
                 "target_size_ratio": target_size_ratio,
                 "size_balance_weight": size_balance_weight,
@@ -1471,5 +1531,6 @@ def run_export(args) -> None:
         size_balance_weight=args.size_balance_weight,
         avg_boxes_per_image_min=args.avg_boxes_per_image_min,
         avg_boxes_per_image_max=args.avg_boxes_per_image_max,
+        trim_boxes=getattr(args, "trim_boxes", False),
     )
     print(f"Filtered dataset exported to: {export_root}")

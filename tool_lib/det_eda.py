@@ -22,6 +22,7 @@ except ModuleNotFoundError:
 from . import common as rt
 from .det_analysis import percentile_float, percentile_int
 from .det_shared import safe_class_name
+from .progress import track
 
 SMALL_OBJECT_AREA_THRESHOLD = 32.0 * 32.0
 MEDIUM_OBJECT_AREA_THRESHOLD = 96.0 * 96.0
@@ -794,7 +795,7 @@ def _collect_dataset_eda(source_data_path: Path) -> tuple[dict[str, Any], list[d
     for split_name in SPLIT_ORDER:
         infos = source_infos_by_split.get(split_name, [])
         split_entry = split_entries[split_name]
-        for info in infos:
+        for info in track(infos, label=f"det/eda 扫描 {split_name}", total=len(infos), unit="img"):
             split_entry["images"] += 1
             all_entry["images"] += 1
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import json
 import shutil
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -72,19 +73,27 @@ def _print_progress_line(label: str, current: int, total: int, detail: str = "",
 
 def _make_live_progress_callback(label: str, *, single_line: bool = False):
     last_print_at = 0.0
+    try:
+        is_tty = bool(sys.stdout.isatty())
+    except Exception:
+        is_tty = False
 
     def _callback(current: int, total: int, detail: str) -> None:
         nonlocal last_print_at
         now = time.monotonic()
-        should_commit_line = current >= total or ((now - last_print_at) >= 0.8 and not single_line)
+        done = current >= total
+        # 交互终端: 一律 \r 单行原地刷新, 只有结束时才换行 -> 固定一行不刷屏。
+        # 非终端(重定向日志): 每 0.8s 提交一行, 便于日志留痕。
+        periodic_commit = (not is_tty) and (not single_line) and (now - last_print_at) >= 0.8
+        commit_line = done or periodic_commit
         _print_progress_line(
             label,
             current,
             total,
             detail,
-            end="\n" if should_commit_line else "\r",
+            end="\n" if commit_line else "\r",
         )
-        if should_commit_line:
+        if commit_line:
             last_print_at = now
     return _callback
 
@@ -130,6 +139,7 @@ def _select_balanced_train_candidates_compat(
     size_balance_weight=0.0,
     avg_boxes_per_image_min=0.0,
     avg_boxes_per_image_max=0.0,
+    prioritize_balance=False,
 ):
     kwargs = {
         "candidates": candidates,
@@ -148,6 +158,8 @@ def _select_balanced_train_candidates_compat(
         kwargs["size_balance_weight"] = size_balance_weight
         kwargs["avg_boxes_per_image_min"] = avg_boxes_per_image_min
         kwargs["avg_boxes_per_image_max"] = avg_boxes_per_image_max
+    if _supports_keyword_arg(select_balanced_train_candidates, "prioritize_balance"):
+        kwargs["prioritize_balance"] = prioritize_balance
     return select_balanced_train_candidates(**kwargs)
 
 
@@ -1340,6 +1352,7 @@ def _export_filtered_dataset_impl(
         size_balance_weight=size_balance_weight,
         avg_boxes_per_image_min=avg_instances_per_image_min,
         avg_boxes_per_image_max=avg_instances_per_image_max,
+        prioritize_balance=auto_balance,
     )
     stage_idx += 1
     _log_export_stage(

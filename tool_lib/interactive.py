@@ -644,6 +644,9 @@ def print_default_seg_eval_summary(
         print(f"  threshold: {rt.DEFAULT_SEG_THRESHOLD}")
     print("  output_dir: <experiment_dir>/eval")
     print("  classwise: False")
+    if seg_train_type == "semantic":
+        max_vis = rt.SEG_EVAL_VIS_MAX_IMAGES
+        print(f"  vis_max_images: {max_vis}（{'不限制' if max_vis <= 0 else '好/差各半，类别尽量全'}）")
     print(f"  device: {rt.DEFAULT_DEVICE}")
     print("  overwrite: False")
 
@@ -663,6 +666,8 @@ def build_seg_eval_cli_preview(args: argparse.Namespace) -> str:
     parts.extend(["--threshold", str(args.threshold)])
     if getattr(args, "classwise", False):
         parts.append("--classwise")
+    if str(getattr(args, "seg_train_type", "instance")) == "semantic":
+        parts.extend(["--vis-max-images", str(getattr(args, "vis_max_images", rt.SEG_EVAL_VIS_MAX_IMAGES))])
     parts.extend(["--device", str(args.device)])
     if getattr(args, "overwrite", False):
         parts.append("--overwrite")
@@ -755,6 +760,7 @@ def build_det_cli_preview(args: argparse.Namespace) -> str:
         parts.extend(["--size-balance-weight", str(args.size_balance_weight)])
         parts.extend(["--avg-boxes-per-image-min", str(args.avg_boxes_per_image_min)])
         parts.extend(["--avg-boxes-per-image-max", str(args.avg_boxes_per_image_max)])
+        parts.append("--trim-boxes" if getattr(args, "trim_boxes", False) else "--no-trim-boxes")
         parts.extend(["--export-suffix", str(args.export_suffix)])
     elif args.command == "eda":
         parts.extend(["--data", str(args.data)])
@@ -2220,9 +2226,16 @@ def build_interactive_args() -> argparse.Namespace | None:
 
     if task == "seg" and action in {"infer", "eval"}:
         seg_train_type = _prompt_seg_train_type()
-        experiment_dir = prompt_experiment_dir("seg", rt.EXPERIMENT_ROOT_DIR / "my_experiment_seg")
+        experiment_dir = prompt_experiment_dir("seg", rt.SEG_DEFAULT_EXPERIMENT_DIR)
         if action == "infer":
-            mode = prompt_choice("请选择 seg 推理输入方式", [("image", "image 单张图片"), ("image_dir", "image_dir 文件夹批量推理")])
+            mode = prompt_choice(
+                "请选择 seg 推理输入方式",
+                [
+                    ("dataset", "dataset 数据集模式（自动发现 data.yaml 并选择）"),
+                    ("image", "image 单张图片"),
+                    ("image_dir", "image_dir 文件夹批量推理"),
+                ],
+            )
             args = argparse.Namespace(
                 tool_task="seg",
                 tool_action="infer",
@@ -2238,7 +2251,15 @@ def build_interactive_args() -> argparse.Namespace | None:
                 overwrite=prompt_yes_no("输出目录非空时是否允许覆盖", False),
                 device=rt.DEFAULT_DEVICE,
             )
-            if mode == "image":
+            if mode == "dataset":
+                args.data = prompt_dataset_yaml(
+                    "seg", _default_train_data_yaml("seg", seg_train_type)
+                )
+                args.split = prompt_choice(
+                    "请选择数据集划分 --split",
+                    [("train", "train"), ("test", "test"), ("val", "val")],
+                )
+            elif mode == "image":
                 args.image = prompt_required_path("图片路径")
             else:
                 args.image_dir = prompt_required_path("图片目录")
@@ -2291,6 +2312,15 @@ def build_interactive_args() -> argparse.Namespace | None:
             classwise=prompt_yes_no("是否输出按类指标 --classwise", False)
             if use_custom
             else False,
+            save_visualization=prompt_yes_no("是否保存 GT/预测对比图 --save-visualization", True)
+            if use_custom
+            else True,
+            vis_max_images=prompt_int(
+                "对比图最多出多少张（好/差各半，0=不限制）--vis-max-images",
+                rt.SEG_EVAL_VIS_MAX_IMAGES,
+            )
+            if use_custom
+            else rt.SEG_EVAL_VIS_MAX_IMAGES,
             device=(prompt_text("推理设备 --device", rt.DEFAULT_DEVICE) or rt.DEFAULT_DEVICE)
             if use_custom
             else rt.DEFAULT_DEVICE,
@@ -2390,6 +2420,7 @@ def build_interactive_args() -> argparse.Namespace | None:
             size_balance_weight=rt.EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT,
             avg_boxes_per_image_min=rt.EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN,
             avg_boxes_per_image_max=rt.EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX,
+            trim_boxes=rt.EXPORT_DEFAULT_TRIM_BOXES,
             export_suffix=rt.EXPORT_DEFAULT_EXPORT_SUFFIX,
         )
         print("\n导出策略: 只询问总图数，其余阈值基于 EDA 和目标图数自动联合推导。")
@@ -2717,6 +2748,16 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     eval_parser.add_argument("--classwise", action="store_true", default=False)
     eval_parser.add_argument("--device", type=str, default=rt.INFER_DEFAULT_DEVICE)
     eval_parser.add_argument("--overwrite", action="store_true", default=rt.INFER_DEFAULT_OVERWRITE)
+    eval_parser.add_argument("--save-visualization", dest="save_visualization", action="store_true")
+    eval_parser.add_argument("--no-save-visualization", dest="save_visualization", action="store_false")
+    eval_parser.set_defaults(save_visualization=True)
+    eval_parser.add_argument(
+        "--vis-max-images",
+        dest="vis_max_images",
+        type=int,
+        default=rt.SEG_EVAL_VIS_MAX_IMAGES,
+        help="seg 实例评估对比图最多出多少张（好/差各半，类别尽量全）；0=不限制、出全部。",
+    )
     eval_parser.add_argument("--dry-run", action="store_true", default=False)
     eval_parser.add_argument("--skip-important-artifacts", action="store_true", default=False, help=argparse.SUPPRESS)
     eval_parser.add_argument("--selected-splits", type=str, default=None, help=argparse.SUPPRESS)
@@ -2758,6 +2799,14 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=rt.EXPORT_DEFAULT_MAX_BOXES_PER_CLASS_PER_IMAGE,
     )
     export_parser.add_argument("--box-density-penalty", type=float, default=rt.EXPORT_DEFAULT_BOX_DENSITY_PENALTY)
+    export_parser.add_argument(
+        "--trim-boxes",
+        dest="trim_boxes",
+        action="store_true",
+        default=rt.EXPORT_DEFAULT_TRIM_BOXES,
+        help="选图后把超出均衡窗口的类的多余框从标签里删掉(会产生漏标，默认关闭)。",
+    )
+    export_parser.add_argument("--no-trim-boxes", dest="trim_boxes", action="store_false")
     export_parser.add_argument("--size-ratio", type=str, default=rt.EXPORT_DEFAULT_SIZE_RATIO)
     export_parser.add_argument("--size-balance-weight", type=float, default=rt.EXPORT_DEFAULT_SIZE_BALANCE_WEIGHT)
     export_parser.add_argument("--avg-boxes-per-image-min", type=float, default=rt.EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MIN)
@@ -2962,7 +3011,7 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.tool_action = "infer"
         if args.task == "seg":
             if args.experiment_dir == rt.INFER_DEFAULT_EXPERIMENT_DIR:
-                args.experiment_dir = rt.EXPERIMENT_ROOT_DIR / "my_experiment_seg"
+                args.experiment_dir = rt.SEG_DEFAULT_EXPERIMENT_DIR
             if args.image is None and args.image_dir is None and args.data is None:
                 args.data = _default_train_data_yaml("seg", args.seg_train_type)
             args.threshold = args.threshold if args.threshold is not None else rt.DEFAULT_SEG_THRESHOLD
@@ -2985,7 +3034,7 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.tool_action = "eval"
         if args.task == "seg":
             if args.experiment_dir == rt.INFER_DEFAULT_EXPERIMENT_DIR:
-                args.experiment_dir = rt.EXPERIMENT_ROOT_DIR / "my_experiment_seg"
+                args.experiment_dir = rt.SEG_DEFAULT_EXPERIMENT_DIR
             if args.data is None:
                 args.data = _default_train_data_yaml("seg", args.seg_train_type)
             args.threshold = args.threshold if args.threshold is not None else rt.DEFAULT_SEG_THRESHOLD

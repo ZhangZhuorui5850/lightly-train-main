@@ -23,6 +23,7 @@ from typing import Any
 
 from . import common as rt
 from .det_shared import collect_source_image_infos, safe_class_name
+from .progress import track
 
 OPTIMIZE_SUFFIX = "_AA"
 DEFAULT_CONFUSION_THRESHOLD = 0.15
@@ -838,7 +839,7 @@ def apply_optimize_decisions(
         dst_image_dir.mkdir(parents=True, exist_ok=True)
         dst_label_dir.mkdir(parents=True, exist_ok=True)
 
-        for info in infos:
+        for info in track(infos, label=f"det/optimize 导出 {split_name}", total=len(infos), unit="img"):
             dst_image = dst_image_dir / info.rel_path
             dst_label = dst_label_dir / info.rel_path.with_suffix(".txt")
             dst_image.parent.mkdir(parents=True, exist_ok=True)

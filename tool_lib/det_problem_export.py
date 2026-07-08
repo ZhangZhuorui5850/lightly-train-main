@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import common as rt
+from .progress import track
 
 
 def _box_iou(box_a: list[float], box_b: list[float]) -> float:
@@ -606,7 +607,7 @@ def analyze_dataset_with_model(
     processed = 0
 
     for split_name, infos in source_infos_by_split.items():
-        for info in infos:
+        for info in track(infos, label=f"det/problem 分析 {split_name}", total=len(infos), unit="img"):
             processed += 1
             if progress_callback and processed % 100 == 0:
                 progress_callback(processed, total_images, f"分析中: {info.rel_path}")

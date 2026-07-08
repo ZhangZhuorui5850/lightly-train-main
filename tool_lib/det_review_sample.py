@@ -24,6 +24,7 @@ from typing import Any, Callable, Sequence
 
 from . import common as rt
 from .det_shared import read_yolo_label_lines
+from .progress import track
 
 # ── 默认阈值 ──────────────────────────────────────────────
 IOU_DUP = 0.9
@@ -207,7 +208,10 @@ def scan_dataset(
         if not img_dir.exists():
             continue
 
-        for rel_img in rt.file_helpers.list_image_filenames_from_dir(image_dir=img_dir):
+        for rel_img in track(
+            rt.file_helpers.list_image_filenames_from_dir(image_dir=img_dir),
+            label=f"det/review 校验 {split}", unit="img",
+        ):
             rel_path = Path(rel_img)
             src_img = img_dir / rel_path
             src_lbl = (lbl_dir / rel_path.with_suffix(".txt")) if lbl_dir else None

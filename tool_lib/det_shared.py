@@ -267,45 +267,94 @@ def build_legacy_report(
     }
 
 
-def draw_predictions(image_path: Path, output_path: Path, records: list[dict[str, Any]], gt_items: list[dict[str, Any]] | None = None, class_names: dict[int, str] | None = None) -> None:
-    color_pred = (0, 200, 0)
-    color_gt = (220, 30, 30)
-    with rt.Image.open(image_path) as image:
-        image = image.convert("RGB")
-        draw = rt.ImageDraw.Draw(image)
-        font_path = str(Path(__file__).resolve().parent / "msyh.ttc")
+DET_COLOR_PRED = (0, 200, 0)
+DET_COLOR_GT = (220, 30, 30)
 
-        try:
-            font = rt.ImageFont.truetype(font_path, 15)
-        except IOError:
-            print(f"Warning: 找不到中文字体文件 {font_path}，标签将显示为方块。")
-            font = rt.ImageFont.load_default()
 
-        width, height = image.size
-        line_width = max(2, round(min(width, height) / 400))
+def _render_det_boxes(
+    base_image: Any,
+    *,
+    records: list[dict[str, Any]] | None = None,
+    gt_items: list[dict[str, Any]] | None = None,
+    class_names: dict[int, str] | None = None,
+    font: Any = None,
+) -> Any:
+    """在 base_image 的副本上画框并返回新图（不改动入参）。
 
-        def draw_box(box_xyxy: list[float], color: tuple[int, int, int], label: str, dashed: bool = False) -> None:
-            x1, y1, x2, y2 = box_xyxy
-            if dashed:
-                draw.rectangle((x1, y1, x2, y2), outline=color, width=line_width)
-            else:
-                draw.rectangle((x1, y1, x2, y2), outline=color, width=line_width)
-            left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
-            text_h = bottom - top
-            text_w = right - left
+    GT：红色虚线 + 标签贴框下沿；pred：绿色实线 + 标签贴框上沿。
+    GT 与 pred 框常常高度重合，把两者标签分到上下两侧，避免互相遮挡。
+    """
+    image = base_image.convert("RGB")
+    draw = rt.ImageDraw.Draw(image)
+    if font is None:
+        font = rt.load_cjk_font(15)
+
+    width, height = image.size
+    line_width = max(2, round(min(width, height) / 400))
+
+    def _draw_dashed_rectangle(box_xyxy: list[float], color: tuple[int, int, int], dash: int = 9, gap: int = 6) -> None:
+        x1, y1, x2, y2 = box_xyxy
+        corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1]):
+            length = ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5
+            if length == 0:
+                continue
+            ux, uy = (bx - ax) / length, (by - ay) / length
+            pos = 0.0
+            while pos < length:
+                seg_end = min(pos + dash, length)
+                draw.line(
+                    (ax + ux * pos, ay + uy * pos, ax + ux * seg_end, ay + uy * seg_end),
+                    fill=color,
+                    width=line_width,
+                )
+                pos += dash + gap
+
+    def draw_box(box_xyxy: list[float], color: tuple[int, int, int], label: str, dashed: bool = False, label_pos: str = "top") -> None:
+        x1, y1, x2, y2 = box_xyxy
+        if dashed:
+            _draw_dashed_rectangle(box_xyxy, color)
+        else:
+            draw.rectangle((x1, y1, x2, y2), outline=color, width=line_width)
+        left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
+        text_h = bottom - top
+        text_w = right - left
+        if label_pos == "bottom":
+            rect_y0 = min(max(y2, 0), height - text_h - 4)
+            rect_y1 = rect_y0 + text_h + 4
+        else:
             rect_y0 = max(0, y1 - text_h - 4)
             rect_y1 = max(y1, rect_y0 + text_h + 4)
-            draw.rectangle((x1, rect_y0, x1 + text_w + 4, rect_y1), fill=color)
-            draw.text((x1 + 2, rect_y0 + 2), label, fill=(255, 255, 255), font=font)
+        draw.rectangle((x1, rect_y0, x1 + text_w + 4, rect_y1), fill=color)
+        draw.text((x1 + 2, rect_y0 + 2), label, fill=(255, 255, 255), font=font)
 
-        for gt in gt_items or []:
-            name = (class_names or {}).get(gt["class_id"], f"class_{gt['class_id']}")
-            draw_box(gt["bbox"], color_gt, f"[GT] {name}", dashed=True)
-        for record in records:
-            draw_box(record["bbox_xyxy"], color_pred, f"{record['class_name']} {record['score']:.3f}")
+    for gt in gt_items or []:
+        name = (class_names or {}).get(gt["class_id"], f"class_{gt['class_id']}")
+        draw_box(gt["bbox"], DET_COLOR_GT, f"[GT] {name}", dashed=True, label_pos="bottom")
+    for record in records or []:
+        draw_box(record["bbox_xyxy"], DET_COLOR_PRED, f"{record['class_name']} {record['score']:.3f}", label_pos="top")
+    return image
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        image.save(output_path)
+
+def draw_predictions(image_path: Path, output_path: Path, records: list[dict[str, Any]], gt_items: list[dict[str, Any]] | None = None, class_names: dict[int, str] | None = None) -> None:
+    with rt.Image.open(image_path) as image:
+        rendered = _render_det_boxes(image, records=records, gt_items=gt_items, class_names=class_names)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    rendered.save(output_path)
+
+
+def draw_comparison(image_path: Path, output_path: Path, records: list[dict[str, Any]], gt_items: list[dict[str, Any]] | None = None, class_names: dict[int, str] | None = None) -> None:
+    """生成 [原图 | 真值 GT | 预测 Pred] 三联对比图，便于汇报展示。"""
+    font = rt.load_cjk_font(15)
+    with rt.Image.open(image_path) as image:
+        base = image.convert("RGB")
+        original = base.copy()
+        gt_panel = _render_det_boxes(base, gt_items=gt_items, class_names=class_names, font=font)
+        pred_panel = _render_det_boxes(base, records=records, class_names=class_names, font=font)
+    rt.make_comparison_panel(
+        [("原图", original), ("真值 GT", gt_panel), ("预测 Pred", pred_panel)],
+        output_path,
+    )
 
 
 def xywhn_to_xyxy_tensor(boxes, image_size: tuple[int, int]):

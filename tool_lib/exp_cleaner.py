@@ -193,18 +193,23 @@ def analyze_experiment(exp_dir: Path) -> ExperimentAnalysis:
             )
         )
 
-    # infer-*/images/
-    for infer_dir in exp_dir.glob("infer-*"):
-        images_dir = infer_dir / "images"
-        if images_dir.is_dir():
-            cleanable.append(
-                CleanCandidate(
-                    path=images_dir,
-                    category="infer_images",
-                    size_bytes=_dir_size(images_dir),
-                    description=f"{infer_dir.name}/images/",
+    # 各推理/评估目录下的 images/ 与 compare/（可重新生成，统一视为可清理）。
+    # 覆盖 det 的 infer-*，以及 seg 的 infer / eval。
+    vis_parent_dirs = list(exp_dir.glob("infer-*")) + [exp_dir / "infer", exp_dir / "eval"]
+    for vis_dir in vis_parent_dirs:
+        if not vis_dir.is_dir():
+            continue
+        for sub in ("images", "compare"):
+            target = vis_dir / sub
+            if target.is_dir():
+                cleanable.append(
+                    CleanCandidate(
+                        path=target,
+                        category="infer_images",
+                        size_bytes=_dir_size(target),
+                        description=f"{vis_dir.name}/{sub}/",
+                    )
                 )
-            )
 
     total_size = sum(item.size_bytes for item in cleanable) + sum(
         item.size_bytes for item in preserved

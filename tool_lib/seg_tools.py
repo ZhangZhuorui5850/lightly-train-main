@@ -243,6 +243,113 @@ def _compute_semantic_iou(confusion: Any) -> tuple[dict[str, float], dict[str, d
     return metrics, per_class
 
 
+def _semantic_class_mapping(model: Any, data_path: Path, split: str) -> dict[str, Any]:
+    """构造语义评估用的类别映射与 LUT（与 _accumulate_semantic_confusion 内一致）。
+
+    抽成独立函数，让"评估后挑图渲染"能重建同一套映射来复算显示用的类别索引，
+    避免在渲染处重复一大段易漂移的 LUT 代码。指标仍只由 _accumulate 产出，不受此影响。
+    """
+    data_cfg = train_tools.load_semantic_segmentation_split_config(data_path, split)
+    classes = data_cfg["classes"]
+    ignore_classes = {int(item) for item in data_cfg.get("ignore_classes", set()) or set()}
+    class_names = rt.get_model_class_names(model)
+    model_class_ids = sorted(class_names)
+    model_class_to_idx = {cid: i for i, cid in enumerate(model_class_ids)}
+    data_class_ids_sorted = sorted(set(classes) - ignore_classes)
+    internal_to_model_idx = rt.np.full(len(data_class_ids_sorted) + 1, -1, dtype=rt.np.int64)
+    for internal_id, orig_id in enumerate(data_class_ids_sorted):
+        if orig_id in model_class_to_idx:
+            internal_to_model_idx[internal_id] = model_class_to_idx[orig_id]
+    pred_lut_size = (max(model_class_ids) + 1) if model_class_ids else 1
+    pred_remap = rt.np.full(pred_lut_size, -1, dtype=rt.np.int64)
+    for cid, idx in model_class_to_idx.items():
+        pred_remap[cid] = idx
+    return {
+        "classes": classes,
+        "ignore_classes": ignore_classes,
+        "internal_to_model_idx": internal_to_model_idx,
+        "pred_remap": pred_remap,
+        "pred_lut_size": pred_lut_size,
+        "idx_to_name": {i: class_names[cid] for i, cid in enumerate(model_class_ids)},
+    }
+
+
+def _remap_semantic_arrays(pred_np: Any, target_np: Any, mapping: dict[str, Any]) -> tuple[Any, Any]:
+    """把单张图的原始 GT / 预测数组映射到统一类别索引空间（<0 表示忽略）。"""
+    itmi = mapping["internal_to_model_idx"]
+    target_clipped = rt.np.clip(target_np, 0, len(itmi) - 1)
+    target_remapped = rt.np.where(
+        target_np == -100, -100,
+        rt.np.where(
+            (target_np >= 0) & (target_np < len(itmi)),
+            itmi[target_clipped], -100,
+        ),
+    )
+    pred_remap = mapping["pred_remap"]
+    pred_lut_size = mapping["pred_lut_size"]
+    pred_clipped = rt.np.clip(pred_np, 0, pred_lut_size - 1)
+    pred_remapped = rt.np.where(
+        (pred_np >= 0) & (pred_np < pred_lut_size),
+        pred_remap[pred_clipped], -1,
+    )
+    return target_remapped, pred_remapped
+
+
+def _semantic_image_quality(target_remapped: Any, pred_remapped: Any, valid: Any, num_classes: int) -> float:
+    """单张图的 mIoU，用于挑图排序（不参与全局指标）。异常一律返回 0.0。"""
+    try:
+        t = target_remapped[valid]
+        p = pred_remapped[valid]
+        if t.size == 0:
+            return 0.0
+        conf = rt.np.bincount(
+            num_classes * t + p, minlength=num_classes ** 2
+        ).reshape((num_classes, num_classes))
+        metrics, _ = _compute_semantic_iou(conf)
+        return float(metrics["miou"])
+    except Exception:  # noqa: BLE001 选图评分绝不能中断评估
+        return 0.0
+
+
+def _semantic_dominant_class(target_remapped: Any, valid: Any) -> int:
+    """一张图的主类别：GT 里占像素最多的统一索引类；无有效 GT 记 -1。"""
+    gt = target_remapped[valid]
+    if gt.size == 0:
+        return -1
+    return int(rt.np.bincount(gt).argmax())
+
+
+def _select_diverse_entries(items: list[dict[str, Any]], count: int, *, best: bool, score_of, class_of) -> list[dict[str, Any]]:
+    """按主类别轮询挑样本，让稀有类别也能进入样本，最多返回 count 个。
+
+    best=True 取高分（表现好），best=False 取低分（表现差）。返回顺序即最终排名。
+    """
+    if count <= 0 or not items:
+        return []
+    groups: dict[Any, list[dict[str, Any]]] = {}
+    for it in items:
+        groups.setdefault(class_of(it), []).append(it)
+    for lst in groups.values():
+        lst.sort(key=score_of, reverse=best)
+    class_order = sorted(groups.keys())
+    selected: list[dict[str, Any]] = []
+    cursors = {c: 0 for c in class_order}
+    while len(selected) < count:
+        progressed = False
+        for c in class_order:
+            lst = groups[c]
+            idx = cursors[c]
+            if idx < len(lst):
+                selected.append(lst[idx])
+                cursors[c] = idx + 1
+                progressed = True
+                if len(selected) >= count:
+                    break
+        if not progressed:
+            break
+    return selected
+
+
 def save_semantic_visualization(image_path: Path, output_path: Path, mask_tensor: Any, class_names: dict[int, str]) -> None:
     with rt.Image.open(image_path) as image:
         image = image.convert("RGB")
@@ -426,6 +533,134 @@ def save_semantic_comparison(image_path: Path, output_path: Path, gt_idx: Any, p
         legend = _render_class_legend([(v, idx_to_name.get(v, str(v))) for v in present], h)
         panels.append(("类别图例", legend))
     rt.make_comparison_panel(panels, output_path)
+
+
+def _render_semantic_visualizations(
+    model: Any,
+    data_path: Path,
+    split: str,
+    rows: list[dict[str, Any]],
+    *,
+    output_dir: Path,
+    max_images: int,
+) -> None:
+    """评估后统一挑图渲染语义对比图：好/差各半、类别尽量全，最多 max_images 张。
+
+    max_images<=0 表示不限制、渲染全部（旧行为）。挑中的图按 per-image mIoU 排序，
+    重新推理一次以拿到预测掩码后渲染，写入 compare/good 与 compare/bad，并汇总 manifest。
+    重新推理只针对挑中的这一小批图，成本很低，也避免为全量图缓存逐像素预测。
+    """
+    scored = [
+        r for r in rows
+        if r.get("image_path") and r.get("mask_path") and r.get("vis_miou") is not None
+    ]
+    if not scored:
+        return
+
+    def _score_of(r: dict[str, Any]) -> float:
+        return float(r.get("vis_miou", 0.0))
+
+    def _class_of(r: dict[str, Any]) -> int:
+        return int(r.get("vis_class", -1))
+
+    if max_images and max_images > 0:
+        n_good = max_images // 2
+        n_bad = max_images - n_good
+        good = _select_diverse_entries(scored, n_good, best=True, score_of=_score_of, class_of=_class_of)
+        picked = {id(r) for r in good}
+        remaining = [r for r in scored if id(r) not in picked]
+        bad = _select_diverse_entries(remaining, n_bad, best=False, score_of=_score_of, class_of=_class_of)
+    else:
+        good = sorted(scored, key=_score_of, reverse=True)
+        bad = []
+
+    mapping = _semantic_class_mapping(model, data_path, split)
+    idx_to_name = mapping["idx_to_name"]
+    compare_root = output_dir / "compare"
+    manifest: list[dict[str, Any]] = []
+
+    def _render_bucket(bucket: list[dict[str, Any]], subdir: str | None) -> None:
+        target_dir = compare_root / subdir if subdir else compare_root
+        for rank, row in enumerate(
+            track(bucket, label=f"seg/eval 出图 {subdir or 'all'}", total=len(bucket), unit="img"),
+            start=1,
+        ):
+            image_path = Path(row["image_path"])
+            mask_path = Path(row["mask_path"])
+            score = float(row.get("vis_miou", 0.0))
+            try:
+                prediction = predict_model(model, image_path, 0.0)
+                pred_np = _prediction_to_numpy(prediction)
+                target_np = _load_semantic_mask(mask_path, mapping["classes"], mapping["ignore_classes"])
+                pred_np = _resize_prediction_if_needed(pred_np, target_np.shape)
+                target_remapped, pred_remapped = _remap_semantic_arrays(pred_np, target_np, mapping)
+                name = f"{rank:03d}_miou{score:.2f}_{image_path.stem}.png"
+                out_path = target_dir / name
+                save_semantic_comparison(image_path, out_path, target_remapped, pred_remapped, idx_to_name)
+            except Exception as exc:  # noqa: BLE001 单图出图失败不影响其余
+                print(f"  ⚠ 对比图生成失败 {image_path}: {exc}")
+                continue
+            manifest.append({
+                "bucket": subdir or "all",
+                "rank": rank,
+                "miou": round(score, 6),
+                "dominant_class": idx_to_name.get(_class_of(row), str(_class_of(row))),
+                "image": str(image_path),
+                "mask": str(mask_path),
+                "output": str(out_path.relative_to(output_dir)),
+            })
+
+    if bad:
+        _render_bucket(good, "good")
+        _render_bucket(bad, "bad")
+    else:
+        _render_bucket(good, None)
+
+    compare_root.mkdir(parents=True, exist_ok=True)
+    (compare_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "split": split,
+                "total_scored": len(scored),
+                "rendered": len(manifest),
+                "max_images": max_images,
+                "items": manifest,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # 人类可读的映射文档：说明命名规则，并把每张输出对比图映射回原图 + 原 mask，
+    # 方便从原数据集里定位原始数据。字段与 manifest.json 一致，只是排版成表格。
+    lines = [
+        f"# seg eval 对比图映射（split: {split}）",
+        "",
+        "## 命名规则",
+        "",
+        "输出文件名格式：`<排名 3 位>_miou<该图 mIoU>_<原图文件名>.png`",
+        "",
+        "- `good/` = 表现最好的一批（mIoU 高），`bad/` = 表现最差的一批（mIoU 低）。",
+        "- 文件名里的 `原图文件名` 就是原图去掉扩展名后的 stem；下表给出原图与原 mask 的完整路径。",
+        "- 挑图规则：好/差各半、按主类别轮询以尽量覆盖更多类别；`max_images` 控制总数（0=不限制）。",
+        f"- 本次：共评分 {len(scored)} 张，实际出图 {len(manifest)} 张，max_images={max_images}。",
+        "",
+        "## 逐图映射",
+        "",
+        "| 输出对比图 | mIoU | 主类别 | 原图 | 原 mask |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for item in manifest:
+        lines.append(
+            f"| {item['output']} | {item['miou']:.4f} | {item['dominant_class']} "
+            f"| {item['image']} | {item['mask']} |"
+        )
+    (compare_root / "mapping.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    print(f"[{split}] 对比图已保存到: {compare_root}（共 {len(manifest)} 张）")
+    print(f"[{split}] 文件名↔原图/原mask 映射: {compare_root / 'mapping.md'}（另有 manifest.json）")
 
 
 def _seg_reuse_precheck(args, action: str) -> str:
@@ -888,9 +1123,11 @@ def _accumulate_semantic_confusion(
     *,
     shard_index: int | None = None,
     num_shards: int = 1,
-    vis_dir: Path | None = None,
 ) -> dict[str, Any] | None:
-    """加载样本并累积混淆矩阵，可分片、带容错与计时。无样本/无该 split 时返回 None。"""
+    """加载样本并累积混淆矩阵，可分片、带容错与计时。无样本/无该 split 时返回 None。
+
+    每图会额外记录用于挑图的 mIoU 与主类别；对比图的挑选与渲染统一在评估结束后进行。
+    """
     # 先查 yaml 里是否定义了该 split；未定义就跳过（多 split 评估时常见，
     # 不能让 load_semantic_segmentation_split_config 直接抛异常中断整轮评估）。
     if train_tools._load_yaml_dict(data_path).get(split) is None:
@@ -996,14 +1233,18 @@ def _accumulate_semantic_confusion(
                 minlength=num_eval_classes ** 2,
             )
             confusion += bincount.reshape((num_eval_classes, num_eval_classes))
-        rows.append({"image_path": str(image_path), "mask_path": str(mask_path), "valid_pixels": int(valid.sum())})
-        if vis_dir is not None:
-            try:
-                idx_to_name = {i: class_names[cid] for i, cid in enumerate(model_class_ids)}
-                compare_path = vis_dir / f"{Path(image_path).stem}_compare.png"
-                save_semantic_comparison(image_path, compare_path, target_remapped, pred_remapped, idx_to_name)
-            except Exception as exc:  # noqa: BLE001 可视化失败绝不能中断评估
-                print(f"  ⚠ 对比图生成失败 {image_path}: {exc}")
+        # 记录每图 mIoU 与主类别，供评估后统一挑图（好/差各半、类别尽量全）。
+        # 对比图的渲染不再逐图内联进行——那样会给全部图都出图；挑选是全局的，
+        # 必须看完所有图（多卡时还要汇总各分片）后再渲染选中的一小批。
+        vis_miou = _semantic_image_quality(target_remapped, pred_remapped, valid, num_eval_classes)
+        vis_class = _semantic_dominant_class(target_remapped, valid)
+        rows.append({
+            "image_path": str(image_path),
+            "mask_path": str(mask_path),
+            "valid_pixels": int(valid.sum()),
+            "vis_miou": round(float(vis_miou), 6),
+            "vis_class": vis_class,
+        })
         # 进度由 track() 单行进度条展示
 
     return {
@@ -1037,7 +1278,7 @@ def _write_semantic_summary(
     rt.prepare_output_dir(output_dir, overwrite, clean=True)
     summary_path = output_dir / "seg_semantic_eval_summary.json"
     csv_path = output_dir / "seg_semantic_eval_samples.csv"
-    rt.save_records_csv(csv_path, rows, ["image_path", "mask_path", "valid_pixels"])
+    rt.save_records_csv(csv_path, rows, ["image_path", "mask_path", "valid_pixels", "vis_miou", "vis_class"])
     summary = {
         "task": "semantic_segmentation",
         "checkpoint": str(checkpoint_path),
@@ -1073,16 +1314,17 @@ def _evaluate_semantic_split(
     shard_index: int | None = None,
     num_shards: int = 1,
     save_visualization: bool = True,
+    vis_max_images: int = 0,
 ) -> dict[str, Any] | None:
     """对单个 split 执行语义分割评估，保存 summary/CSV 并打印指标。
 
     分片子进程模式（shard_index 给定且 num_shards>1）下不写最终 summary，
     而是把本分片的混淆矩阵/rows 写成 shard result，留给父进程合并。
+    非分片模式下，写完 summary 再挑图渲染对比图（好/差各半、类别尽量全）。
     """
     accumulated = _accumulate_semantic_confusion(
         model, data_path, split, threshold,
         shard_index=shard_index, num_shards=num_shards,
-        vis_dir=_eval_compare_dir(output_dir) / split if save_visualization else None,
     )
     if accumulated is None:
         return None
@@ -1109,7 +1351,7 @@ def _evaluate_semantic_split(
         )
         return None
 
-    return _write_semantic_summary(
+    summary = _write_semantic_summary(
         output_dir,
         split=split,
         confusion=confusion,
@@ -1123,6 +1365,13 @@ def _evaluate_semantic_split(
         checkpoint_path=checkpoint_path,
         data_path=data_path,
     )
+    # summary 里已 clean 过 output_dir，故渲染放在其后，避免对比图被清掉。
+    if save_visualization:
+        _render_semantic_visualizations(
+            model, data_path, split, rows,
+            output_dir=output_dir, max_images=vis_max_images,
+        )
+    return summary
 
 
 def run_semantic_eval(args) -> None:
@@ -1193,6 +1442,7 @@ def run_semantic_eval(args) -> None:
             overwrite=args.overwrite,
             checkpoint_path=checkpoint_path,
             save_visualization=getattr(args, "save_visualization", True),
+            vis_max_images=int(getattr(args, "vis_max_images", rt.SEG_EVAL_VIS_MAX_IMAGES)),
         )
         if summary is not None:
             summaries[split] = summary
@@ -1396,6 +1646,9 @@ def _merge_parallel_semantic(
 ) -> None:
     """按 split 合并各分片的语义混淆矩阵，写出与顺序路径字节一致的 summary/CSV。"""
     wrote_any = False
+    want_vis = getattr(args, "save_visualization", True)
+    vis_max = int(getattr(args, "vis_max_images", rt.SEG_EVAL_VIS_MAX_IMAGES))
+    model = None  # 挑图渲染需要重新推理选中的一小批图，故惰性加载一次模型
     for split in splits:
         # 每个子进程把该 split 写到 shard_dir/<split>/seg_semantic_shard_result.json。
         split_shard_dirs = [
@@ -1422,6 +1675,17 @@ def _merge_parallel_semantic(
             checkpoint_path=checkpoint_path,
             data_path=data_path,
         )
+        # summary 已 clean 过 split_output_dir，故渲染放其后。挑图需重新推理，惰性加载模型。
+        if want_vis:
+            if model is None:
+                model = rt.lightly_train.load_model(
+                    model=checkpoint_path, device=rt.resolve_device("auto")
+                )
+                model.eval()
+            _render_semantic_visualizations(
+                model, data_path, split, merged["rows"],
+                output_dir=split_output_dir, max_images=vis_max,
+            )
         _write_seg_run_meta(
             split_output_dir / "run_meta.json",
             action="eval",

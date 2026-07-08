@@ -18,8 +18,11 @@ from typing import Any
 
 from . import common as rt
 from . import gpu_parallel
+from . import run_reuse
+from .progress import track
 from .det_shared import (
     build_legacy_report,
+    draw_comparison,
     draw_predictions,
     gt_records,
     load_ground_truth,
@@ -184,6 +187,12 @@ def visualization_output_path(
     rel_path = relative_output_path(sample, suffix)
     class_name = primary_prediction_class_name(records)
     return images_dir / rel_path.with_name(f"{class_name}_{rel_path.name}")
+
+
+def comparison_output_path(output_dir: Path, sample: rt.ImageSample, suffix: str) -> Path:
+    """[原图|GT|预测] 三联对比图统一落到 <output_dir>/compare/ 下，文件名 <图名>_compare.png。"""
+    rel_path = relative_output_path(sample, suffix)
+    return output_dir / "compare" / rel_path.with_name(f"{rel_path.stem}_compare.png")
 
 
 def find_saved_visualization_path(output_dir: Path, sample: rt.ImageSample) -> Path | None:
@@ -508,6 +517,7 @@ def print_dry_run_summary(
     ]
     if args.save_visualization:
         planned_artifacts.append(output_dir / "images")
+        planned_artifacts.append(output_dir / "compare")
     if args.save_json:
         planned_artifacts.append(temp_dir / "json")
     if args.save_txt:
@@ -935,6 +945,7 @@ def merge_shard_results(
         final_temp_dir = rt.infer_temp_dir(final_output_dir)
         if args.save_visualization:
             copy_tree_contents(shard_output_dir / "images", final_output_dir / "images")
+            copy_tree_contents(shard_output_dir / "compare", final_output_dir / "compare")
         if args.save_json or args.save_txt:
             shard_temp_dir = rt.infer_temp_dir(shard_output_dir)
         if args.save_json:
@@ -1051,7 +1062,10 @@ def run_multi_split_shard_infer(args) -> None:
 
     with tempfile.TemporaryDirectory(prefix="lt_rgb_") as _rgb_scratch_str:
         _rgb_scratch = Path(_rgb_scratch_str)
-        for idx, split_sample in enumerate(split_samples, start=1):
+        for idx, split_sample in enumerate(
+            track(split_samples, label="det/infer 推理", total=len(split_samples), unit="img"),
+            start=1,
+        ):
             split = split_sample.split
             sample = split_sample.sample
             state = split_states[split]
@@ -1089,6 +1103,12 @@ def run_multi_split_shard_infer(args) -> None:
                 )
                 gt_items_vis = gt_records(gt_boxes, gt_labels) if has_label else []
                 draw_predictions(sample.image_path, vis_path, records, gt_items_vis, class_names)
+                # 有真值时额外产出 [原图|GT|预测] 三联对比图，统一落到 compare/ 下。
+                if has_label:
+                    compare_path = comparison_output_path(
+                        output_dir, sample, rt.visualization_suffix(sample.image_path)
+                    )
+                    draw_comparison(sample.image_path, compare_path, records, gt_items_vis, class_names)
             if args.save_json:
                 save_prediction_json(json_dir / relative_output_path(sample, ".json"), sample, image_size, records)
             if args.save_txt:
@@ -1112,8 +1132,6 @@ def run_multi_split_shard_infer(args) -> None:
                 state["total_tp"] += image_total_tp
 
             state["processed_images"] += 1
-            if idx == 1 or idx % 20 == 0 or idx == len(split_samples):
-                print(f"[{idx}/{len(split_samples)}] processed ({split}): {sample.image_path}")
 
     for split in splits:
         state = split_states[split]
@@ -1218,7 +1236,10 @@ def run_parallel_split_infer(args) -> bool:
         data_cfg=data_cfg,
         split=args.split,
     )
-    rt.prepare_output_dir(final_output_dir, args.overwrite)
+    if _det_reuse_precheck(args, final_output_dir, checkpoint_path) == run_reuse.REUSE:
+        print(f"[det/infer] 已复用上次结果，未重新推理：{final_output_dir}")
+        return True
+    rt.prepare_output_dir(final_output_dir, args.overwrite, clean=True)
 
     base_samples, _, input_mode = get_input_samples(SimpleNamespace(**{**vars(args), "shard_index": None, "num_shards": 1}))
     rt.ensure_image_samples(base_samples)
@@ -1298,6 +1319,26 @@ def run_parallel_all_infer(args, splits: list[str]) -> bool:
     eligible_gpus = filter_high_memory_gpus(all_gpus)
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
     data_cfg = rt.load_data_config(args.data) if args.data is not None else None
+
+    # 逐 split 初步复用检测：可复用的直接跳过，只并行重跑缺数据/不一致的 split。
+    rerun_splits: list[str] = []
+    for split in splits:
+        split_args = SimpleNamespace(**vars(args))
+        split_args.requested_split = args.split
+        split_args.split = split
+        out_dir = build_split_output_dir(
+            args=split_args, checkpoint_path=checkpoint_path, data_cfg=data_cfg, split=split,
+        )
+        if _det_reuse_precheck(split_args, out_dir, checkpoint_path) == run_reuse.REUSE:
+            print(f"[det/infer] split={split} 已复用，跳过。")
+        else:
+            rerun_splits.append(split)
+    if not rerun_splits:
+        print("[det/infer] 所有 split 均已复用，无需重新推理。")
+        return True
+    splits = rerun_splits
+    args.overwrite = True  # 需重跑的 split 走干净覆盖（保留缓存）
+
     base_samples, _, _ = get_multi_split_input_samples(
         SimpleNamespace(**{**vars(args), "shard_index": None, "num_shards": 1}),
         splits,
@@ -1326,7 +1367,7 @@ def run_parallel_all_infer(args, splits: list[str]) -> bool:
             data_cfg=data_cfg,
             split=split,
         )
-        rt.prepare_output_dir(output_dir, args.overwrite)
+        rt.prepare_output_dir(output_dir, args.overwrite, clean=True)
         split_num_images[split] = sum(1 for item in base_samples if item.split == split)
 
     shard_root = rt.infer_temp_dir(final_output_root) / "_multi_shards" / str(args.split)
@@ -1401,6 +1442,25 @@ def run_parallel_all_infer(args, splits: list[str]) -> bool:
     return True
 
 
+def _det_reuse_precheck(args, output_dir: Path, checkpoint_path: Path) -> str:
+    """构造 det 指纹并做复用前置检查，返回 run_reuse 的决策常量。"""
+    data = getattr(args, "data", None)
+    if data is not None:
+        input_mode = "dataset"
+    elif getattr(args, "image", None) is not None:
+        input_mode = "image"
+    else:
+        input_mode = "image_dir"
+    fingerprint = run_reuse.make_fingerprint(
+        task="det", action="infer", checkpoint=checkpoint_path,
+        data=data, split=getattr(args, "split", None),
+        threshold=getattr(args, "score_threshold", None), input_mode=input_mode,
+        image=getattr(args, "image", None), image_dir=getattr(args, "image_dir", None),
+    )
+    # run_meta.json 在流程末尾才写，存在即代表上次跑完了。
+    return run_reuse.precheck(args, output_dir, fingerprint, action_label="det/infer", required=["run_meta.json"])
+
+
 def run_single_infer(args) -> None:
     use_dataset = args.data is not None
     compute_full_metrics = use_dataset and (args.compute_metrics or args.save_test_report)
@@ -1444,7 +1504,11 @@ def run_single_infer(args) -> None:
         )
         return
 
-    rt.prepare_output_dir(args.output_dir, args.overwrite)
+    if not shard_child:
+        if _det_reuse_precheck(args, args.output_dir, checkpoint_path) == run_reuse.REUSE:
+            print(f"[det/infer] 已复用上次结果，未重新推理：{args.output_dir}")
+            return
+    rt.prepare_output_dir(args.output_dir, args.overwrite, clean=True)
     dashboard_path: Path | None = None
     if not shard_child and not getattr(args, "skip_important_artifacts", False):
         dashboard_path = sync_important_artifacts(checkpoint_path)
@@ -1521,6 +1585,12 @@ def run_single_infer(args) -> None:
                 )
                 gt_items_vis = gt_records(gt_boxes, gt_labels) if has_label else []
                 draw_predictions(sample.image_path, vis_path, records, gt_items_vis, class_names)
+                # 有真值时额外产出 [原图|GT|预测] 三联对比图，统一落到 compare/ 下。
+                if has_label:
+                    compare_path = comparison_output_path(
+                        output_dir, sample, rt.visualization_suffix(sample.image_path)
+                    )
+                    draw_comparison(sample.image_path, compare_path, records, gt_items_vis, class_names)
             if args.save_json:
                 save_prediction_json(json_dir / relative_output_path(sample, ".json"), sample, image_size, records)
             if args.save_txt:

@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 
 from . import common as rt
+from .progress import track
 
 
 def run_infer(args) -> None:
@@ -31,7 +32,7 @@ def run_infer(args) -> None:
     rt.ensure_image_samples([rt.ImageSample(image_path=p, relative_path=Path(p.name)) for p in image_paths])
 
     rows: list[dict[str, object]] = []
-    for image_path in image_paths:
+    for image_path in track(image_paths, label="cls/infer 推理", unit="img"):
         pred = model.predict(str(image_path), topk=args.topk, threshold=args.threshold)
         labels = pred["labels"]
         scores = pred["scores"]
@@ -75,7 +76,7 @@ def run_eval(args) -> None:
 
     rows: list[dict[str, object]] = []
     correct = 0
-    for image_path in image_paths:
+    for image_path in track(image_paths, label="cls/eval 评估", unit="img"):
         true_label_name = image_path.parent.name
         true_label_id = name_to_id.get(true_label_name, -1)
         pred = model.predict(str(image_path), topk=args.topk, threshold=args.threshold)
