@@ -17,6 +17,7 @@ convert_datasets/
     ├── seg2mvtec_interactive.py
     ├── yoloseg_to_mvtec.py
     ├── objectseg_to_mvtec.py
+    ├── objseg_wizard.py
     ├── seg_sample_browse.py
     ├── make_sample_yoloseg.py
     ├── mirror_det_subset_to_seg.py
@@ -89,13 +90,20 @@ python convert.py list            # 只打印菜单
 
 适用:多模态/零样本异常检测。category 是**物体**,物体内按缺陷分子文件夹。
 
-三步:
-1.(可选)抽样定物体:
-   `python convert.py sample-browse` → 看 `<out>/sample_index.csv` 归纳有哪些物体。
-2. 人工分图:在 `staging/` 下建**中文物体名**文件夹,把对应图片放进去(一张图只放一个物体)。
-3. 生成:
-   `python convert.py to-mvtec-obj`(或直接
-   `python convert_tools/objectseg_to_mvtec.py --staging <staging> --src <seg源> --out <输出> --clean`)
+推荐用交互向导一站式走完:
+
+    python convert.py obj-wizard
+
+- **第1步(生成标注预览)**:输入源 seg 数据集 + 输出目录,生成每张图的**标注预览**
+  (左=原图画上缺陷多边形+中文类别名,右=信息栏:文件名、缺陷种类数、逐类计数、多边形总数)
+  和 `sample_index.csv`(含 `n_defect_classes` 列,可先筛多类别图)。
+- **人工分图**:把预览下载到本地,逐张看图判断属于哪个物体,建**中文物体名**文件夹分好
+  (一张图只放一个物体;多物体/说不清的先别放),再把 `staging/` 上传回服务器。
+- **第2步(转换)**:再跑一次向导选第2步,按文件名回源数据查标注、生成物体版 MVTec。
+
+也可跳过向导直接用单命令:`python convert.py sample-browse`(生成预览)、
+`python convert.py to-mvtec-obj`(转换)。中文字体默认用仓库自带 `tool_lib/msyh.ttc`,
+可用 `--font` 覆盖。
 
 产出 `<out>/<物体>/{train/good(空), test/good(空), test/<缺陷>/, ground_truth/<缺陷>/}`,
 外加 `<out>/object_manifest.csv` 审计清单。脚本按文件名回源查标注、自动发现缺陷、一图多缺陷会复制进各缺陷子文件夹(mask 分拆)。
@@ -133,6 +141,7 @@ python convert.py det2seg --det-subset <det子集> --seg-source <seg全量> [--c
 | `seg2mvtec_interactive.py` | ③ 入口：扫描 + 交互 |
 | `yoloseg_to_mvtec.py` | ③ 核心库(被上面 import，也可单独 CLI) |
 | `objectseg_to_mvtec.py` | 物体版：按人工分好的物体文件夹 + 源seg 生成 MVTec(category=物体)；对应 `convert.py to-mvtec-obj` |
+| `objseg_wizard.py` | 物体版向导(交互)：分两步生成预览+转换；对应 `convert.py obj-wizard` |
 | `seg_sample_browse.py` | (可选)抽样摊图，帮人归纳源数据有哪些物体；对应 `convert.py sample-browse` |
 | `make_sample_yoloseg.py` | ③ 造示例数据 |
 | `one_click_convert.py` / `LabelMeToYOLO.py` | ② 转 YOLO 入口 |
