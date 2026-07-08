@@ -96,3 +96,41 @@ def test_scan_staging_same_stem_diff_ext_in_one_object_is_not_conflict(tmp_path)
     _img(staging / "管道" / "a.png")  # 管道 里已有 a.jpg,再加同名不同扩展的 a.png
     _objects, conflicts = om.scan_staging(staging)
     assert "a" not in conflicts  # 同一物体内不算跨物体冲突
+
+
+def _run(tmp_path):
+    src = make_src(tmp_path / "src")
+    staging = make_staging(tmp_path / "staging")
+    out = tmp_path / "out"
+    result = om.convert(staging, src, out, clean=True, verbose=False)
+    return out, result
+
+
+def test_convert_builds_object_category_structure(tmp_path):
+    out, _ = _run(tmp_path)
+    assert (out / "管道" / "test" / "锈蚀" / "a.png").exists()
+    assert (out / "管道" / "ground_truth" / "锈蚀" / "a_mask.png").exists()
+    assert (out / "管道" / "train" / "good").is_dir()
+    assert (out / "阀门" / "train" / "good").is_dir()
+
+
+def test_convert_duplicates_multidefect_image_into_each_defect(tmp_path):
+    out, _ = _run(tmp_path)
+    assert (out / "管道" / "test" / "锈蚀" / "b.png").exists()
+    assert (out / "管道" / "test" / "裂纹" / "b.png").exists()
+    assert (out / "管道" / "ground_truth" / "锈蚀" / "b_mask.png").exists()
+    assert (out / "管道" / "ground_truth" / "裂纹" / "b_mask.png").exists()
+
+
+def test_convert_mask_is_split_per_defect(tmp_path):
+    out, _ = _run(tmp_path)
+    m_rust = cv2.imread(str(out / "管道" / "ground_truth" / "锈蚀" / "b_mask.png"), cv2.IMREAD_GRAYSCALE)
+    m_crack = cv2.imread(str(out / "管道" / "ground_truth" / "裂纹" / "b_mask.png"), cv2.IMREAD_GRAYSCALE)
+    assert set(np.unique(m_rust)).issubset({0, 255})
+    assert m_rust[19, 19] == 255 and m_rust[45, 45] == 0
+    assert m_crack[45, 45] == 255 and m_crack[19, 19] == 0
+
+
+def test_convert_empty_label_goes_to_test_good(tmp_path):
+    out, _ = _run(tmp_path)
+    assert (out / "阀门" / "test" / "good" / "d.png").exists()

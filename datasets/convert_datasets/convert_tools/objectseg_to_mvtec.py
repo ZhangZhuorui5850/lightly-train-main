@@ -101,3 +101,86 @@ def scan_staging(staging: Path) -> tuple[dict[str, list[Path]], dict[str, list[s
         objects[obj_dir.name] = imgs
     conflicts = {stem: objs for stem, objs in stem_objs.items() if len(objs) > 1}
     return objects, conflicts
+
+
+def _ensure_empty_layout(cat: Path) -> None:
+    """建每个物体都要有的空目录(满足 MVTec 格式,即使零样本用途)。"""
+    (cat / "train" / "good").mkdir(parents=True, exist_ok=True)
+    (cat / "test" / "good").mkdir(parents=True, exist_ok=True)
+
+
+def convert(
+    staging: Path,
+    src: Path,
+    out: Path,
+    clean: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """把 staging(人工分好的物体文件夹) + src(YOLO-seg) 转成物体版 MVTec 到 out。
+
+    返回统计 dict:{stats, missing, conflicts, manifest}。从不修改 src。
+    """
+    staging, src, out = staging.resolve(), src.resolve(), out.resolve()
+    names = load_names(src)
+    index = build_label_index(src)
+    objects, conflicts = scan_staging(staging)
+
+    if clean and out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # stats[物体][缺陷名 或 "good"] = 计数
+    stats: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    missing: list[tuple[str, str]] = []
+    manifest: list[dict[str, str]] = []
+
+    for obj, imgs in objects.items():
+        cat = out / obj
+        _ensure_empty_layout(cat)
+        bar = tqdm(imgs, desc=f"物体 {obj}", unit="img", disable=not verbose,
+                   dynamic_ncols=True, leave=False)
+        for img_path in bar:
+            stem = img_path.stem
+            if stem not in index:
+                missing.append((obj, stem))
+                continue
+            label_path, split = index[stem]
+            img = cv2.imread(str(img_path))
+            if img is None:
+                missing.append((obj, stem))
+                continue
+            h, w = img.shape[:2]
+            polys = parse_label(label_path)
+            present = sorted({cls for cls, _ in polys})
+
+            if not present:  # 空标签 → 对该物体是 good
+                dst = cat / "test" / "good"
+                cv2.imwrite(str(dst / f"{stem}.png"), img)
+                stats[obj]["good"] += 1
+            else:
+                for cls in present:
+                    dname = names[cls]
+                    dst = cat / "test" / dname
+                    dst.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(dst / f"{stem}.png"), img)
+                    only = [p for c, p in polys if c == cls]
+                    mask = make_mask(only, w, h)
+                    gt = cat / "ground_truth" / dname
+                    gt.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(gt / f"{stem}_mask.png"), mask)
+                    stats[obj][dname] += 1
+
+            manifest.append({
+                "stem": stem,
+                "object": obj,
+                "orig_split": split,
+                "defects": ";".join(names[c] for c in present),
+                "src_label": str(label_path.relative_to(src)),
+            })
+
+    return {
+        "stats": {o: dict(d) for o, d in stats.items()},
+        "missing": missing,
+        "conflicts": conflicts,
+        "manifest": manifest,
+    }
