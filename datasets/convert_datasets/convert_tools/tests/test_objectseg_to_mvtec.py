@@ -89,3 +89,10 @@ def test_scan_staging_flags_stem_in_two_objects(tmp_path):
     objects, conflicts = om.scan_staging(staging)
     assert "a" in conflicts
     assert set(conflicts["a"]) == {"管道", "阀门"}
+
+
+def test_scan_staging_same_stem_diff_ext_in_one_object_is_not_conflict(tmp_path):
+    staging = make_staging(tmp_path / "staging")
+    _img(staging / "管道" / "a.png")  # 管道 里已有 a.jpg,再加同名不同扩展的 a.png
+    _objects, conflicts = om.scan_staging(staging)
+    assert "a" not in conflicts  # 同一物体内不算跨物体冲突

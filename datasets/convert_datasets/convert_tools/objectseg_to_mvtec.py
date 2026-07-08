@@ -96,7 +96,8 @@ def scan_staging(staging: Path) -> tuple[dict[str, list[Path]], dict[str, list[s
         for img in sorted(obj_dir.iterdir()):
             if img.is_file() and img.suffix.lower() in IMG_EXTS:
                 imgs.append(img)
-                stem_objs[img.stem].append(obj_dir.name)
+                if obj_dir.name not in stem_objs[img.stem]:
+                    stem_objs[img.stem].append(obj_dir.name)
         objects[obj_dir.name] = imgs
     conflicts = {stem: objs for stem, objs in stem_objs.items() if len(objs) > 1}
     return objects, conflicts
