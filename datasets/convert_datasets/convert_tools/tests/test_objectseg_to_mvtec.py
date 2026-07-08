@@ -167,3 +167,20 @@ def test_cli_runs_end_to_end(tmp_path):
     assert r.returncode == 0, r.stderr
     assert (out / "管道" / "test" / "锈蚀" / "a.png").exists()
     assert (out / "object_manifest.csv").exists()
+
+
+def test_sample_browse_writes_index_csv(tmp_path):
+    src = make_src(tmp_path / "src")
+    # 需要真实图片供抽样:补 images/
+    for split, stem in [("train", "a"), ("train", "b"), ("val", "c"), ("train", "d")]:
+        _img(src / "images" / split / f"{stem}.jpg")
+    out = tmp_path / "browse"
+    import seg_sample_browse as sb
+    n = sb.browse(src, out, limit=10)
+    assert n == 4
+    idx = out / "sample_index.csv"
+    assert idx.exists()
+    import csv as _csv
+    rows = {r["stem"]: r for r in _csv.DictReader(idx.open(encoding="utf-8"))}
+    assert rows["b"]["defects"] == "锈蚀;裂纹"
+    assert (out / "b.jpg").exists()

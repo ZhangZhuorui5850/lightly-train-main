@@ -100,6 +100,13 @@ COMMANDS: dict[str, Tool] = {
         "需 --src <seg目录> --out <输出目录>",
         interactive=False, primary=False,
     ),
+    "sample-browse": Tool(
+        "seg_sample_browse.py",
+        "物体版第0步(可选):抽样摊图,帮你归纳源数据里有哪些物体",
+        "更多",
+        "需 --src <seg源> --out <浏览目录> [--limit 500]",
+        interactive=False, primary=False,
+    ),
     "make-sample": Tool(
         "make_sample_yoloseg.py",
         "造一份示例 YOLO-seg 数据(仅 demo/测试用)",
