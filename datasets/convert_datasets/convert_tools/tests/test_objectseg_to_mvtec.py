@@ -169,6 +169,38 @@ def test_cli_runs_end_to_end(tmp_path):
     assert (out / "object_manifest.csv").exists()
 
 
+def test_convert_refuses_nonempty_out_without_clean(tmp_path):
+    src = make_src(tmp_path / "src")
+    staging = make_staging(tmp_path / "staging")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "stale.txt").write_text("old")  # 预先放一个陈旧文件
+    with pytest.raises(SystemExit):
+        om.convert(staging, src, out, clean=False, verbose=False)
+
+
+def test_convert_clean_overwrites_existing_out(tmp_path):
+    src = make_src(tmp_path / "src")
+    staging = make_staging(tmp_path / "staging")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "stale.txt").write_text("old")
+    om.convert(staging, src, out, clean=True, verbose=False)  # 不应报错
+    assert not (out / "stale.txt").exists()  # 陈旧文件被清掉
+    assert (out / "object_manifest.csv").exists()
+
+
+def test_convert_raises_on_out_of_range_class_id(tmp_path):
+    src = make_src(tmp_path / "src")
+    # 追加一个越界类别 id 的标签(names 只有 3 类:0,1,2)
+    _write_label(src / "labels" / "train" / "bad.txt", [(9, _tri(0.5, 0.5))])
+    staging = tmp_path / "staging"
+    _img(staging / "管道" / "bad.jpg")
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit):
+        om.convert(staging, src, out, clean=True, verbose=False)
+
+
 def test_sample_browse_writes_index_csv(tmp_path):
     src = make_src(tmp_path / "src")
     # 需要真实图片供抽样:补 images/

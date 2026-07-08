@@ -154,6 +154,11 @@ def convert(
 
     if clean and out.exists():
         shutil.rmtree(out)
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(
+            f"[拒绝覆盖] 输出目录已存在且非空: {out}\n"
+            "用 --clean 从头重建,或换一个 --out。"
+        )
     out.mkdir(parents=True, exist_ok=True)
 
     # stats[物体][缺陷名 或 "good"] = 计数
@@ -186,6 +191,12 @@ def convert(
                 stats[obj]["good"] += 1
             else:
                 for cls in present:
+                    if cls < 0 or cls >= len(names):
+                        raise SystemExit(
+                            f"[类别越界] 标签 {label_path} 出现 cls={cls},"
+                            f"但 data.yaml/classes.txt 只有 {len(names)} 个类别(0..{len(names) - 1})。"
+                            "请检查是不是 --src 指错了,或 data.yaml 与标签不匹配。"
+                        )
                     dname = names[cls]
                     dst = cat / "test" / dname
                     dst.mkdir(parents=True, exist_ok=True)
@@ -226,7 +237,10 @@ def main() -> None:
     ap.add_argument("--out", required=True, type=Path, help="输出 MVTec AD 根目录")
     ap.add_argument("--clean", action="store_true", help="先清空 --out")
     args = ap.parse_args()
-    convert(args.staging, args.src, args.out, clean=args.clean, verbose=True)
+    try:
+        convert(args.staging, args.src, args.out, clean=args.clean, verbose=True)
+    except DuplicateStemError as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":
