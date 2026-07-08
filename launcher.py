@@ -114,6 +114,11 @@ DET_SETTINGS = {
     # det_export_avg_boxes_per_image_min/max: 平均每图框数软目标区间，默认 5~15；都填 0 关闭。
     "det_export_avg_boxes_per_image_min": 5,
     "det_export_avg_boxes_per_image_max": 15,
+    # det_export_trim_boxes: 选图后把超出均衡窗口的多数类多余框从标签里删掉，让各类
+    #   框数真正落入 balance_ratio 窗口。只选图受共现物理底限制时(多数类作"乘客"被动
+    #   超配额)，这是把类别压到完全均衡的硬手段。代价：被删的框变成无标签实例(训练时
+    #   潜在漏标)。默认 False；要求严格类别均衡时设 True。
+    "det_export_trim_boxes": False,
     "det_export_suffix": "_A",
 }
 
@@ -142,6 +147,12 @@ SEG_SETTINGS = {
     # 改 seg 数据集时，下面 seg_export_* 的源数据会自动跟着变
     "seg_dataset_dir": "datasets/neu_dataset/dataset_seg",
     "seg_train_type": "instance",
+
+    # seg_experiment_dir:
+    #   infer/eval 未显式给 --experiment-dir/--checkpoint 时的默认实验目录。
+    #   "auto"（默认）自动发现 out/ 下最近一次含 checkpoint 的 seg 实验（train_seg.py 的 OUT）。
+    #   也可写死具体目录，如 "out/xxx"；或每次用 --experiment-dir 覆盖。
+    "seg_experiment_dir": "auto",
     # 语义分割默认指向真实存在的数据集（neu_dataset 下没有 dataset_semantic）。
     "semantic_seg_dataset_dir": "datasets/aeroscapes/dataset_semantic",
     "semantic_seg_data_yaml": "datasets/aeroscapes/dataset_semantic/data.yaml",
@@ -150,6 +161,11 @@ SEG_SETTINGS = {
     # seg_threshold:
     #   推理/评估默认阈值。掩码太少就调低，噪声太多就调高。
     "seg_threshold": 0.8,
+
+    # seg_eval_vis_max_images:
+    #   实例评估对比图最多出多少张，好/差各半、类别尽量全，避免占满磁盘。
+    #   0 表示不限制、给每张有标注的图都出对比图（旧行为）。
+    "seg_eval_vis_max_images": 100,
 
     # export 默认配置（参数语义对齐 det，关键词把"框"换成"实例"）
     # seg_export_source_data 不填时，默认 <seg_dataset_dir>/data.yaml

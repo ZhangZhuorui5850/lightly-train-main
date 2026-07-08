@@ -3,6 +3,8 @@ from pathlib import Path
 import yaml
 import lightly_train
 
+import seg_copy_paste  # 在线 Copy-Paste 增强（必须在调用 train 之前 import）
+
 # ======================== 改这里 ========================
 
 OUT = "out/seg/aeroscapes"                             # 输出目录
@@ -11,8 +13,21 @@ BACKBONE_WEIGHTS = "weights/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"  # bac
 
 DATA_YAML = "datasets/aeroscapes/dataset_semantic/data.yaml"  # 数据集配置
 
-STEPS = 5000
+STEPS = 2000
 BATCH_SIZE = 4
+
+# ---- Copy-Paste 在线数据增强 ----
+COPY_PASTE = True          # False=完全关闭，行为回到官方原样
+COPY_PASTE_ARGS = dict(
+    prob=0.5,              # 多大概率对一张图做拼贴
+    paste_classes=None,    # 允许粘贴的类别 id；None=除背景外全部
+    background_classes=(0,),  # 背景/多数类，不参与粘贴
+    max_paste=3,           # 每张图最多粘贴几个连通块
+    min_area_frac=0.001,   # 连通块小于全图该比例则丢弃（滤碎片）
+    source_max_tries=20,   # 选源裁剪可能裁掉目标类，最多重试次数
+    feather=0,             # 边缘羽化核(奇数,0=硬贴)，仅软化图像
+    verbose=True,
+)
 
 # =======================================================
 
@@ -51,6 +66,9 @@ def load_data(yaml_path: str) -> dict:
 
 def main():
     data = load_data(DATA_YAML)
+
+    if COPY_PASTE:
+        seg_copy_paste.enable(**COPY_PASTE_ARGS)
 
     # 验证路径
     for split in ("train", "val"):
