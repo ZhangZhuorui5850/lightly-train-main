@@ -201,21 +201,37 @@ def test_convert_raises_on_out_of_range_class_id(tmp_path):
         om.convert(staging, src, out, clean=True, verbose=False)
 
 
-def test_sample_browse_writes_index_csv(tmp_path):
-    src = make_src(tmp_path / "src")
-    # 需要真实图片供抽样:补 images/
+def test_browse_writes_annotated_previews_and_new_csv_columns(tmp_path):
+    import csv as _csv
+    from PIL import Image
+    import seg_sample_browse as sb
+
+    src = make_src(tmp_path / "src")  # a=锈蚀, b=锈蚀+裂纹, c=污迹, d=空
     for split, stem in [("train", "a"), ("train", "b"), ("val", "c"), ("train", "d")]:
         _img(src / "images" / split / f"{stem}.jpg")
     out = tmp_path / "browse"
-    import seg_sample_browse as sb
     n = sb.browse(src, out, limit=10)
     assert n == 4
-    idx = out / "sample_index.csv"
-    assert idx.exists()
-    import csv as _csv
-    rows = {r["stem"]: r for r in _csv.DictReader(idx.open(encoding="utf-8"))}
+
+    assert (out / "b.png").exists()
+    base_w = Image.open(src / "images" / "train" / "b.jpg").width
+    assert Image.open(out / "b.png").width > base_w
+
+    rows = {r["stem"]: r for r in _csv.DictReader((out / "sample_index.csv").open(encoding="utf-8"))}
     assert rows["b"]["defects"] == "锈蚀;裂纹"
-    assert (out / "b.jpg").exists()
+    assert rows["b"]["n_defect_classes"] == "2"
+    assert rows["b"]["n_polygons"] == "2"
+    assert rows["d"]["n_defect_classes"] == "0"  # 空标签
+
+
+def test_browse_skips_missing_image(tmp_path):
+    import seg_sample_browse as sb
+    src = make_src(tmp_path / "src")
+    _img(src / "images" / "train" / "a.jpg")  # 只给 a 配图
+    out = tmp_path / "browse"
+    n = sb.browse(src, out, limit=10)
+    assert n == 1
+    assert (out / "a.png").exists()
 
 
 def test_class_color_deterministic_and_distinct():
