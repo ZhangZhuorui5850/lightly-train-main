@@ -264,3 +264,31 @@ def test_render_preview_appends_info_panel(tmp_path):
     assert canvas.height == 64                 # 高度=原图高
     assert canvas.width > base_w               # 右边拼了信息栏
     assert canvas.mode == "RGB"
+
+
+def test_wizard_run_generate_forwards(monkeypatch, tmp_path):
+    import objseg_wizard as wiz
+    calls = {}
+
+    def fake_browse(src, out, limit=500, font_path=None):
+        calls.update(src=src, out=out, limit=limit, font_path=font_path)
+        return 7
+
+    monkeypatch.setattr(wiz.seg_sample_browse, "browse", fake_browse)
+    n = wiz.run_generate(tmp_path / "s", tmp_path / "o", limit=3)
+    assert n == 7
+    assert calls["limit"] == 3 and calls["src"] == tmp_path / "s"
+
+
+def test_wizard_run_build_forwards(monkeypatch, tmp_path):
+    import objseg_wizard as wiz
+    calls = {}
+
+    def fake_convert(staging, src, out, clean=False, verbose=True):
+        calls.update(staging=staging, src=src, out=out, clean=clean)
+        return {"stats": {}, "missing": [], "conflicts": {}, "manifest": []}
+
+    monkeypatch.setattr(wiz.objectseg_to_mvtec, "convert", fake_convert)
+    result = wiz.run_build(tmp_path / "stg", tmp_path / "src", tmp_path / "out", clean=True)
+    assert calls["clean"] is True and calls["staging"] == tmp_path / "stg"
+    assert "manifest" in result
