@@ -25,7 +25,9 @@ from typing import Any
 
 from . import common as rt
 from . import gpu_parallel
+from . import run_reuse
 from . import train_tools
+from .progress import track
 from .seg_export import run_export  # noqa: F401  re-export to keep dispatch wiring simple
 from .seg_shared import rle_decode, rle_encode
 
@@ -115,6 +117,24 @@ def _seg_infer_image_paths(args: Any) -> list[Path]:
         samples, _ = rt.list_dataset_samples(data_cfg=data_cfg, split=args.split)
         return [sample.image_path for sample in samples]
     return rt.list_image_files(args.image if args.image is not None else args.image_dir)
+
+
+def _seg_infer_gt_lookup(args: Any) -> dict[Path, Path | None]:
+    """实例分割 + 数据集模式下返回 {image_path: label_path}，用于产出 GT 对比图。
+
+    语义分割、单图/目录模式（无标注）一律返回空 dict。
+    """
+    if _normalize_seg_type(args) == "semantic":
+        return {}
+    data_path = getattr(args, "data", None)
+    if data_path is None:
+        return {}
+    try:
+        data_cfg = rt.load_data_config(Path(data_path))
+        samples, _ = rt.list_dataset_samples(data_cfg=data_cfg, split=args.split)
+    except Exception:  # noqa: BLE001 拿不到真值就退回不画对比图
+        return {}
+    return {sample.image_path: sample.label_path for sample in samples}
 
 
 def _class_labels(classes: dict[int, Any], class_id: int) -> set[Any]:
@@ -244,28 +264,207 @@ def save_semantic_visualization(image_path: Path, output_path: Path, mask_tensor
     )
 
 
+def _render_instance_overlay(
+    base_image: Any,
+    labels: list[int],
+    masks: Any,
+    class_names: dict[int, str],
+    *,
+    scores: list[float] | None = None,
+    color_by: str = "instance",
+    with_labels: bool = False,
+    font: Any = None,
+) -> Any:
+    """把实例掩码半透明叠加到 base_image 的副本上并返回新图（不改入参）。
+
+    color_by="instance" 每个实例不同色（便于区分重叠实例）；
+    color_by="class" 按类别上色（便于 GT 与预测同类对照）。
+    with_labels=True 时在每个实例左上角画 类名(+分数) 文字标签。
+    """
+    overlay = rt.np.array(base_image.convert("RGB"))
+    for idx, (label, mask) in enumerate(zip(labels, masks)):
+        key = int(label) if color_by == "class" else idx
+        color = rt.np.array(color_for_index(key), dtype=rt.np.uint8)
+        mask_bool = rt.np.asarray(mask).astype(bool)
+        overlay[mask_bool] = (0.55 * overlay[mask_bool] + 0.45 * color).astype(rt.np.uint8)
+    image = rt.Image.fromarray(overlay)
+    if with_labels:
+        draw = rt.ImageDraw.Draw(image)
+        if font is None:
+            font = rt.load_cjk_font(15)
+        for idx, (label, mask) in enumerate(zip(labels, masks)):
+            ys, xs = rt.np.where(rt.np.asarray(mask).astype(bool))
+            if xs.size == 0:
+                continue
+            key = int(label) if color_by == "class" else idx
+            color = color_for_index(key)
+            name = class_names.get(int(label), str(int(label)))
+            text = f"{name} {scores[idx]:.2f}" if scores is not None else name
+            x0, y0 = int(xs.min()), int(ys.min())
+            left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+            text_w, text_h = right - left, bottom - top
+            rect_y0 = max(0, y0 - text_h - 4)
+            draw.rectangle((x0, rect_y0, x0 + text_w + 4, rect_y0 + text_h + 4), fill=color)
+            draw.text((x0 + 2, rect_y0 + 2), text, fill=(255, 255, 255), font=font)
+    return image
+
+
 def save_instance_visualization(image_path: Path, output_path: Path, prediction: dict[str, Any], class_names: dict[int, str]) -> None:
     with rt.Image.open(image_path) as image:
-        image = image.convert("RGB")
-        image_np = rt.np.array(image)
+        base = image.convert("RGB")
 
     labels = prediction["labels"].detach().cpu().tolist()
     masks = prediction["masks"].detach().cpu().numpy()
     scores = prediction["scores"].detach().cpu().tolist()
-    overlay = image_np.copy()
-    meta: list[dict[str, Any]] = []
-    for idx, (label, mask, score) in enumerate(zip(labels, masks, scores)):
-        color = rt.np.array(color_for_index(idx), dtype=rt.np.uint8)
-        mask_bool = mask.astype(bool)
-        overlay[mask_bool] = (0.55 * overlay[mask_bool] + 0.45 * color).astype(rt.np.uint8)
-        meta.append({"class_id": int(label), "class_name": class_names.get(int(label), str(label)), "score": round(float(score), 6)})
+    rendered = _render_instance_overlay(base, labels, masks, class_names, color_by="instance")
+    meta = [
+        {"class_id": int(label), "class_name": class_names.get(int(label), str(label)), "score": round(float(score), 6)}
+        for label, score in zip(labels, scores)
+    ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    rt.Image.fromarray(overlay).save(output_path)
+    rendered.save(output_path)
     output_path.with_suffix(".json").write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def save_instance_comparison(image_path: Path, output_path: Path, prediction: dict[str, Any], target: dict[str, Any], class_names: dict[int, str]) -> None:
+    """生成 [原图 | 真值 GT | 预测 Pred] 三联对比图（实例分割），便于汇报展示。
+
+    GT 与预测都按类别上色、带类名标签，便于直接比对同类区域。
+    """
+    with rt.Image.open(image_path) as image:
+        base = image.convert("RGB")
+    original = base.copy()
+    font = rt.load_cjk_font(15)
+    gt_panel = _render_instance_overlay(
+        base,
+        target["labels"].detach().cpu().tolist(),
+        target["masks"].detach().cpu().numpy(),
+        class_names,
+        color_by="class",
+        with_labels=True,
+        font=font,
+    )
+    pred_panel = _render_instance_overlay(
+        base,
+        prediction["labels"].detach().cpu().tolist(),
+        prediction["masks"].detach().cpu().numpy(),
+        class_names,
+        scores=prediction["scores"].detach().cpu().tolist(),
+        color_by="class",
+        with_labels=True,
+        font=font,
+    )
+    rt.make_comparison_panel(
+        [("原图", original), ("真值 GT", gt_panel), ("预测 Pred", pred_panel)],
+        output_path,
+    )
+
+
+def _eval_compare_dir(output_like: Path) -> Path:
+    """对比图的稳定落盘目录。
+
+    分片子进程的 output_dir 形如 <final>/_shards/shard_xx，该目录评估后会被整体删除，
+    所以对比图要写到 <final>/compare；非分片场景直接写 <output_dir>/compare。
+    """
+    path = Path(output_like)
+    if path.parent.name == "_shards":
+        return path.parent.parent / "compare"
+    return path / "compare"
+
+
+def _filter_instance_prediction(prediction: dict[str, Any], threshold: float) -> dict[str, Any]:
+    """按分数阈值过滤实例预测，用于展示（eval 的指标仍用全量预测，不受影响）。"""
+    scores = prediction["scores"]
+    keep = scores >= threshold
+    return {"labels": prediction["labels"][keep], "masks": prediction["masks"][keep], "scores": scores[keep]}
+
+
+def _render_semantic_index_overlay(base_image: Any, label_idx: Any) -> Any:
+    """把统一索引空间的语义标签图半透明叠加到 base_image（按索引上色，GT 与预测同色）。"""
+    h, w = label_idx.shape
+    base = base_image.convert("RGB").resize((w, h))
+    overlay = rt.np.array(base)
+    for value in sorted(int(v) for v in set(label_idx.reshape(-1).tolist()) if v >= 0):
+        color = rt.np.array(color_for_index(value), dtype=rt.np.uint8)
+        sel = label_idx == value
+        overlay[sel] = (0.55 * overlay[sel] + 0.45 * color).astype(rt.np.uint8)
+    return rt.Image.fromarray(overlay)
+
+
+def _render_class_legend(items: list[tuple[int, str]], height: int, *, font: Any = None) -> Any:
+    """生成类别图例图（色块+类名），高度对齐到 height，便于和对比图等高拼接。"""
+    if font is None:
+        font = rt.load_cjk_font(16)
+    swatch, pad = 18, 8
+    probe = rt.ImageDraw.Draw(rt.Image.new("RGB", (8, 8)))
+    text_w = max((probe.textbbox((0, 0), name, font=font)[2] for _, name in items), default=40)
+    width = swatch + pad * 3 + int(text_w)
+    legend = rt.Image.new("RGB", (max(width, 60), max(height, 1)), (255, 255, 255))
+    draw = rt.ImageDraw.Draw(legend)
+    y = pad
+    for idx, name in items:
+        draw.rectangle((pad, y, pad + swatch, y + swatch), fill=color_for_index(idx))
+        draw.text((pad * 2 + swatch, y), name, fill=(20, 20, 20), font=font)
+        y += swatch + pad
+    return legend
+
+
+def save_semantic_comparison(image_path: Path, output_path: Path, gt_idx: Any, pred_idx: Any, idx_to_name: dict[int, str]) -> None:
+    """生成 [原图 | 真值 GT | 预测 Pred | 图例] 语义分割对比图。
+
+    gt_idx / pred_idx 均为统一类别索引空间的 2D 数组（<0 表示忽略/背景），保证同类同色。
+    """
+    with rt.Image.open(image_path) as image:
+        base = image.convert("RGB")
+    h, w = pred_idx.shape
+    original = base.resize((w, h))
+    gt_panel = _render_semantic_index_overlay(base, gt_idx)
+    pred_panel = _render_semantic_index_overlay(base, pred_idx)
+    present = sorted({int(v) for v in set(gt_idx.reshape(-1).tolist()) | set(pred_idx.reshape(-1).tolist()) if v >= 0})
+    panels = [("原图", original), ("真值 GT", gt_panel), ("预测 Pred", pred_panel)]
+    if present:
+        legend = _render_class_legend([(v, idx_to_name.get(v, str(v))) for v in present], h)
+        panels.append(("类别图例", legend))
+    rt.make_comparison_panel(panels, output_path)
+
+
+def _seg_reuse_precheck(args, action: str) -> str:
+    """构造 seg 指纹 + 所需产物清单，做初步复用检测，返回 run_reuse 的决策常量。"""
+    checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
+    data = getattr(args, "data", None)
+    if data is not None:
+        input_mode = "dataset"
+    elif getattr(args, "image", None) is not None:
+        input_mode = "image"
+    else:
+        input_mode = "image_dir"
+    seg_type = _normalize_seg_type(args)
+    fingerprint = run_reuse.make_fingerprint(
+        task="seg", action=action, checkpoint=checkpoint_path,
+        data=data, split=getattr(args, "split", None),
+        threshold=getattr(args, "threshold", None), input_mode=input_mode,
+        image=getattr(args, "image", None), image_dir=getattr(args, "image_dir", None),
+        seg_train_type=seg_type,
+    )
+    # 所需产物：infer 看 run_meta（末尾才写=跑完）；eval 看评估摘要，
+    # 开了可视化还要求对比图齐全，否则视为"数据不足"自动重跑。
+    if action == "eval":
+        summary = "seg_semantic_eval_summary.json" if seg_type == "semantic" else "seg_eval_summary.json"
+        required = [summary]
+        if getattr(args, "save_visualization", True):
+            required.append("compare")
+    else:
+        required = ["run_meta.json"]
+    return run_reuse.precheck(args, args.output_dir, fingerprint, action_label=f"seg/{action}", required=required)
 
 
 def run_infer(args) -> None:
     action = "infer"
+    # 初步复用检测（仅父进程、非 dry-run）：数据齐全且一致就复用，否则自动重跑。
+    if not _is_seg_shard_child(args) and not getattr(args, "dry_run", False):
+        if _seg_reuse_precheck(args, "infer") == run_reuse.REUSE:
+            print(f"[seg/infer] 已复用上次结果，未重新推理：{args.output_dir}")
+            return
     if not _is_seg_shard_child(args) and run_parallel_seg_infer(args):
         return
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
@@ -281,7 +480,7 @@ def run_infer(args) -> None:
         except Exception:  # noqa: BLE001 dry-run 仅尽力打印，拿不到数量就跳过
             pass
         return
-    rt.prepare_output_dir(output_dir, args.overwrite)
+    rt.prepare_output_dir(output_dir, args.overwrite, clean=True)
 
     device_mode = args.device
     resolved_device_arg = args.device
@@ -308,15 +507,30 @@ def run_infer(args) -> None:
             len(image_paths), shard_index=args.shard_index, num_shards=args.num_shards
         )
         image_paths = [image_paths[i] for i in subset]
-    for idx, image_path in enumerate(image_paths, start=1):
+    # 数据集模式（实例分割）下能拿到真值，额外产出 [原图|GT|预测] 三联对比图。
+    gt_lookup = _seg_infer_gt_lookup(args)
+    # 统一目录结构：普通可视化在 images/，三联对比图在 compare/。
+    images_dir = output_dir / "images"
+    compare_dir = output_dir / "compare"
+    for idx, image_path in enumerate(
+        track(image_paths, label="seg/infer 推理", total=len(image_paths), unit="img"),
+        start=1,
+    ):
         prediction = predict_model(model, image_path, args.threshold)
-        out_path = output_dir / image_path.name
+        out_path = images_dir / image_path.name
         if isinstance(prediction, dict) and "masks" in prediction:
             save_instance_visualization(image_path, out_path, prediction, class_names)
+            label_path = gt_lookup.get(image_path)
+            if label_path is not None and Path(label_path).exists():
+                masks = prediction["masks"]
+                image_size = (int(masks.shape[-1]), int(masks.shape[-2]))  # (width, height)
+                target, has_label = load_instance_ground_truth(label_path, image_size)
+                if has_label:
+                    compare_path = compare_dir / f"{out_path.stem}_compare.png"
+                    save_instance_comparison(image_path, compare_path, prediction, target, class_names)
         else:
             save_semantic_visualization(image_path, out_path, prediction, class_names)
-        if idx == 1 or idx % 20 == 0 or idx == len(image_paths):
-            print(f"[{idx}/{len(image_paths)}] processed: {image_path}")
+        # 进度由 track() 单行进度条展示
 
     if not _is_seg_shard_child(args):
         _write_seg_run_meta(
@@ -412,10 +626,16 @@ def _write_seg_run_meta(meta_path, *, action, checkpoint_path, output_dir, args,
         "seg_train_type": str(getattr(args, "seg_train_type", "instance")),
         "split": split_value if isinstance(split_value, str) else _normalize_splits(split_value or []),
         "num_images": int(num_images),
+        "input_mode": (
+            "dataset" if getattr(args, "data", None) is not None
+            else ("image" if getattr(args, "image", None) is not None else "image_dir")
+        ),
         "paths": {
             "output_dir": str(output_dir),
             "checkpoint_path": str(checkpoint_path),
             "data": str(getattr(args, "data", None)) if getattr(args, "data", None) is not None else None,
+            "image": str(getattr(args, "image", None)) if getattr(args, "image", None) is not None else None,
+            "image_dir": str(getattr(args, "image_dir", None)) if getattr(args, "image_dir", None) is not None else None,
         },
         "settings": {
             "device": getattr(args, "device", None),
@@ -498,6 +718,8 @@ def _accumulate_instance_eval(
     *,
     shard_index: int | None = None,
     num_shards: int = 1,
+    vis_dir: Path | None = None,
+    vis_threshold: float = 0.0,
 ) -> dict[str, Any]:
     """加载样本并累积实例分割评估，可分片、带容错与计时。
 
@@ -529,7 +751,9 @@ def _accumulate_instance_eval(
             return None, exc
 
     for idx, (sample, (image, load_error)) in enumerate(
-        _prefetch_iter(shard_samples, _load_image), start=1
+        track(_prefetch_iter(shard_samples, _load_image),
+              label="seg/eval 评估", total=len(shard_samples), unit="img"),
+        start=1,
     ):
         try:
             if load_error is not None:
@@ -551,8 +775,15 @@ def _accumulate_instance_eval(
             images_with_labels += 1
         update_metric(metric, label_mapping, prediction, target)
         entries.append(_serialize_instance_entry(prediction, target))
-        if idx == 1 or idx % 20 == 0 or idx == len(shard_samples):
-            print(f"[{idx}/{len(shard_samples)}] processed: {sample.image_path}")
+        # 指标用全量预测（0.0）；对比图按展示阈值过滤，避免低分实例糊满画面。
+        if vis_dir is not None and has_label:
+            try:
+                compare_path = vis_dir / f"{Path(sample.image_path).stem}_compare.png"
+                shown = _filter_instance_prediction(prediction, vis_threshold)
+                save_instance_comparison(sample.image_path, compare_path, shown, target, class_names)
+            except Exception as exc:  # noqa: BLE001 可视化失败绝不能中断评估
+                print(f"  ⚠ 对比图生成失败 {sample.image_path}: {exc}")
+        # 进度由 track() 单行进度条展示
 
     return {
         "class_names": class_names,
@@ -657,6 +888,7 @@ def _accumulate_semantic_confusion(
     *,
     shard_index: int | None = None,
     num_shards: int = 1,
+    vis_dir: Path | None = None,
 ) -> dict[str, Any] | None:
     """加载样本并累积混淆矩阵，可分片、带容错与计时。无样本/无该 split 时返回 None。"""
     # 先查 yaml 里是否定义了该 split；未定义就跳过（多 split 评估时常见，
@@ -722,7 +954,9 @@ def _accumulate_semantic_confusion(
             return None, exc
 
     for idx, ((image_path, mask_path), (image, load_error)) in enumerate(
-        _prefetch_iter(shard_samples, _load_image), start=1
+        track(_prefetch_iter(shard_samples, _load_image),
+              label="seg/eval 语义评估", total=len(shard_samples), unit="img"),
+        start=1,
     ):
         try:
             if load_error is not None:
@@ -763,8 +997,14 @@ def _accumulate_semantic_confusion(
             )
             confusion += bincount.reshape((num_eval_classes, num_eval_classes))
         rows.append({"image_path": str(image_path), "mask_path": str(mask_path), "valid_pixels": int(valid.sum())})
-        if idx == 1 or idx % 20 == 0 or idx == len(shard_samples):
-            print(f"[{idx}/{len(shard_samples)}] processed: {image_path}")
+        if vis_dir is not None:
+            try:
+                idx_to_name = {i: class_names[cid] for i, cid in enumerate(model_class_ids)}
+                compare_path = vis_dir / f"{Path(image_path).stem}_compare.png"
+                save_semantic_comparison(image_path, compare_path, target_remapped, pred_remapped, idx_to_name)
+            except Exception as exc:  # noqa: BLE001 可视化失败绝不能中断评估
+                print(f"  ⚠ 对比图生成失败 {image_path}: {exc}")
+        # 进度由 track() 单行进度条展示
 
     return {
         "confusion": confusion,
@@ -794,7 +1034,7 @@ def _write_semantic_summary(
 ) -> dict[str, Any]:
     """计算 IoU、写 summary/CSV 并打印指标。顺序路径与并行合并路径共用，保证产物字节一致。"""
     metrics, per_class = _compute_semantic_iou(confusion)
-    rt.prepare_output_dir(output_dir, overwrite)
+    rt.prepare_output_dir(output_dir, overwrite, clean=True)
     summary_path = output_dir / "seg_semantic_eval_summary.json"
     csv_path = output_dir / "seg_semantic_eval_samples.csv"
     rt.save_records_csv(csv_path, rows, ["image_path", "mask_path", "valid_pixels"])
@@ -832,6 +1072,7 @@ def _evaluate_semantic_split(
     *,
     shard_index: int | None = None,
     num_shards: int = 1,
+    save_visualization: bool = True,
 ) -> dict[str, Any] | None:
     """对单个 split 执行语义分割评估，保存 summary/CSV 并打印指标。
 
@@ -839,7 +1080,9 @@ def _evaluate_semantic_split(
     而是把本分片的混淆矩阵/rows 写成 shard result，留给父进程合并。
     """
     accumulated = _accumulate_semantic_confusion(
-        model, data_path, split, threshold, shard_index=shard_index, num_shards=num_shards
+        model, data_path, split, threshold,
+        shard_index=shard_index, num_shards=num_shards,
+        vis_dir=_eval_compare_dir(output_dir) / split if save_visualization else None,
     )
     if accumulated is None:
         return None
@@ -938,6 +1181,7 @@ def run_semantic_eval(args) -> None:
                 checkpoint_path=checkpoint_path,
                 shard_index=args.shard_index,
                 num_shards=args.num_shards,
+                save_visualization=getattr(args, "save_visualization", True),
             )
             continue
         summary = _evaluate_semantic_split(
@@ -948,6 +1192,7 @@ def run_semantic_eval(args) -> None:
             threshold=0.0,
             overwrite=args.overwrite,
             checkpoint_path=checkpoint_path,
+            save_visualization=getattr(args, "save_visualization", True),
         )
         if summary is not None:
             summaries[split] = summary
@@ -978,6 +1223,7 @@ def _build_seg_eval_child_command(args, *, shard_index, num_shards, output_dir, 
     command += ["--output-dir", str(output_dir), "--device", device]
     command += ["--shard-index", str(shard_index), "--num-shards", str(num_shards)]
     command += ["--skip-important-artifacts"]
+    command += ["--save-visualization"] if getattr(args, "save_visualization", True) else ["--no-save-visualization"]
     if getattr(args, "classwise", False):
         command += ["--classwise"]
     if getattr(args, "overwrite", False):
@@ -1013,7 +1259,7 @@ def _run_parallel_seg_eval_impl(args, eligible) -> bool:
         else rt.experiment_dir_from_checkpoint_path(checkpoint_path) / "eval"
     )
     splits = _normalize_splits(args.split)
-    rt.prepare_output_dir(final_output_dir, args.overwrite)
+    rt.prepare_output_dir(final_output_dir, args.overwrite, clean=True)
 
     num_shards = len(eligible)
     shard_root = final_output_dir / "_shards"
@@ -1102,7 +1348,7 @@ def _run_parallel_seg_infer_impl(args, eligible) -> bool:
         if args.output_dir is not None
         else rt.experiment_dir_from_checkpoint_path(checkpoint_path) / "infer"
     )
-    rt.prepare_output_dir(final_output_dir, args.overwrite)
+    rt.prepare_output_dir(final_output_dir, args.overwrite, clean=True)
 
     image_paths = _seg_infer_image_paths(args)
     num_shards = min(len(eligible), len(image_paths))
@@ -1229,6 +1475,11 @@ def _merge_parallel_instance(args, shard_dirs, *, split, final_output_dir, check
 
 def run_eval(args) -> None:
     seg_type = _normalize_seg_type(args)
+    # 初步复用检测（仅父进程、非 dry-run），覆盖实例与语义两种 eval。
+    if not _is_seg_shard_child(args) and not getattr(args, "dry_run", False):
+        if _seg_reuse_precheck(args, "eval") == run_reuse.REUSE:
+            print(f"[seg/eval] 已复用上次评估结果，未重新评估：{args.output_dir}")
+            return
     # 自动多卡：device=auto 且 ≥2 张空闲卡时分片到子进程，否则回退顺序模式（返回 False）。
     # 子进程通过 launcher.py eval 重入本函数，_is_seg_shard_child 为真而跳过并行、直走分片写盘。
     if not _is_seg_shard_child(args) and run_parallel_seg_eval(args):
@@ -1255,7 +1506,7 @@ def run_eval(args) -> None:
         except Exception:  # noqa: BLE001 dry-run 仅尽力打印，拿不到数量就跳过
             pass
         return
-    rt.prepare_output_dir(output_dir, args.overwrite)
+    rt.prepare_output_dir(output_dir, args.overwrite, clean=True)
     data_cfg = rt.load_data_config(args.data)
 
     device_mode = args.device
@@ -1277,10 +1528,14 @@ def run_eval(args) -> None:
 
     # 分片子进程：只跑本分片、把序列化预测/标注写盘，由父进程合并出全局 mAP。
     # mAP 是全局指标，逐分片各算各的再平均是错的，所以分片模式绝不在此计算最终指标。
+    want_vis = getattr(args, "save_visualization", True)
+    vis_threshold = float(getattr(args, "threshold", None) or rt.DEFAULT_SEG_THRESHOLD)
     if _is_seg_shard_child(args):
         accumulated = _accumulate_instance_eval(
             model, data_cfg, split, args.classwise,
             shard_index=args.shard_index, num_shards=args.num_shards,
+            vis_dir=_eval_compare_dir(args.output_dir) if want_vis else None,
+            vis_threshold=vis_threshold,
         )
         _write_instance_shard_result(
             args.output_dir,
@@ -1294,7 +1549,11 @@ def run_eval(args) -> None:
         )
         return
 
-    accumulated = _accumulate_instance_eval(model, data_cfg, split, args.classwise)
+    accumulated = _accumulate_instance_eval(
+        model, data_cfg, split, args.classwise,
+        vis_dir=_eval_compare_dir(output_dir) if want_vis else None,
+        vis_threshold=vis_threshold,
+    )
     metric = accumulated["metric"]
     num_images = accumulated["num_images"]
     images_with_labels = accumulated["images_with_labels"]
