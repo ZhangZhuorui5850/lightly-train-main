@@ -100,7 +100,7 @@ def _render_panel(stem: str, split: str, polys: list, names: list[str],
     row(f"文件: {stem}", title)
     row(f"来源: {split}", body)
     divider()
-    warn = " ⚠" if n_classes > 1 else ""
+    warn = "（多类别!）" if n_classes > 1 else ""
     row(f"缺陷种类: {n_classes}{warn}", title,
         fill=(200, 80, 0) if n_classes > 1 else (30, 30, 30))
     for cls in sorted(counts):
@@ -134,9 +134,10 @@ def render_preview(img_path: Path, polys: list, names: list[str], split: str,
             tx, ty = min(pts, key=lambda p: p[1])
             name = _class_name(names, cls)
             tw, th = _text_size(od, name, label_font)
+            tx0 = min(max(0.0, tx), max(0.0, w - tw - 4))   # 水平夹住,别画出右边界
             ty0 = max(0, ty - th - 3)
-            od.rectangle([tx, ty0, tx + tw + 4, ty0 + th + 3], fill=color + (220,))
-            od.text((tx + 2, ty0), name, fill=(255, 255, 255), font=label_font)
+            od.rectangle([tx0, ty0, tx0 + tw + 4, ty0 + th + 3], fill=color + (220,))
+            od.text((tx0 + 2, ty0), name, fill=(255, 255, 255), font=label_font)
 
     annotated = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
     panel = _render_panel(img_path.stem, split, polys, names,
