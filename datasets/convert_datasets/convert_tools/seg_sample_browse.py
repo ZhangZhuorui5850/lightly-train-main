@@ -99,7 +99,7 @@ def _render_panel(stem: str, split: str, polys: list, names: list[str],
     row(f"文件: {stem}", title)
     row(f"来源: {split}", body)
     divider()
-    warn = "（多类别!）" if n_classes > 1 else ""
+    warn = "（多类别）" if n_classes > 1 else ""
     row(f"缺陷种类: {n_classes}{warn}", title,
         fill=(200, 80, 0) if n_classes > 1 else (30, 30, 30))
     for cls in sorted(counts):

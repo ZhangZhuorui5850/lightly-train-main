@@ -33,7 +33,7 @@ def run_generate(src: Path, out: Path, limit: int = 500, font_path: Path | None 
     return n
 
 
-def run_build(staging: Path, src: Path, out: Path, clean: bool = True) -> dict:
+def run_build(staging: Path, src: Path, out: Path, clean: bool = False) -> dict:
     """第2步:按分好的 staging + 源数据生成物体版 MVTec。"""
     result = objectseg_to_mvtec.convert(staging, src, out, clean=clean, verbose=True)
     print(f"\n[第2步完成] MVTec 输出在:\n  {out}\n  审计清单:{out / 'object_manifest.csv'}\n")
@@ -44,6 +44,21 @@ def _ask_path(prompt: str) -> Path:
     return Path(input(prompt).strip())
 
 
+def _ask_int(prompt: str, default: int) -> int:
+    raw = input(prompt).strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"  输入的不是数字,用默认 {default}。")
+        return default
+
+
+def _ask_yes(prompt: str) -> bool:
+    return input(prompt).strip().lower() in ("y", "yes", "是")
+
+
 def main() -> None:
     print(
         "物体版 MVTec 向导(分两步):\n"
@@ -52,22 +67,21 @@ def main() -> None:
     )
     try:
         choice = input("选择步骤 [1/2,回车取消]: ").strip()
+        if choice == "1":
+            src = _ask_path("源 seg 数据集路径: ")
+            out = _ask_path("预览输出目录: ")
+            limit = _ask_int("抽样张数(默认 500): ", 500)
+            run_generate(src, out, limit=limit)
+        elif choice == "2":
+            staging = _ask_path("staging(物体文件夹根)路径: ")
+            src = _ask_path("源 seg 数据集路径: ")
+            out = _ask_path("MVTec 输出目录: ")
+            clean = _ask_yes(f"输出目录 {out} 若已存在且非空要先清空重建吗? [y/N]: ")
+            run_build(staging, src, out, clean=clean)
+        else:
+            print("已取消。")
     except (EOFError, KeyboardInterrupt):
-        print()
-        return
-    if choice == "1":
-        src = _ask_path("源 seg 数据集路径: ")
-        out = _ask_path("预览输出目录: ")
-        raw = input("抽样张数(默认 500): ").strip()
-        limit = int(raw) if raw else 500
-        run_generate(src, out, limit=limit)
-    elif choice == "2":
-        staging = _ask_path("staging(物体文件夹根)路径: ")
-        src = _ask_path("源 seg 数据集路径: ")
-        out = _ask_path("MVTec 输出目录: ")
-        run_build(staging, src, out, clean=True)
-    else:
-        print("已取消。")
+        print("\n已取消。")
 
 
 if __name__ == "__main__":
