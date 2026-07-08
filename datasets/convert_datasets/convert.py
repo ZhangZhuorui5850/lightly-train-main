@@ -64,6 +64,13 @@ COMMANDS: dict[str, Tool] = {
         "需 --staging <物体文件夹根> --src <seg源> --out <输出> [--clean]",
         interactive=False,
     ),
+    "obj-wizard": Tool(
+        "objseg_wizard.py",
+        "物体版向导(交互):分两步——①生成标注预览挑数据 ②分好后转 MVTec",
+        "转 MVTec AD",
+        "回车进入向导,按提示选第1步或第2步",
+        interactive=True,
+    ),
     "det2seg": Tool(
         "mirror_det_subset_to_seg.py",
         "把挑出的 det 子集按图片名镜像成对应的 seg 子集",
