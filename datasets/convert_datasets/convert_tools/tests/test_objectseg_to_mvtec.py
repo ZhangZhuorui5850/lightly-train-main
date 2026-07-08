@@ -216,3 +216,17 @@ def test_sample_browse_writes_index_csv(tmp_path):
     rows = {r["stem"]: r for r in _csv.DictReader(idx.open(encoding="utf-8"))}
     assert rows["b"]["defects"] == "锈蚀;裂纹"
     assert (out / "b.jpg").exists()
+
+
+def test_class_color_deterministic_and_distinct():
+    import seg_sample_browse as sb
+    assert sb.class_color(0) == sb.class_color(0)          # 同类同色
+    assert sb.class_color(0) != sb.class_color(1)          # 不同类不同色
+    c = sb.class_color(2)
+    assert isinstance(c, tuple) and len(c) == 3 and all(0 <= v <= 255 for v in c)
+
+
+def test_class_name_handles_out_of_range():
+    import seg_sample_browse as sb
+    assert sb._class_name(["锈蚀", "裂纹"], 1) == "裂纹"
+    assert sb._class_name(["锈蚀", "裂纹"], 9) == "未知类别9"

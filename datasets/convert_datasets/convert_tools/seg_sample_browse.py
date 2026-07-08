@@ -22,6 +22,51 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from yoloseg_to_mvtec import IMG_EXTS, SPLITS, load_names, parse_label  # noqa: E402
 
 try:
+    from PIL import Image, ImageDraw, ImageFont
+except ModuleNotFoundError as e:  # pragma: no cover
+    sys.exit(
+        f"\n[依赖缺失] 找不到模块 '{e.name}'(需要 Pillow)。\n"
+        "请先: conda activate lightlytrain  然后重试。\n"
+        f"(当前 Python: {sys.executable})\n"
+    )
+
+# 仓库自带中文字体:<repo>/tool_lib/msyh.ttc
+_DEFAULT_FONT = Path(__file__).resolve().parents[3] / "tool_lib" / "msyh.ttc"
+
+# 固定调色板:整轮预览里同一类别永远同色,便于肉眼辨认。
+_PALETTE = [
+    (230, 25, 75), (60, 180, 75), (0, 130, 200), (245, 130, 48),
+    (145, 30, 180), (70, 240, 240), (240, 50, 230), (210, 245, 60),
+    (250, 190, 190), (0, 128, 128), (170, 110, 40), (128, 0, 0),
+]
+
+
+def class_color(cls: int) -> tuple[int, int, int]:
+    """类别 id → 固定 RGB 色(超出调色板则循环)。"""
+    return _PALETTE[cls % len(_PALETTE)]
+
+
+def _class_name(names: list[str], cls: int) -> str:
+    """安全取类名;越界返回占位名(预览要尽量出图,不硬失败)。"""
+    return names[cls] if 0 <= cls < len(names) else f"未知类别{cls}"
+
+
+def load_cjk_font(size: int, font_path: Path | None = None):
+    """加载中文字体(默认仓库自带 msyh.ttc);找不到退回 PIL 默认字体。"""
+    path = str(font_path) if font_path else str(_DEFAULT_FONT)
+    try:
+        return ImageFont.truetype(path, size)
+    except (OSError, IOError):
+        return ImageFont.load_default()
+
+
+def _text_size(draw, text: str, font) -> tuple[int, int]:
+    """量文字像素宽高(用 textbbox,兼容新版 PIL)。"""
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    return max(0, right - left), max(0, bottom - top)
+
+
+try:
     from tqdm import tqdm
 except ModuleNotFoundError:  # pragma: no cover
     def tqdm(it, **_kw):
