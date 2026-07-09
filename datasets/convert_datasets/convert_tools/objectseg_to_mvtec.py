@@ -18,7 +18,8 @@
 规则:
   * 图属于哪个物体 = 人工分图决定(staging 文件夹名);缺陷由回源查标注自动发现。
   * 一图多缺陷 → 复制进每个缺陷子文件夹,mask 只留该缺陷的多边形。
-  * 从不修改源数据。图片内容取自 staging 里的那份(与源同图)。
+  * 从不修改源数据。staging 里的文件只用来“按文件名选择”;图像和标注都从
+    源数据集按 stem 取原图/原标注(所以 staging 里放预览图/占位文件都行)。
 
 用法:
   python objectseg_to_mvtec.py --staging <staging> --src <seg源> --out <mvtec输出> [--clean]
@@ -45,7 +46,7 @@ except ModuleNotFoundError as e:
 
 # 复用 legacy 转换器里已验证的核心逻辑。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from yoloseg_to_mvtec import IMG_EXTS, SPLITS, load_names, make_mask, parse_label  # noqa: E402,F401
+from yoloseg_to_mvtec import IMG_EXTS, SPLITS, find_image, load_names, make_mask, parse_label  # noqa: E402,F401
 
 try:  # 单行进度条;缺 tqdm 时退化为直接迭代
     from tqdm import tqdm
@@ -177,7 +178,10 @@ def convert(
                 missing.append((obj, stem))
                 continue
             label_path, split = index[stem]
-            img = cv2.imread(str(img_path))
+            # 只用 staging 里的“文件名”做选择;图像内容一律取源数据集里的原图,
+            # 这样即使你分进去的是带标注的预览图(或占位文件),输出的也是干净原图。
+            src_img = find_image(src, split, stem)
+            img = cv2.imread(str(src_img)) if src_img is not None else None
             if img is None:
                 missing.append((obj, stem))
                 continue

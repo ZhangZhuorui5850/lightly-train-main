@@ -32,16 +32,25 @@ def _write_label(p: Path, entries):
     p.write_text("\n".join(lines))
 
 
-def make_src(root: Path) -> Path:
-    """最小 YOLO-seg 源:只需要 data.yaml + labels/(images/ 不必要)。"""
+def make_src(root: Path, with_images: bool = True) -> Path:
+    """最小 YOLO-seg 源:data.yaml + labels/,默认也带 images/(转换器按文件名从源取原图)。
+
+    with_images=False 时不建 images/,给需要自己控制哪些图存在的用例(如缺图跳过)用。
+    """
     root.mkdir(parents=True, exist_ok=True)
     (root / "data.yaml").write_text(
         yaml.safe_dump({"names": NAMES}, allow_unicode=True), encoding="utf-8"
     )
-    _write_label(root / "labels" / "train" / "a.txt", [(0, _tri(0.3, 0.3))])                 # 锈蚀
-    _write_label(root / "labels" / "train" / "b.txt", [(0, _tri(0.3, 0.3)), (1, _tri(0.7, 0.7))])  # 锈蚀+裂纹
-    _write_label(root / "labels" / "val" / "c.txt", [(2, _tri(0.5, 0.5))])                   # 污迹
-    _write_label(root / "labels" / "train" / "d.txt", [])                                    # 空/good
+    labels = [("train", "a", [(0, _tri(0.3, 0.3))]),                                  # 锈蚀
+              ("train", "b", [(0, _tri(0.3, 0.3)), (1, _tri(0.7, 0.7))]),             # 锈蚀+裂纹
+              ("val", "c", [(2, _tri(0.5, 0.5))]),                                    # 污迹
+              ("train", "d", [])]                                                     # 空/good
+    for split, stem, entries in labels:
+        _write_label(root / "labels" / split / f"{stem}.txt", entries)
+        if with_images:
+            img_p = root / "images" / split / f"{stem}.jpg"
+            img_p.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(img_p), np.full((64, 64, 3), 128, np.uint8))
     return root
 
 
@@ -153,6 +162,24 @@ def test_convert_writes_manifest_csv(tmp_path):
     assert by_stem["a"]["src_label"] == "labels/train/a.txt"
 
 
+def test_convert_reads_image_from_source_not_staging(tmp_path):
+    """staging 里放的图只用来选文件名;输出的图必须来自源数据集的原图。"""
+    from PIL import Image
+    src = make_src(tmp_path / "src")  # 源 a 是 64x64
+    # staging/管道/a.jpg 故意放一张不同尺寸的“假图”(100x100),模拟放了预览图/占位
+    staging = tmp_path / "staging"
+    decoy = staging / "管道" / "a.jpg"
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(decoy), np.full((100, 100, 3), 200, np.uint8))
+    out = tmp_path / "out"
+    om.convert(staging, src, out, clean=True, verbose=False)
+
+    produced = out / "管道" / "test" / "锈蚀" / "a.png"
+    assert produced.exists()
+    # 若用了 staging 的 decoy 会是 100x100;来自源则是 64x64
+    assert Image.open(produced).size == (64, 64)
+
+
 def test_cli_runs_end_to_end(tmp_path):
     src = make_src(tmp_path / "src")
     staging = make_staging(tmp_path / "staging")
@@ -192,8 +219,9 @@ def test_convert_clean_overwrites_existing_out(tmp_path):
 
 def test_convert_raises_on_out_of_range_class_id(tmp_path):
     src = make_src(tmp_path / "src")
-    # 追加一个越界类别 id 的标签(names 只有 3 类:0,1,2)
+    # 追加一个越界类别 id 的标签(names 只有 3 类:0,1,2)+ 对应源图
     _write_label(src / "labels" / "train" / "bad.txt", [(9, _tri(0.5, 0.5))])
+    _img(src / "images" / "train" / "bad.jpg")   # 源里要有原图,越界检查才会被触及
     staging = tmp_path / "staging"
     _img(staging / "管道" / "bad.jpg")
     out = tmp_path / "out"
@@ -226,7 +254,7 @@ def test_browse_writes_annotated_previews_and_new_csv_columns(tmp_path):
 
 def test_browse_skips_missing_image(tmp_path):
     import seg_sample_browse as sb
-    src = make_src(tmp_path / "src")
+    src = make_src(tmp_path / "src", with_images=False)
     _img(src / "images" / "train" / "a.jpg")  # 只给 a 配图
     out = tmp_path / "browse"
     n = sb.browse(src, out, limit=10)
