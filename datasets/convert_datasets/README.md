@@ -21,6 +21,8 @@ convert_datasets/
     ├── seg_sample_browse.py
     ├── make_sample_yoloseg.py
     ├── mirror_det_subset_to_seg.py
+    ├── generated_mask_to_yoloseg.py
+    ├── generated2seg_interactive.py
     └── inspect_labelme_shapes.py
 ```
 
@@ -59,6 +61,51 @@ python convert.py list            # 只打印菜单
 | 整理散图/LabelMe → YOLO **det/cls/seg** 一步到位 | `oneclick` |
 | 把 `*seg` 数据交互式转成 **MVTec AD**(单个/全部都在这里选) | `to-mvtec` |
 | 把挑出的 **det 子集 → 对应 seg 子集** | `det2seg --det-subset <dir> --seg-source <dir>` |
+| 图生图返回的 **image + fg 掩码 → YOLO Seg** | `generated2seg` |
+
+## 图生图返回数据 → YOLO Seg (`generated2seg`)
+
+支持以下返回结构，路径可以放在任意位置：
+
+```text
+<输入根>/
+└── <物体>/
+    └── <缺陷>/
+        ├── image/   # 生成图片
+        │   ├── 0.png
+        │   └── ...
+        └── fg/      # 同 stem 的 PNG 缺陷掩码
+            ├── 0.png
+            └── ...
+```
+
+交互运行：
+
+```bash
+python convert.py generated2seg
+```
+
+工具会扫描 `datasets/` 中所有含同级 `image/`、`fg/` 的目录，显示配对数、问题数、
+物体数和缺陷数。菜单支持序号选择，也支持输入 `p` 后填写任意路径。
+
+直接指定路径：
+
+```bash
+python convert.py generated2seg --src /path/to/generated --out /path/to/output_seg --yes
+```
+
+转换规则：
+
+- `<缺陷>` 目录名自动成为 YOLO 类别；多个物体下的同名缺陷共用 class ID。
+- 根目录内存在有效 `data.yaml` 或 `classes.txt` 时沿用其类别顺序；其余缺陷自动追加。
+- 缺少类别配置时按缺陷目录自然排序生成 `data.yaml`、`classes.txt` 和
+  `class_mapping.json`。
+- 所有生成样本默认写入 train；val/test 空目录会一并创建。
+- 输出文件名采用 `<物体>__<缺陷>__<原stem>`，用于区分各目录重复的 `0.png`。
+- fg 掩码经过二值化、白底自动反相、外轮廓提取和归一化后写成 YOLO polygon。
+- `conversion_report.csv` 记录缺失配对、尺寸冲突、空掩码、轮廓数和前景比例。
+
+常用参数：`--threshold 127`、`--min-area 1`、`--epsilon 0.001`、`--clean`。
 
 ## 更多(单步 / 特殊输入 / 辅助，`convert.py more` 展开)
 
@@ -149,4 +196,6 @@ python convert.py det2seg --det-subset <det子集> --seg-source <seg全量> [--c
 | `one_click_convert.py` / `LabelMeToYOLO.py` | ② 转 YOLO 入口 |
 | `sync_picture.py` / `coco_to_synced.py` | ① 采集整理入口 |
 | `mirror_det_subset_to_seg.py` | ④ det 子集 → 对应 seg 子集 |
+| `generated2seg_interactive.py` | 扫描/选择图生图返回目录并转 YOLO Seg |
+| `generated_mask_to_yoloseg.py` | image + fg 掩码转换核心，也支持独立 CLI |
 | `inspect_labelme_shapes.py` | 辅助：检查 LabelMe |

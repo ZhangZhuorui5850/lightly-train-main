@@ -50,6 +50,13 @@ COMMANDS: dict[str, Tool] = {
         "回车走默认(当前目录源)，或 --help 看参数",
         interactive=True,
     ),
+    "generated2seg": Tool(
+        "generated2seg_interactive.py",
+        "图生图返回的 <物体>/<缺陷>/{image,fg掩码} → YOLO Seg",
+        "整理 + 转 YOLO",
+        "回车=自动扫描并选择；或 --src <路径> [--out <路径>] [--yes]",
+        interactive=True,
+    ),
     "to-mvtec": Tool(
         "seg2mvtec_interactive.py",
         "缺陷版(legacy):扫描 *seg 数据集，每个缺陷=一个 category，交互式转 MVTec AD",

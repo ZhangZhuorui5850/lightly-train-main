@@ -5,6 +5,19 @@ out
 # Datasets (large files, do not upload)
 datasets/
 
+# Dataset conversion source added under the otherwise ignored datasets tree.
+!datasets/
+datasets/*
+!datasets/convert_datasets/
+datasets/convert_datasets/*
+!datasets/convert_datasets/convert_tools/
+datasets/convert_datasets/convert_tools/*
+!datasets/convert_datasets/convert_tools/generated_mask_to_yoloseg.py
+!datasets/convert_datasets/convert_tools/generated2seg_interactive.py
+!datasets/convert_datasets/convert_tools/tests/
+datasets/convert_datasets/convert_tools/tests/*
+!datasets/convert_datasets/convert_tools/tests/test_generated_mask_to_yoloseg.py
+
 # TensorRT
 *.trt
 
