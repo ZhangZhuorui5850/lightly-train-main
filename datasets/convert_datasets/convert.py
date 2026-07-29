@@ -39,10 +39,24 @@ class Tool:
 
 
 # command -> Tool。改这里就能增删工具。
-# 3 个主流程(primary)平时只用这几个；其余是它们的内部分步或辅助工具(primary=False)，
+# 主流程(primary)显示在默认菜单；其余是内部分步或辅助工具(primary=False)，
 # 已被主流程包含或很少直接用，默认折叠，`convert.py more` 才展开。
 COMMANDS: dict[str, Tool] = {
     # ---- 主流程 ----
+    "auto": Tool(
+        "conversion_wizard.py",
+        "先选转换功能，再自动检索兼容数据集并统一输出命名",
+        "自动发现",
+        "回车=扫描仓库 datasets/；或 --datasets <路径>；--list 只查看",
+        interactive=True,
+    ),
+    "yolo2semantic": Tool(
+        "yoloseg_to_semantic.py",
+        "YOLO Seg polygon txt → train_seg.py 使用的 PNG 语义掩码",
+        "转语义分割",
+        "回车=自动扫描并选择；或 --src <数据集> --out <输出目录>",
+        interactive=True,
+    ),
     "oneclick": Tool(
         "one_click_convert.py",
         "整理散图/LabelMe → YOLO det/cls/seg 一步到位(内部已含 sync + labelme2yolo)",
@@ -55,6 +69,13 @@ COMMANDS: dict[str, Tool] = {
         "图生图返回的 <物体>/<缺陷>/{image,fg掩码} → YOLO Seg",
         "整理 + 转 YOLO",
         "回车=自动扫描并选择；或 --src <路径> [--out <路径>] [--yes]",
+        interactive=True,
+    ),
+    "mvtec2yolo": Tool(
+        "mvtec_to_yolo.py",
+        "标准 MVTec AD → YOLO Seg/Det（默认同时生成）",
+        "整理 + 转 YOLO",
+        "回车=扫描 datasets/ 并选择；或 --src <目录> [--out <目录>] [--task segment|detect|both]",
         interactive=True,
     ),
     "to-mvtec": Tool(
@@ -137,7 +158,7 @@ COMMANDS: dict[str, Tool] = {
     ),
 }
 
-STAGE_ORDER = ["整理 + 转 YOLO", "转 MVTec AD", "子集对齐", "更多"]
+STAGE_ORDER = ["自动发现", "转语义分割", "整理 + 转 YOLO", "转 MVTec AD", "子集对齐", "更多"]
 
 
 def _ordered_commands(show_all: bool) -> list[tuple[str, Tool]]:

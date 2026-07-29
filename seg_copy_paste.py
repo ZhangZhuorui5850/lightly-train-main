@@ -22,7 +22,10 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -30,16 +33,19 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
+from filelock import FileLock
 
-from lightly_train._data import file_helpers
+from lightly_train._data import cache, file_helpers
 from lightly_train._data import mask_semantic_segmentation_dataset as _msd
 from lightly_train._data.mask_semantic_segmentation_dataset import (
     MaskSemanticSegmentationDataset,
 )
 from lightly_train.types import MaskSemanticSegmentationDatasetItem
+from tool_lib.progress import track
 
 logger = logging.getLogger(__name__)
 
+_CACHE_VERSION = 1
 _CONFIG: dict[str, Any] = {
     "enabled": False,
     "prob": 0.5,
@@ -51,6 +57,17 @@ _CONFIG: dict[str, Any] = {
     "feather": 0,
     "verbose": True,
 }
+
+
+def _distributed_is_initialized() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def _is_global_rank_zero() -> bool:
+    """仅让全局主进程输出进度，避免 DDP 多进程进度条互相覆盖。"""
+    if _distributed_is_initialized():
+        return torch.distributed.get_rank() == 0
+    return int(os.environ.get("RANK", "0")) == 0
 
 
 class CopyPasteDataset(MaskSemanticSegmentationDataset):
@@ -72,16 +89,34 @@ class CopyPasteDataset(MaskSemanticSegmentationDataset):
             self._build_index()
 
     def _build_index(self) -> None:
-        index = {c: [] for c in self._cp_classes}
-        for i in range(len(self.image_info)):
-            mask_path = Path(self.image_info[i]["mask_filepaths"])
-            mask = file_helpers.open_mask_numpy(mask_path=mask_path)
-            mask = self.map_mask_labels_to_class_ids(mask)
-            present = set(np.unique(mask).tolist()) & self._cp_classes
-            for c in present:
-                index[int(c)].append(i)
-        self._cp_index = {c: idxs for c, idxs in index.items() if idxs}
-        if _CONFIG["verbose"]:
+        cache_path = self._index_cache_path()
+        if _is_global_rank_zero():
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with FileLock(str(cache_path) + ".lock"):
+                cached = self._load_valid_cached_index(cache_path)
+                if cached is None:
+                    index, manifest_digest = self._scan_index()
+                    self._save_cached_index(
+                        cache_path=cache_path,
+                        index=index,
+                        manifest_digest=manifest_digest,
+                    )
+                else:
+                    index = cached
+                    if _CONFIG["verbose"]:
+                        logger.info(f"[copy-paste] 复用索引缓存: '{cache_path}'")
+            self._cp_index = index
+
+        if _distributed_is_initialized():
+            torch.distributed.barrier()
+
+        if not _is_global_rank_zero():
+            cached = self._read_cached_index(cache_path)
+            if cached is None:
+                raise RuntimeError(f"Copy-Paste 索引缓存读取失败: '{cache_path}'")
+            self._cp_index = cached["index"]
+
+        if _CONFIG["verbose"] and _is_global_rank_zero():
             stat = {c: len(idxs) for c, idxs in sorted(self._cp_index.items())}
             logger.info(
                 f"[copy-paste] 启用。可粘贴类别->图片数: {stat} "
@@ -91,6 +126,138 @@ class CopyPasteDataset(MaskSemanticSegmentationDataset):
                 logger.warning(
                     "[copy-paste] 训练集中没有任何可粘贴的类别，copy-paste 将不生效。"
                 )
+
+    def _index_cache_path(self) -> Path:
+        classes = []
+        for class_id, class_info in sorted(self.dataset_args.classes.items()):
+            labels = sorted(repr(label) for label in class_info.labels)
+            classes.append((int(class_id), labels))
+        identity = {
+            "version": _CACHE_VERSION,
+            "image_dir": str(self.dataset_args.image_dir.expanduser().resolve()),
+            "mask_source": str(
+                Path(self.dataset_args.mask_dir_or_file).expanduser().resolve()
+            ),
+            "classes": classes,
+            "ignore_classes": sorted(self.dataset_args.ignore_classes or ()),
+            "ignore_index": int(self.dataset_args.ignore_index),
+            "paste_classes": sorted(self._cp_classes),
+        }
+        digest = hashlib.sha256(
+            json.dumps(identity, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return cache.get_data_cache_dir() / "copy_paste" / f"{digest}.json"
+
+    @staticmethod
+    def _update_manifest(
+        digest: Any,
+        mask_path: Path,
+    ) -> None:
+        stat = mask_path.stat()
+        digest.update(os.path.abspath(mask_path).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update(b"\n")
+
+    def _manifest_digest(self) -> str:
+        digest = hashlib.sha256()
+        indices = track(
+            range(len(self.image_info)),
+            label="[copy-paste] 校验索引缓存",
+            unit="mask",
+            enable=bool(_CONFIG["verbose"]),
+        )
+        for i in indices:
+            mask_path = Path(self.image_info[i]["mask_filepaths"])
+            self._update_manifest(digest=digest, mask_path=mask_path)
+        return digest.hexdigest()
+
+    def _scan_index(self) -> tuple[dict[int, list[int]], str]:
+        index = {c: [] for c in self._cp_classes}
+        digest = hashlib.sha256()
+        indices = track(
+            range(len(self.image_info)),
+            label="[copy-paste] 扫描训练 mask",
+            unit="mask",
+            enable=bool(_CONFIG["verbose"]),
+        )
+        for i in indices:
+            mask_path = Path(self.image_info[i]["mask_filepaths"])
+            self._update_manifest(digest=digest, mask_path=mask_path)
+            mask = file_helpers.open_mask_numpy(mask_path=mask_path)
+            mask = self.map_mask_labels_to_class_ids(mask)
+            present = set(np.unique(mask).tolist()) & self._cp_classes
+            for c in present:
+                index[int(c)].append(i)
+        return (
+            {c: idxs for c, idxs in index.items() if idxs},
+            digest.hexdigest(),
+        )
+
+    def _read_cached_index(self, cache_path: Path) -> dict[str, Any] | None:
+        try:
+            with cache_path.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if raw.get("version") != _CACHE_VERSION:
+                return None
+            raw_index = raw["index"]
+            index = {
+                int(class_id): [int(i) for i in indices]
+                for class_id, indices in raw_index.items()
+            }
+            if any(
+                class_id not in self._cp_classes
+                or any(i < 0 or i >= len(self.image_info) for i in indices)
+                for class_id, indices in index.items()
+            ):
+                return None
+            return {
+                "manifest_digest": str(raw["manifest_digest"]),
+                "index": index,
+            }
+        except (
+            AttributeError,
+            FileNotFoundError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return None
+
+    def _load_valid_cached_index(
+        self,
+        cache_path: Path,
+    ) -> dict[int, list[int]] | None:
+        cached = self._read_cached_index(cache_path)
+        if cached is None:
+            return None
+        if cached["manifest_digest"] != self._manifest_digest():
+            if _CONFIG["verbose"]:
+                logger.info("[copy-paste] 数据集已更新，重新构建索引。")
+            return None
+        return cached["index"]
+
+    @staticmethod
+    def _save_cached_index(
+        cache_path: Path,
+        index: dict[int, list[int]],
+        manifest_digest: str,
+    ) -> None:
+        payload = {
+            "version": _CACHE_VERSION,
+            "manifest_digest": manifest_digest,
+            "index": index,
+        }
+        temp_path = cache_path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            with temp_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+            temp_path.replace(cache_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def _load_transformed(
         self, index: int, require_classes: set[int] | None = None

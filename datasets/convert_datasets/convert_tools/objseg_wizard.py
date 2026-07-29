@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import objectseg_to_mvtec  # noqa: E402
 import seg_sample_browse  # noqa: E402
+from output_naming import default_output_dir  # noqa: E402
 
 
 def run_generate(src: Path, out: Path, limit: int = 500, font_path: Path | None = None) -> int:
@@ -45,6 +46,12 @@ def _ask_path(prompt: str) -> Path:
     return Path(input(prompt).strip())
 
 
+def _ask_output_path(prompt: str, source: Path, operation: str) -> Path:
+    default = default_output_dir(source, operation)
+    raw = input(f"{prompt} [默认 {default}]: ").strip()
+    return Path(raw).expanduser() if raw else default
+
+
 def _ask_int(prompt: str, default: int) -> int:
     raw = input(prompt).strip()
     if not raw:
@@ -70,13 +77,13 @@ def main() -> None:
         choice = input("选择步骤 [1/2,回车取消]: ").strip()
         if choice == "1":
             src = _ask_path("源 seg 数据集路径: ")
-            out = _ask_path("预览输出目录: ")
+            out = _ask_output_path("预览输出目录", src, "sample-preview")
             limit = _ask_int("抽样张数(默认 500): ", 500)
             run_generate(src, out, limit=limit)
         elif choice == "2":
             staging = _ask_path("staging(物体文件夹根)路径: ")
             src = _ask_path("源 seg 数据集路径: ")
-            out = _ask_path("MVTec 输出目录: ")
+            out = _ask_output_path("MVTec 输出目录", src, "to-mvtec-object")
             clean = _ask_yes(f"输出目录 {out} 若已存在且非空要先清空重建吗? [y/N]: ")
             run_build(staging, src, out, clean=clean)
         else:

@@ -14,28 +14,17 @@ from generated_mask_to_yoloseg import (  # noqa: E402
     natural_key,
     resolve_class_names,
 )
-
-
-def auto_datasets_root() -> Path:
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent / "datasets"
-        if candidate.is_dir():
-            return candidate.resolve()
-    return Path("datasets").resolve()
+from dataset_discovery import (  # noqa: E402
+    auto_datasets_root,
+    scan_generated_mask_roots,
+)
+from output_naming import default_output_dir  # noqa: E402
 
 
 def scan_candidates(root: Path) -> list[Path]:
     """Group leaves as ``root/object/defect/{image,fg}`` candidate roots."""
-    root = root.expanduser().resolve()
-    candidates: set[Path] = set()
-    for image_dir in root.rglob("image"):
-        if not image_dir.is_dir() or not (image_dir.parent / "fg").is_dir():
-            continue
-        leaf = image_dir.parent
-        candidate = leaf.parent.parent if leaf.parent.parent.is_relative_to(root) else leaf
-        candidates.add(candidate)
-    return sorted(candidates, key=lambda p: natural_key(str(p.relative_to(root))))
+    candidates = scan_generated_mask_roots(root)
+    return sorted(candidates, key=lambda p: natural_key(str(p.relative_to(root.resolve()))))
 
 
 def inspect_candidate(path: Path) -> dict:
@@ -90,7 +79,7 @@ def choose_source(root: Path) -> Path | None:
 
 
 def default_output(src: Path) -> Path:
-    return src.parent / f"{src.name}_generated_seg"
+    return default_output_dir(src, "to-yolo-seg")
 
 
 def print_analysis(src: Path, names_from: Path | None) -> tuple[list, list, list[str], Path | None]:

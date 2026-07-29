@@ -8,7 +8,8 @@ from pathlib import Path
 from . import common as rt
 
 CONVERT_DATASETS_ROOT = rt.ROOT_DIR / "datasets" / "convert_datasets"
-ONE_CLICK_CONVERT_PATH = CONVERT_DATASETS_ROOT / "one_click_convert.py"
+CONVERT_TOOLS_ROOT = CONVERT_DATASETS_ROOT / "convert_tools"
+ONE_CLICK_CONVERT_PATH = CONVERT_TOOLS_ROOT / "one_click_convert.py"
 
 
 def list_convert_source_dirs() -> list[Path]:
@@ -17,7 +18,9 @@ def list_convert_source_dirs() -> list[Path]:
     candidates = [
         path.resolve()
         for path in CONVERT_DATASETS_ROOT.iterdir()
-        if path.is_dir() and path.name != "__pycache__" and not path.name.startswith(".")
+        if path.is_dir()
+        and path.name not in {"__pycache__", "convert_tools"}
+        and not path.name.startswith(".")
     ]
     candidates.sort(key=lambda path: path.name.lower())
     return candidates

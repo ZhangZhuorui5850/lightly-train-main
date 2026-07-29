@@ -23,6 +23,12 @@ convert_datasets/
     ├── mirror_det_subset_to_seg.py
     ├── generated_mask_to_yoloseg.py
     ├── generated2seg_interactive.py
+    ├── mvtec_to_yolo.py
+    ├── dataset_discovery.py
+    ├── interactive_helpers.py
+    ├── output_naming.py
+    ├── conversion_wizard.py
+    ├── yoloseg_to_semantic.py
     └── inspect_labelme_shapes.py
 ```
 
@@ -49,19 +55,97 @@ python convert.py                 # 交互菜单：问你做什么(推荐)
 python convert.py <command> ...   # 直接运行某工具，参数原样转发
 python convert.py <command> -h    # 看该工具自己的参数
 python convert.py list            # 只打印菜单
+python convert.py auto            # 扫描项目数据集并显示可执行转换
+python convert.py yolo2semantic   # YOLO polygon txt 转 PNG 语义掩码
+python convert.py mvtec2yolo ...  # 标准 MVTec 同时转 YOLO Seg 和 Det
 ```
 
 交互模式下：先选序号或命令名 → 再按提示输入参数(纯交互的工具直接回车即可)。
-菜单默认只列 **3 个主流程**；输入 `more` 展开单步/辅助工具。
+菜单默认列出常用主流程；输入 `more` 展开单步/辅助工具。
 
-## 主流程(平时只用这 3 个)
+## 主流程
 
 | 你想做的事 | 命令 |
 |---|---|
+| 自动检索项目中的数据集、识别格式、选择转换目标 | `auto` |
+| YOLO Seg polygon txt → PNG 语义掩码 | `yolo2semantic` |
 | 整理散图/LabelMe → YOLO **det/cls/seg** 一步到位 | `oneclick` |
 | 把 `*seg` 数据交互式转成 **MVTec AD**(单个/全部都在这里选) | `to-mvtec` |
 | 把挑出的 **det 子集 → 对应 seg 子集** | `det2seg --det-subset <dir> --seg-source <dir>` |
 | 图生图返回的 **image + fg 掩码 → YOLO Seg** | `generated2seg` |
+| 标准 **MVTec AD → YOLO Seg + Det** | `mvtec2yolo --src <目录> --out <目录>` |
+
+## 自动扫描与转换向导 (`auto`)
+
+```bash
+python convert.py auto
+python convert.py auto --list
+python convert.py auto --datasets /path/to/datasets
+```
+
+向导按以下顺序执行：
+
+1. 选择转换功能。
+2. 扫描并展示支持该功能的数据集。
+3. 选择数据集并确认输出目录。
+
+扫描器依据目录内容和标签行识别格式，覆盖 YOLO 检测、YOLO 实例分割、PNG 语义分割、
+LabelMe、标准 MVTec AD，以及 `image/fg` 生成数据。候选列表显示图像数、标注数、类别数
+和数据集路径。
+
+共享能力位于 `dataset_discovery.py` 和 `interactive_helpers.py`。其他转换脚本可以直接复用
+数据集根目录解析、split 路径解析、YOLO 标签目录映射、格式识别和交互选择。
+
+所有向导输出目录采用统一格式：
+
+```text
+<源数据集名>__<操作名>
+```
+
+当前操作名包括：
+
+```text
+dataset_seg__to_semantic
+dataset_seg__to_mvtec_ad
+labelme_data__to_yolo
+generated_data__to_yolo_seg
+mvtec_data__mvtec_to_yolo
+dataset_det_A__mirror_seg_subset
+dataset_seg__sample_preview
+dataset_seg__to_mvtec_ad_object
+```
+
+## YOLO Seg → PNG 语义掩码 (`yolo2semantic`)
+
+交互扫描并选择：
+
+```bash
+python convert.py yolo2semantic
+```
+
+直接转换：
+
+```bash
+python convert.py yolo2semantic \
+  --src /path/to/dataset_seg \
+  --out /path/to/dataset_semantic
+```
+
+转换结果可直接作为 `train_seg.py` 的 `DATA_YAML`：
+
+```text
+dataset_semantic/
+├── images/{train,val,test}/
+├── masks/{train,val,test}/*.png
+├── data.yaml
+├── classes.txt
+└── conversion_report.json
+```
+
+默认类别映射为 `background=0`、`YOLO class 0 → semantic class 1`，其余类别依次偏移。
+缺少 txt 或空 txt 的图片生成全背景 mask。实例重叠区域默认采用标签文件中的后一条标注，
+`--overlap first` 和 `--overlap larger` 提供先标注优先、较大实例优先策略。图片传输支持
+`--image-mode copy|hardlink|symlink`。
 
 ## 图生图返回数据 → YOLO Seg (`generated2seg`)
 
@@ -107,6 +191,64 @@ python convert.py generated2seg --src /path/to/generated --out /path/to/output_s
 
 常用参数：`--threshold 127`、`--min-area 1`、`--epsilon 0.001`、`--clean`。
 
+## 标准 MVTec AD → YOLO Seg / Det (`mvtec2yolo`)
+
+支持标准 MVTec 目录，输入路径可以是整个数据集根目录，也可以是单个 category：
+
+```text
+<MVTec根>/
+└── <物体>/
+    ├── train/good/*.png
+    ├── test/good/*.png
+    ├── test/<缺陷>/*.png
+    └── ground_truth/<缺陷>/*_mask.png
+```
+
+交互扫描并选择：
+
+```bash
+python convert.py mvtec2yolo
+```
+
+在 `convert.py` 主菜单选择 `mvtec2yolo` 后，参数处直接回车即可扫描仓库 `datasets/`。
+工具会列出每个候选的图片数、掩码数、类别数和路径，再提示选择输入与输出目录。
+
+同时生成 YOLO Seg 和 Det：
+
+```bash
+python convert.py mvtec2yolo \
+  --src /path/to/mvtec \
+  --out /path/to/mvtec_yolo
+```
+
+输出结构：
+
+```text
+mvtec_yolo/
+├── dataset_seg/{images,labels}/{train,val,test}/
+├── dataset_det/{images,labels}/{train,val,test}/
+├── dataset_seg/data.yaml
+├── dataset_det/data.yaml
+└── conversion_report.csv
+```
+
+只生成一种任务：
+
+```bash
+python convert.py mvtec2yolo --src /path/to/mvtec --out /path/to/dataset_seg --task segment
+python convert.py mvtec2yolo --src /path/to/mvtec --out /path/to/dataset_det --task detect
+```
+
+转换规则：
+
+- 默认 `--class-mode defect`，以 `<缺陷>` 目录名作为 YOLO 类别。
+- `--class-mode object` 以物体名作为类别，`object-defect` 生成“物体+缺陷”类别。
+- 默认 `--split-mode all-train`，让多模态生成的异常样本直接进入监督训练集。
+- `--split-mode preserve` 保留 MVTec 的 train/test 归属。
+- good 图片生成空 txt，作为 YOLO 负样本。
+- 每个 mask 连通区域生成一个 Seg polygon 和一个 Det bbox。
+- 缺失掩码、尺寸冲突和空掩码写入 `conversion_report.csv`。
+
 ## 更多(单步 / 特殊输入 / 辅助，`convert.py more` 展开)
 
 | 命令 | 说明 |
@@ -131,7 +273,7 @@ python convert.py generated2seg --src /path/to/generated --out /path/to/output_s
 - **掩码**：二值 PNG `{0,255}`，与原图同尺寸，命名 `<stem>_mask.png`。
 - **只吃 `*seg`**：目录名以 `seg` 结尾才会被扫描；且会**读内容校验**，
   若标签其实是 det 的 4 点 bbox 会被标记 `DET-skip` 拒绝转换。
-- **不动原数据**：输出写到同级新目录 `dataset_seg → dataset_mvtec_ad`。
+- 输出写到同级新目录：`dataset_seg → dataset_seg__to_mvtec_ad`。
 
 ## 物体版 MVTec AD(推荐,category=物体)
 
@@ -198,4 +340,5 @@ python convert.py det2seg --det-subset <det子集> --seg-source <seg全量> [--c
 | `mirror_det_subset_to_seg.py` | ④ det 子集 → 对应 seg 子集 |
 | `generated2seg_interactive.py` | 扫描/选择图生图返回目录并转 YOLO Seg |
 | `generated_mask_to_yoloseg.py` | image + fg 掩码转换核心，也支持独立 CLI |
+| `mvtec_to_yolo.py` | 标准 MVTec AD → YOLO Seg/Det |
 | `inspect_labelme_shapes.py` | 辅助：检查 LabelMe |

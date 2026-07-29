@@ -14,9 +14,17 @@ datasets/convert_datasets/*
 datasets/convert_datasets/convert_tools/*
 !datasets/convert_datasets/convert_tools/generated_mask_to_yoloseg.py
 !datasets/convert_datasets/convert_tools/generated2seg_interactive.py
+!datasets/convert_datasets/convert_tools/dataset_discovery.py
+!datasets/convert_datasets/convert_tools/interactive_helpers.py
+!datasets/convert_datasets/convert_tools/output_naming.py
+!datasets/convert_datasets/convert_tools/conversion_wizard.py
+!datasets/convert_datasets/convert_tools/yoloseg_to_semantic.py
+!datasets/convert_datasets/convert_tools/mvtec_to_yolo.py
 !datasets/convert_datasets/convert_tools/tests/
 datasets/convert_datasets/convert_tools/tests/*
 !datasets/convert_datasets/convert_tools/tests/test_generated_mask_to_yoloseg.py
+!datasets/convert_datasets/convert_tools/tests/test_yoloseg_to_semantic.py
+!datasets/convert_datasets/convert_tools/tests/test_mvtec_to_yolo.py
 
 # TensorRT
 *.trt
