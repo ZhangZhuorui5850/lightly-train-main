@@ -154,7 +154,8 @@ def test_convert_writes_manifest_csv(tmp_path):
     manifest = out / "object_manifest.csv"
     assert manifest.exists()
     import csv as _csv
-    rows = list(_csv.DictReader(manifest.open(encoding="utf-8")))
+    with manifest.open(encoding="utf-8") as stream:
+        rows = list(_csv.DictReader(stream))
     by_stem = {r["stem"]: r for r in rows}
     assert by_stem["b"]["object"] == "管道"
     assert by_stem["b"]["defects"] == "锈蚀;裂纹"
@@ -177,7 +178,8 @@ def test_convert_reads_image_from_source_not_staging(tmp_path):
     produced = out / "管道" / "test" / "锈蚀" / "a.png"
     assert produced.exists()
     # 若用了 staging 的 decoy 会是 100x100;来自源则是 64x64
-    assert Image.open(produced).size == (64, 64)
+    with Image.open(produced) as image:
+        assert image.size == (64, 64)
 
 
 def test_cli_runs_end_to_end(tmp_path):
@@ -242,10 +244,13 @@ def test_browse_writes_annotated_previews_and_new_csv_columns(tmp_path):
     assert n == 4
 
     assert (out / "b.png").exists()
-    base_w = Image.open(src / "images" / "train" / "b.jpg").width
-    assert Image.open(out / "b.png").width > base_w
+    with Image.open(src / "images" / "train" / "b.jpg") as source_image:
+        base_w = source_image.width
+    with Image.open(out / "b.png") as preview_image:
+        assert preview_image.width > base_w
 
-    rows = {r["stem"]: r for r in _csv.DictReader((out / "sample_index.csv").open(encoding="utf-8"))}
+    with (out / "sample_index.csv").open(encoding="utf-8") as stream:
+        rows = {row["stem"]: row for row in _csv.DictReader(stream)}
     assert rows["b"]["defects"] == "锈蚀;裂纹"
     assert rows["b"]["n_defect_classes"] == "2"
     assert rows["b"]["n_polygons"] == "2"
@@ -288,7 +293,8 @@ def test_render_preview_appends_info_panel(tmp_path):
         (1, np.array([[0.6, 0.6], [0.8, 0.6], [0.7, 0.8]])),   # 裂纹
     ]
     canvas = sb.render_preview(img_path, polys, ["锈蚀", "裂纹", "污迹"], "train")
-    base_w = Image.open(img_path).width
+    with Image.open(img_path) as image:
+        base_w = image.width
     assert canvas.height == 64                 # 高度=原图高
     assert canvas.width > base_w               # 右边拼了信息栏
     assert canvas.mode == "RGB"

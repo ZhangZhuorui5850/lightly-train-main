@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import re
 import shutil
 import tempfile
@@ -23,14 +25,150 @@ from pathlib import Path
 from typing import Any
 
 from . import common as rt
-from . import convert_tools
+from . import dataset_adapter
+from .file_index import find_files
+
+
+class InputCancelled(Exception):
+    """Raised when an interactive input stream closes before confirmation."""
+
+
+COMMAND_HELP = {
+    "train": "训练 cls、det 或 seg 模型",
+    "infer": "对图片、目录或数据集执行推理",
+    "eval": "评估 cls、det 或 seg 模型",
+    "export": "筛选并重划分检测数据集",
+    "seg-export": "筛选并重划分实例分割数据集",
+    "seg-eda": "自动识别并分析实例或语义分割数据集",
+    "seg-curate": "根据 EDA 结果整理语义分割类别",
+    "eda": "分析检测数据集",
+    "review-sample": "生成检测数据集质检抽样",
+    "report": "生成单实验或汇总报告",
+    "clean": "预览或执行实验产物清理",
+    "optimize": "分析类别质量与混淆并交互优化数据集",
+}
+_PENDING_OPTIMIZE_TEMP_DIRS: set[Path] = set()
+ARGUMENT_HELP = {
+    "task": "任务类型。",
+    "seg_train_type": "分割训练类型；省略时优先从实验记录推断。",
+    "data_yaml": "训练数据集目录或 data.yaml。",
+    "model": "LightlyTrain 模型名称。",
+    "backbone_weights": "backbone 预训练权重路径。",
+    "checkpoint": "checkpoint 路径；省略时从实验目录解析最佳权重。",
+    "out_dir": "训练或质检输出目录。",
+    "steps": "训练步数，支持正整数或 auto。",
+    "batch_size": "batch size，支持正整数或 auto。",
+    "num_workers": "数据加载进程数，支持非负整数或 auto。",
+    "devices": "GPU 编号、逗号分隔编号或 auto。",
+    "overwrite": "允许安全替换已有输出。",
+    "resume_interrupted": "从指定已有实验目录继续中断训练。",
+    "experiment_dir": "实验目录；省略时自动选择最近的同任务实验。",
+    "image": "单张输入图片。",
+    "image_dir": "批量输入图片目录。",
+    "data": "数据集目录或 data.yaml。",
+    "split": "数据集划分；部分命令支持一次提供多个 split。",
+    "output_dir": "输出目录；省略时按实验、数据集和 split 自动生成。",
+    "score_threshold": "检测置信度阈值，范围 [0,1]。",
+    "threshold": "分类或分割阈值，范围 [0,1]。",
+    "topk": "分类返回数量，必须大于 0。",
+    "device": "推理设备，例如 auto、cpu、cuda。",
+    "save_visualization": "保存可视化结果。",
+    "save_json": "保存 JSON 预测结果。",
+    "save_txt": "保存 TXT 预测结果。",
+    "report_iou_threshold": "报告 TP/FP/FN 匹配 IoU，范围 [0,1]。",
+    "bad_class_map50_threshold": "劣质类别 mAP50 参考阈值。",
+    "compute_metrics": "计算完整评估指标。",
+    "metric_classwise": "输出按类别指标。",
+    "save_test_report": "保存评估报告 JSON。",
+    "report_path": "评估报告输出路径。",
+    "sahi": "启用 SAHI 切片推理。",
+    "sahi_overlap": "相邻切片重叠比例，范围 [0,1)。",
+    "sahi_nms_iou": "切片结果 NMS IoU，范围 [0,1]。",
+    "sahi_global_local_iou": "全局与局部预测匹配 IoU，范围 [0,1]。",
+    "sahi_skip_small": "小图跳过 SAHI。",
+    "dry_run": "只分析并显示执行计划，保持零写入。",
+    "test_dir": "按类别子目录组织的分类测试集。",
+    "classwise": "输出按类别指标。",
+    "vis_max_images": "每个 split 的对比图上限；0 表示全量。",
+    "report_json": "评估报告 JSON；可按命令语义自动匹配。",
+    "export_source_data": "待筛选的数据集目录或 data.yaml。",
+    "good_class_threshold": "类别质量参考阈值，范围 [0,1]。",
+    "balance_ratio": "类别最大/最小数量比例；0 表示自动，人工值需大于等于 1。",
+    "split_ratio": "train:val:test 三段比例，例如 8:1:1。",
+    "size_ratio": "small:medium:large 三段目标比例；空字符串关闭尺寸均衡。",
+    "size_balance_weight": "尺寸均衡权重，必须为非负有限数字。",
+    "export_suffix": "导出数据集目录后缀。",
+    "seg_type": "分割数据类型；auto 会读取标注内容判断。",
+    "min_class_images": "每类最少图片数或 EDA 推荐门槛。",
+    "threshold_percentile": "EDA 推荐阈值百分位，范围 [0,1]。",
+    "eda_dir": "已有 EDA 输出目录。",
+    "drop_classes": "逗号分隔的待删除类别 ID。",
+    "image_threshold": "train 每类图片上限；0 表示保留全量。",
+    "contiguous_ids": "将保留类别重映射为连续 ID。",
+    "search": "实验目录关键词。",
+    "source_data_yaml": "待优化的检测数据集目录或 data.yaml。",
+    "infer_output_dir": "包含预测 JSON 的 infer 输出目录。",
+    "optimize_experiment_dir": "优化报告归档实验目录。",
+    "confusion_threshold": "类别混淆候选阈值，范围 [0,1]。",
+}
+
+OPTION_HELP = {
+    "--skip-visualization": "跳过可视化结果。",
+    "--no-save-visualization": "跳过评估对比图。",
+    "--skip-json": "跳过 JSON 预测结果。",
+    "--no-sahi-skip-small": "所有图片均按已启用的 SAHI 策略处理。",
+    "--no-auto-balance": "使用显式导出阈值和数量参数。",
+    "--strict-class-threshold": "将类别质量阈值作为严格筛选条件。",
+    "--no-trim-boxes": "保留入选图片中的全部原始框。",
+    "--disable-geometry": "关闭几何标注问题分析。",
+    "--disable-model-analysis": "关闭模型预测问题分析。",
+    "--disable-outlier-class": "关闭异常类别分析。",
+    "--disable-visualization": "关闭质检样本可视化。",
+    "--no-embed-images": "报告引用外部图片文件。",
+}
+
+
+class CommandHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    """Show value defaults while keeping boolean toggle descriptions unambiguous."""
+
+    def _get_help_string(self, action: argparse.Action) -> str:
+        if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
+            return action.help or ""
+        return super()._get_help_string(action)
+
+
+def _add_command_parser(subparsers: Any, command: str) -> argparse.ArgumentParser:
+    description = COMMAND_HELP[command]
+    return subparsers.add_parser(
+        command,
+        help=description,
+        description=description,
+        formatter_class=CommandHelpFormatter,
+    )
+
+
+def _complete_parser_help(subparsers: Any) -> None:
+    for command_parser in subparsers.choices.values():
+        for action in command_parser._actions:
+            if action.help is None:
+                action.help = next(
+                    (
+                        OPTION_HELP[option]
+                        for option in action.option_strings
+                        if option in OPTION_HELP
+                    ),
+                    ARGUMENT_HELP.get(
+                        action.dest,
+                        f"{action.dest.replace('_', ' ')} 参数。",
+                    ),
+                )
 
 
 def read_input(prompt: str) -> str:
     try:
         return input(prompt)
     except EOFError:
-        raise SystemExit("\n输入结束，已取消执行。")
+        raise InputCancelled("输入结束，已取消执行。")
 
 
 def prompt_choice(title: str, options: list[tuple[str, str]]) -> str:
@@ -106,20 +244,11 @@ def list_recent_experiment_dirs(task: str, limit: int = 5) -> list[Path]:
 
 
 def list_experiment_dirs(task: str | None = None) -> list[Path]:
-    if not rt.EXPERIMENT_ROOT_DIR.exists():
-        return []
-    candidates = [path for path in rt.EXPERIMENT_ROOT_DIR.rglob("*") if rt.is_experiment_dir(path)]
-    if task is None:
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        return candidates
-    candidates.sort(
-        key=lambda p: (
-            p.stat().st_mtime,
-            1 if rt.is_task_experiment_dir(p, task) else 0,
-        ),
-        reverse=True,
+    return rt.discover_recent_experiment_dirs(
+        task,
+        limit=None,
+        require_checkpoint=False,
     )
-    return candidates
 
 
 def compact_display_path(path: Path) -> str:
@@ -147,17 +276,20 @@ def compact_display_value(value: object) -> object:
 
 
 def filter_dirs_by_keyword(dirs: list[Path], keyword: str) -> list[Path]:
-    raw = keyword.strip().lower()
+    raw = keyword.strip().casefold()
     if not raw:
         return dirs
-    normalized = re.sub(r"[^0-9a-z]+", " ", raw)
+    normalized = re.sub(r"[^\w]+", " ", raw, flags=re.UNICODE)
     terms = [term for term in normalized.split() if term]
     if not terms:
         return dirs
     return [
         path
         for path in dirs
-        if all(term in re.sub(r"[^0-9a-z]+", " ", str(path).lower()) for term in terms)
+        if all(
+            term in re.sub(r"[^\w]+", " ", str(path).casefold(), flags=re.UNICODE)
+            for term in terms
+        )
     ]
 
 
@@ -258,7 +390,11 @@ def _dataset_preferences_from_experiment(experiment_dir: Path | None) -> tuple[s
 
     resolved_experiment_dir = experiment_dir.expanduser().resolve()
     preferred_tokens |= _tokenize_path_text(resolved_experiment_dir.name)
-    preferred_tokens |= _tokenize_path_text(str(resolved_experiment_dir.relative_to(rt.ROOT_DIR)))
+    try:
+        experiment_text = str(resolved_experiment_dir.relative_to(rt.ROOT_DIR))
+    except ValueError:
+        experiment_text = str(resolved_experiment_dir)
+    preferred_tokens |= _tokenize_path_text(experiment_text)
 
     train_log_path = resolved_experiment_dir / "train.log"
     if train_log_path.exists():
@@ -278,31 +414,35 @@ def _dataset_preferences_from_experiment(experiment_dir: Path | None) -> tuple[s
         search_roots.append(rt.TEST_OUTPUT_ROOT_DIR)
 
     seen_run_meta_paths: set[Path] = set()
-    for search_root in search_roots:
-        for run_meta_path in search_root.rglob("run_meta.json"):
-            resolved_run_meta_path = run_meta_path.resolve()
-            if resolved_run_meta_path in seen_run_meta_paths:
-                continue
-            seen_run_meta_paths.add(resolved_run_meta_path)
-            payload = _load_json_dict(run_meta_path)
-            if payload.get("task") != "det" or payload.get("action") != "infer":
-                continue
-            paths_payload = payload.get("paths")
-            if not isinstance(paths_payload, dict):
-                continue
-            recorded_experiment_dir = _resolve_existing_path(paths_payload.get("experiment_dir"))
-            if recorded_experiment_dir != resolved_experiment_dir:
-                continue
-            data_yaml_path = _resolve_existing_path(paths_payload.get("data_yaml"))
-            if data_yaml_path is not None:
-                preferred_yaml_paths.add(data_yaml_path)
-                preferred_root_dirs.add(data_yaml_path.parent.resolve())
-            data_root = _resolve_existing_path(paths_payload.get("data_root"))
-            if data_root is not None:
-                preferred_root_dirs.add(data_root)
-                preferred_yaml_paths.add((data_root / "data.yaml").resolve())
-                preferred_tokens |= _tokenize_path_text(data_root.name)
-                preferred_tokens |= _tokenize_path_text(data_root.parent.name)
+    for run_meta_path in find_files(
+        search_roots,
+        label="索引数据集关联记录",
+        filenames={"run_meta.json"},
+    ):
+        resolved_run_meta_path = run_meta_path.resolve()
+        if resolved_run_meta_path in seen_run_meta_paths:
+            continue
+        seen_run_meta_paths.add(resolved_run_meta_path)
+        payload = _load_json_dict(run_meta_path)
+        if payload.get("task") != "det" or payload.get("action") != "infer":
+            continue
+        paths_payload = payload.get("paths")
+        if not isinstance(paths_payload, dict):
+            continue
+        recorded_experiment_dir = _resolve_existing_path(paths_payload.get("experiment_dir"))
+        physically_inside = resolved_experiment_dir in resolved_run_meta_path.parents
+        if not physically_inside and recorded_experiment_dir != resolved_experiment_dir:
+            continue
+        data_yaml_path = _resolve_existing_path(paths_payload.get("data_yaml"))
+        if data_yaml_path is not None:
+            preferred_yaml_paths.add(data_yaml_path)
+            preferred_root_dirs.add(data_yaml_path.parent.resolve())
+        data_root = _resolve_existing_path(paths_payload.get("data_root"))
+        if data_root is not None:
+            preferred_root_dirs.add(data_root)
+            preferred_yaml_paths.add((data_root / "data.yaml").resolve())
+            preferred_tokens |= _tokenize_path_text(data_root.name)
+            preferred_tokens |= _tokenize_path_text(data_root.parent.name)
 
     return preferred_yaml_paths, preferred_root_dirs, preferred_tokens
 
@@ -316,7 +456,11 @@ def _dataset_candidate_sort_key(
 ) -> tuple[int, int, str]:
     resolved_candidate = candidate.resolve()
     candidate_root = resolved_candidate.parent
-    candidate_tokens = _tokenize_path_text(str(candidate_root.relative_to(rt.ROOT_DIR)))
+    try:
+        candidate_text = str(candidate_root.relative_to(rt.ROOT_DIR))
+    except ValueError:
+        candidate_text = str(candidate_root)
+    candidate_tokens = _tokenize_path_text(candidate_text)
     token_overlap = len(candidate_tokens & preferred_tokens)
 
     relevance_score = 0
@@ -335,23 +479,51 @@ def list_dataset_yaml_candidates(
     *,
     preferred_experiment_dir: Path | None = None,
 ) -> list[Path]:
-    dataset_roots = list(rt.ROOT_DIR.glob("datasets/**/data.yaml"))
-    candidates: list[Path] = []
-    for path in dataset_roots:
-        parent_name = path.parent.name.lower()
-        path_text = str(path).lower()
-        if "datasets/convert_datasets/" in path_text.replace("\\", "/"):
+    search_roots = list(rt.DATASET_SEARCH_ROOTS)
+    default_root = (rt.ROOT_DIR / "datasets").resolve()
+    if default_root not in search_roots:
+        search_roots.insert(0, default_root)
+    # Batch jobs and mounted datasets can extend discovery without editing the
+    # launcher file.  The value follows the platform path separator syntax.
+    for raw_root in os.environ.get("LIGHTLY_DATASET_SEARCH_ROOTS", "").split(os.pathsep):
+        if not raw_root.strip():
             continue
-        if task == "det" and "dataset_det" not in parent_name and "detect" not in path_text:
-            continue
-        if (
-            task == "seg"
-            and "dataset_seg" not in parent_name
-            and "seg" not in path_text
-            and "semantic" not in path_text
+        env_root = Path(raw_root).expanduser().resolve()
+        if env_root not in search_roots:
+            search_roots.append(env_root)
+    indexed_roots = set(search_roots)
+    for configured in (
+        rt.DATASET_DIR,
+        rt.INFER_DEFAULT_DATA,
+        rt.EXPORT_DEFAULT_SOURCE_DATA,
+        rt.SEG_DATASET_DIR,
+        rt.SEG_EXPORT_DEFAULT_SOURCE_DATA,
+        rt.SEMANTIC_SEG_DATASET_DIR,
+        rt.SEMANTIC_SEG_DEFAULT_DATA,
+    ):
+        configured = Path(configured).expanduser().resolve()
+        candidate_root = configured.parent if configured.suffix.casefold() in {".yaml", ".yml"} else configured
+        if candidate_root.exists() and not any(
+            _path_is_inside(candidate_root, root) for root in search_roots
         ):
-            continue
-        candidates.append(path.resolve())
+            search_roots.append(candidate_root)
+
+    candidates: list[Path] = []
+    for search_root in search_roots:
+        if search_root.exists():
+            candidates.extend(
+                dataset_adapter.discover_dataset_configs(
+                    search_root,
+                    task=task,
+                    include_empty=search_root in indexed_roots,
+                    include_unknown=(
+                        search_root in indexed_roots
+                        and task in {"det", "seg", "instance"}
+                    ),
+                    show_progress=True,
+                )
+            )
+    candidates = list(dict.fromkeys(path.resolve() for path in candidates))
 
     preferred_yaml_paths, preferred_root_dirs, preferred_tokens = _dataset_preferences_from_experiment(
         preferred_experiment_dir
@@ -366,33 +538,6 @@ def list_dataset_yaml_candidates(
         reverse=True,
     )
     return candidates
-
-
-def prompt_convert_source_dir() -> Path:
-    candidates = convert_tools.list_convert_source_dirs()
-    if not candidates:
-        return prompt_required_path("待转换源目录")
-
-    while True:
-        print("\n自动发现的待转换数据集:")
-        for idx, path in enumerate(candidates, start=1):
-            print(f"  {idx}. {compact_display_path(path)}")
-        print("  输入编号直接选择")
-        print("  输入名称直接选择，例如: TLPD")
-        print("  输入 custom 手动输入路径")
-
-        raw = read_input("请选择数据集: ").strip()
-        lowered = raw.lower()
-        if lowered == "custom":
-            return prompt_required_path("待转换源目录")
-        if raw.isdigit():
-            index = int(raw) - 1
-            if 0 <= index < len(candidates):
-                return candidates[index]
-        for path in candidates:
-            if lowered == path.name.lower():
-                return path
-        print("无效选择，请重新输入。")
 
 
 def prompt_directory_name(prompt: str, default: str) -> str:
@@ -417,31 +562,44 @@ def prompt_dataset_yaml(task: str, default: Path, *, preferred_experiment_dir: P
         return Path(prompt_text("数据配置 --data", str(default)) or str(default))
 
     visible_limit = 20
+    active_candidates = candidates
     visible_candidates = candidates[:visible_limit]
 
     while True:
         print(f"\n自动发现的 {task} 数据集:")
         for idx, path in enumerate(visible_candidates, start=1):
             print(f"  {idx}. {compact_display_path(path)}")
-        if len(candidates) > visible_limit and len(visible_candidates) < len(candidates):
-            print(f"  ... 当前仅显示前 {len(visible_candidates)} 个，共 {len(candidates)} 个")
+        if len(visible_candidates) < len(active_candidates):
+            print(
+                f"  ... 当前仅显示前 {len(visible_candidates)} 个，"
+                f"当前筛选共 {len(active_candidates)} 个"
+            )
         print("  输入编号直接选择")
-        print("  输入 all 查看全部")
-        print("  输入 custom 手动输入 data.yaml")
+        print("  输入关键词筛选")
+        print("  输入 all 恢复并查看全部")
+        custom_label = "data.yaml 或 ImageFolder 根目录" if task == "cls" else "data.yaml"
+        print(f"  输入 custom 手动输入 {custom_label}")
 
         raw = read_input("请选择数据集: ").strip()
         lowered = raw.lower()
         if not raw:
-            return default
+            resolved_default = default.expanduser().resolve()
+            return resolved_default if resolved_default in candidates else candidates[0]
         if lowered == "custom":
             return Path(prompt_text("数据配置 --data", str(default)) or str(default))
         if lowered == "all":
+            active_candidates = candidates
             visible_candidates = candidates
             continue
         if raw.isdigit():
             index = int(raw) - 1
             if 0 <= index < len(visible_candidates):
                 return visible_candidates[index]
+        matched = filter_dirs_by_keyword(candidates, raw)
+        if matched:
+            active_candidates = matched
+            visible_candidates = matched[:visible_limit]
+            continue
         print("无效选择，请重新输入。")
 
 
@@ -458,7 +616,8 @@ def prompt_experiment_dir(task: str, default: Path, *, initial_keyword: str | No
     while True:
         print(f"\nout/ 下实验目录列表（递归扫描，当前任务: {task}）:")
         for idx, path in enumerate(visible_dirs, start=1):
-            print(f"  {idx}. {compact_display_path(path)}")
+            modified_text = rt.format_experiment_modified_time(path)
+            print(f"  {idx}. [{modified_text}] {compact_display_path(path)}")
         print("  输入编号直接选择")
         print("  输入关键字筛选，例如: 0408 / military_dataset")
         print("  输入 all 查看全部")
@@ -622,11 +781,27 @@ def print_default_det_infer_summary(*, mode: str, data_path: Path | None = None)
     default_data = compact_display_path(selected_data) if mode == "dataset" else "(not used)"
     print(f"  data: {default_data}")
     print(f"  output_dir: (auto)")
-    print(f"  report_path: {'(auto)' if mode == 'dataset' else '(not used)'}")
-    print(f"  compute_metrics: {'True' if mode == 'dataset' else 'False'}")
-    print(f"  save_test_report: {'True' if mode == 'dataset' else 'False'}")
-    print(f"  bad_class_map50_threshold: {rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD}")
+    print("  report_path: (not used)")
+    print("  compute_metrics: False")
+    print("  save_test_report: False")
+    print("  overwrite: False")
+
+
+def print_default_det_eval_summary(*, data_path: Path, split: str) -> None:
+    print("\n默认参数摘要")
+    print(f"  data: {compact_display_path(data_path)}")
+    print(f"  split: {split}")
+    print(f"  score_threshold: {rt.INFER_DEFAULT_SCORE_THRESHOLD}")
+    print(f"  report_iou_threshold: {rt.INFER_DEFAULT_REPORT_IOU_THRESHOLD}")
+    print("  compute_metrics: True")
     print("  metric_classwise: False")
+    print("  save_test_report: True")
+    print("  save_visualization: True")
+    print(f"  vis_max_images: {rt.DET_EVAL_VIS_MAX_IMAGES}（每个 split）")
+    print("  save_json: False")
+    print("  save_txt: False")
+    print(f"  device: {rt.INFER_DEFAULT_DEVICE}")
+    print("  output_dir: (auto)")
     print("  overwrite: False")
 
 
@@ -642,7 +817,10 @@ def print_default_seg_eval_summary(
         print("  threshold: 0.0（语义分割不过滤）")
     else:
         print(f"  threshold: {rt.DEFAULT_SEG_THRESHOLD}")
-    print("  output_dir: <experiment_dir>/eval")
+    if len(splits) > 1:
+        print("  output_dir: <experiment_dir>/eval/<split>")
+    else:
+        print("  output_dir: <experiment_dir>/eval")
     print("  classwise: False")
     if seg_train_type == "semantic":
         max_vis = rt.SEG_EVAL_VIS_MAX_IMAGES
@@ -666,8 +844,7 @@ def build_seg_eval_cli_preview(args: argparse.Namespace) -> str:
     parts.extend(["--threshold", str(args.threshold)])
     if getattr(args, "classwise", False):
         parts.append("--classwise")
-    if str(getattr(args, "seg_train_type", "instance")) == "semantic":
-        parts.extend(["--vis-max-images", str(getattr(args, "vis_max_images", rt.SEG_EVAL_VIS_MAX_IMAGES))])
+    parts.extend(["--vis-max-images", str(getattr(args, "vis_max_images", rt.SEG_EVAL_VIS_MAX_IMAGES))])
     parts.extend(["--device", str(args.device)])
     if getattr(args, "overwrite", False):
         parts.append("--overwrite")
@@ -681,10 +858,46 @@ def _collect_existing_det_infer_outputs(
     splits: tuple[str, ...] = ("train", "test", "val"),
 ) -> dict[str, Path]:
     try:
+        from .det_problem_export import discover_infer_runs
+
+        requested_data = data_path.expanduser().resolve()
+        requested_root = requested_data.parent
         existing: dict[str, Path] = {}
-        for split in splits:
-            output_dir = experiment_dir.expanduser().resolve() / "infer" / split
-            if output_dir.exists() and any(output_dir.iterdir()):
+        for run in discover_infer_runs(experiment_dir):
+            split = str(run.get("split", ""))
+            if split not in splits or split in existing:
+                continue
+            meta = run.get("run_meta", {})
+            paths = meta.get("paths", {}) if isinstance(meta, dict) else {}
+            if not isinstance(paths, dict):
+                paths = {}
+            recorded_data = paths.get("data_yaml")
+            recorded_root = paths.get("data_root")
+            data_matches = recorded_data is None and recorded_root is None
+            recorded_candidates: list[Path] = []
+            if recorded_data:
+                recorded_data_path = Path(recorded_data).expanduser().resolve()
+                recorded_candidates.append(recorded_data_path)
+                data_matches = recorded_data_path == requested_data
+            if recorded_root:
+                recorded_root_path = Path(recorded_root).expanduser().resolve()
+                recorded_candidates.append(recorded_root_path)
+                data_matches = data_matches or recorded_root_path == requested_root
+            if not data_matches and recorded_candidates and not any(path.exists() for path in recorded_candidates):
+                requested_tokens = _tokenize_path_text(
+                    f"{requested_root.parent.name} {requested_root.name}"
+                )
+                recorded_tokens = {
+                    token
+                    for path in recorded_candidates
+                    for token in _tokenize_path_text(
+                        f"{(path.parent if path.suffix else path).parent.name} "
+                        f"{(path.parent if path.suffix else path).name}"
+                    )
+                }
+                data_matches = bool(requested_tokens & recorded_tokens)
+            output_dir = run.get("output_dir")
+            if data_matches and isinstance(output_dir, Path) and output_dir.is_dir():
                 existing[split] = output_dir
         return existing
     except Exception:
@@ -714,15 +927,17 @@ def prompt_det_infer_split(*, experiment_dir: Path, data_path: Path) -> str:
 
 def build_det_cli_preview(args: argparse.Namespace) -> str:
     parts = ["python", "launcher.py", args.command]
-    if args.command == "infer":
+    if args.command in {"infer", "eval"}:
+        if args.command == "eval":
+            parts.extend(["--task", "det"])
         parts.extend(["--experiment-dir", str(args.experiment_dir)])
         if args.checkpoint is not None:
             parts.extend(["--checkpoint", str(args.checkpoint)])
-        if args.image is not None:
+        if getattr(args, "image", None) is not None:
             parts.extend(["--image", str(args.image)])
-        elif args.image_dir is not None:
+        elif getattr(args, "image_dir", None) is not None:
             parts.extend(["--image-dir", str(args.image_dir)])
-        elif args.data is not None:
+        elif getattr(args, "data", None) is not None:
             parts.extend(["--data", str(args.data), "--split", str(args.split)])
         if args.output_dir is not None:
             parts.extend(["--output-dir", str(args.output_dir)])
@@ -733,6 +948,13 @@ def build_det_cli_preview(args: argparse.Namespace) -> str:
                 str(getattr(args, "bad_class_map50_threshold", rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD)),
             ]
         )
+        if args.command == "eval":
+            parts.extend(["--report-iou-threshold", str(args.report_iou_threshold)])
+            parts.extend(["--vis-max-images", str(args.vis_max_images)])
+            if getattr(args, "metric_classwise", False):
+                parts.append("--classwise")
+            if not getattr(args, "save_visualization", True):
+                parts.append("--skip-visualization")
     elif args.command == "export":
         if args.report_json is not None:
             parts.extend(["--report-json", str(args.report_json)])
@@ -803,58 +1025,26 @@ def build_seg_export_cli_preview(args: argparse.Namespace) -> str:
     return " ".join(parts)
 
 
-def build_convert_cli_preview(args: argparse.Namespace) -> str:
-    source_dir = Path(args.source_dir)
-    try:
-        source_value = str(source_dir.relative_to(convert_tools.CONVERT_DATASETS_ROOT))
-    except ValueError:
-        source_value = str(source_dir)
-
-    parts = ["python", "launcher.py", "convert", source_value]
-    if getattr(args, "output_name", None):
-        parts.extend(["--output-name", str(args.output_name)])
-    if getattr(args, "task", "all") != "all":
-        parts.extend(["--task", str(args.task)])
-    if args.label_format != "auto":
-        parts.extend(["--label-format", str(args.label_format)])
-    seg_type = getattr(args, "seg_type", "auto")
-    if seg_type != "auto":
-        parts.extend(["--seg-type", seg_type])
-    if getattr(args, "class_ref", None):
-        parts.extend(["--class-ref", str(args.class_ref)])
-    if args.seed is not None:
-        parts.extend(["--seed", str(args.seed)])
-    if args.dry_run:
-        parts.append("--dry-run")
-    return " ".join(parts)
-
-
 def _find_recent_test_reports(
     source_data_yaml: Path | None = None,
 ) -> list[Path]:
     """在 out/ 下搜索 test_report.json，按数据集关系排序。"""
-    patterns = ["*-test_report.json", "test_report.json"]
+    patterns = ["*test_report.json", "*val_report.json", "*train_report.json"]
     roots = [rt.EXPERIMENT_ROOT_DIR, rt.TEST_OUTPUT_ROOT_DIR]
     all_report_root = rt.ALL_REPORT_ROOT_DIR.resolve()
     seen: dict[str, Path] = {}
-    for root in roots:
-        if not root.exists():
-            continue
-        for pattern in patterns:
-            for path in root.rglob(pattern):
-                if not path.is_file():
-                    continue
-                resolved = path.resolve()
-                try:
-                    resolved.relative_to(all_report_root)
-                    continue  # 在 all_report 目录内，跳过（是副本）
-                except ValueError:
-                    pass
-                if rt.IMPORTANT_ARTIFACT_DIRNAME in resolved.parts:
-                    continue  # 在 important 目录内，跳过（是副本）
-                if "old" in resolved.parts:
-                    continue
-                seen[str(resolved)] = resolved
+    for path in find_files(
+        roots,
+        label="索引 Det 评估报告",
+        patterns=patterns,
+        skip_dir_names={
+            all_report_root.name,
+            rt.IMPORTANT_ARTIFACT_DIRNAME,
+            "old",
+        },
+    ):
+        resolved = path.resolve()
+        seen[str(resolved)] = resolved
 
     candidates = list(seen.values())
     if source_data_yaml is not None:
@@ -1275,20 +1465,21 @@ def _infer_output_has_prediction_json(output_dir: Path) -> bool:
     output_dir = output_dir.expanduser().resolve()
     search_dirs = [output_dir / rt.INFER_TEMP_DIRNAME / "json", output_dir]
     seen: set[Path] = set()
-    for search_dir in search_dirs:
-        if not search_dir.exists():
+    for json_path in find_files(
+        search_dirs,
+        label="索引预测 JSON",
+        patterns=["*.json"],
+    ):
+        resolved = json_path.resolve()
+        if resolved in seen:
             continue
-        for json_path in search_dir.rglob("*.json"):
-            resolved = json_path.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            if json_path.name in {"run_meta.json", "metrics_summary.json"}:
-                continue
-            if "report" in json_path.name or "summary" in json_path.name or "manifest" in json_path.name:
-                continue
-            if _is_prediction_json(json_path):
-                return True
+        seen.add(resolved)
+        if json_path.name in {"run_meta.json", "metrics_summary.json"}:
+            continue
+        if "report" in json_path.name or "summary" in json_path.name or "manifest" in json_path.name:
+            continue
+        if _is_prediction_json(json_path):
+            return True
     return False
 
 
@@ -1363,12 +1554,26 @@ def _experiment_dir_from_report(report_json: Path) -> Path | None:
     paths_payload = run_meta.get("paths")
     if not isinstance(paths_payload, dict):
         return None
-    return _resolve_existing_path(paths_payload.get("experiment_dir"))
+    recorded = _resolve_existing_path(paths_payload.get("experiment_dir"))
+    if recorded is not None:
+        return recorded
+    for parent in report_json.expanduser().resolve().parents:
+        if rt.is_experiment_dir(parent):
+            return parent
+    return None
 
 
 def _cleanup_optimize_temp_dir(temp_dir: Path | None) -> None:
     if temp_dir is not None and temp_dir.exists():
         shutil.rmtree(temp_dir)
+    if temp_dir is not None:
+        _PENDING_OPTIMIZE_TEMP_DIRS.discard(temp_dir)
+
+
+def cleanup_pending_optimize_temp_dirs() -> None:
+    """Remove auto-infer workspaces left by cancellation or argument-build errors."""
+    for temp_dir in list(_PENDING_OPTIMIZE_TEMP_DIRS):
+        _cleanup_optimize_temp_dir(temp_dir)
 
 
 def _prompt_optimize_infer_split() -> str:
@@ -1388,7 +1593,7 @@ def _find_auto_infer_report(temp_dir: Path, splits: list[str]) -> Path | None:
     preferred_splits = [split for split in ("test", "val", "train") if split in splits]
     for split in preferred_splits:
         split_dir = temp_dir / split
-        for pattern in ("*-test_report.json", "test_report.json"):
+        for pattern in ("*test_report.json", "*val_report.json", "*train_report.json"):
             candidates = sorted(
                 split_dir.rglob(pattern),
                 key=lambda p: p.stat().st_mtime,
@@ -1396,7 +1601,7 @@ def _find_auto_infer_report(temp_dir: Path, splits: list[str]) -> Path | None:
             )
             if candidates:
                 return candidates[0]
-    for pattern in ("*-test_report.json", "test_report.json"):
+    for pattern in ("*test_report.json", "*val_report.json", "*train_report.json"):
         candidates = sorted(
             temp_dir.rglob(pattern),
             key=lambda p: p.stat().st_mtime,
@@ -1429,6 +1634,7 @@ def _run_auto_infer_for_optimize(
     splits = det_infer.resolve_dataset_infer_splits(data_cfg, split_choice)
 
     temp_dir = Path(tempfile.mkdtemp(prefix="lightly-train-optimize-", dir="/tmp"))
+    _PENDING_OPTIMIZE_TEMP_DIRS.add(temp_dir)
     save_test_report = report_json_for_quality is None
 
     print("\n[auto-infer] 配置摘要")
@@ -1630,12 +1836,29 @@ def _prompt_seg_train_type(default: str | None = None) -> str:
     return prompt_choice("请选择 seg 训练类型", options)
 
 
-def _default_train_data_yaml(task: str, seg_train_type: str | None = None) -> Path:
+def _default_train_data_yaml(
+    task: str,
+    seg_train_type: str | None = None,
+    *,
+    preferred_experiment_dir: Path | None = None,
+) -> Path:
     if task == "seg" and seg_train_type == "semantic":
-        return Path(rt.SEMANTIC_SEG_DEFAULT_DATA)
-    if task == "seg":
-        return Path(rt.SEG_EXPORT_DEFAULT_SOURCE_DATA)
-    return Path(rt.INFER_DEFAULT_DATA)
+        configured = Path(rt.SEMANTIC_SEG_DEFAULT_DATA)
+        candidate_task = "semantic"
+    elif task == "seg":
+        configured = Path(rt.SEG_EXPORT_DEFAULT_SOURCE_DATA)
+        candidate_task = seg_train_type or "instance"
+    else:
+        configured = Path(rt.INFER_DEFAULT_DATA)
+        candidate_task = task
+    if configured.exists():
+        return configured
+    candidates = list_dataset_yaml_candidates(
+        candidate_task, preferred_experiment_dir=preferred_experiment_dir,
+    )
+    if candidates:
+        return candidates[0]
+    return configured
 
 
 def _default_train_model(task: str, seg_train_type: str | None = None) -> str:
@@ -1708,7 +1931,7 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
     if train_mode == "new":
         seg_train_type = _prompt_seg_train_type() if task == "seg" else None
         data_yaml = prompt_dataset_yaml(
-            task,
+            seg_train_type if task == "seg" else task,
             _default_train_data_yaml(task, seg_train_type),
         )
         # A1. 数据集
@@ -1918,10 +2141,12 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
             orig_data_path = (rt.ROOT_DIR / orig_data_path).resolve()
     if not orig_data_path.exists():
         print(f"原数据集不存在: {compact_display_path(orig_data_path)}，请重新指定。")
-        data_yaml = prompt_dataset_yaml(task, orig_data_path)
+        data_yaml = prompt_dataset_yaml(seg_train_type if task == "seg" else task, orig_data_path)
     else:
         reuse_data = prompt_yes_no(f"复用原数据集 [{compact_display_path(orig_data_path)}]", True)
-        data_yaml = orig_data_path if reuse_data else prompt_dataset_yaml(task, orig_data_path)
+        data_yaml = orig_data_path if reuse_data else prompt_dataset_yaml(
+            seg_train_type if task == "seg" else task, orig_data_path
+        )
 
     # B2c. 训练时长
     steps, batch_size = _prompt_train_duration(data_yaml)
@@ -2016,7 +2241,7 @@ def _build_train_args(task: str) -> argparse.Namespace | None:
 
 
 def _build_clean_args() -> argparse.Namespace | None:
-    """实验清理交互流程。"""
+    """收集实验清理计划；实际删除由 dispatch 调用 exp_cleaner 执行。"""
     from . import exp_cleaner
 
     # Step 1: 扫描并生成报告
@@ -2029,19 +2254,23 @@ def _build_clean_args() -> argparse.Namespace | None:
     exp_cleaner.print_clean_report(analyses)
 
     # Step 2: 用户标记重要实验
-    print("请输入要保留完整文件的重要实验编号（逗号分隔，如 1,4；留空表示全部清理）:")
-    raw = read_input("> ").strip()
-
     important_indices: set[int] = set()
-    if raw:
-        for part in raw.split(","):
-            part = part.strip()
-            if part.isdigit():
-                idx = int(part) - 1
-                if 0 <= idx < len(analyses):
-                    important_indices.add(idx)
-                else:
-                    print(f"  警告: 编号 {part} 超出范围，已忽略。")
+    while True:
+        print("请输入要保留完整文件的重要实验编号（逗号分隔，如 1,4；留空表示全部进入清理候选）:")
+        raw = read_input("> ").strip()
+        if not raw:
+            break
+        parts = [part.strip() for part in raw.split(",")]
+        invalid = [
+            part
+            for part in parts
+            if not part.isdigit() or not 1 <= int(part) <= len(analyses)
+        ]
+        if invalid:
+            print(f"输入包含无效编号: {', '.join(repr(part) for part in invalid)}，请重新输入。")
+            continue
+        important_indices = {int(part) - 1 for part in parts}
+        break
 
     if important_indices:
         print("\n已标记为重要（跳过清理）:")
@@ -2068,111 +2297,62 @@ def _build_clean_args() -> argparse.Namespace | None:
         print("已取消清理。")
         return None
 
-    # Step 5: 执行清理
-    print("\n正在清理...")
-    entries = exp_cleaner.execute_clean(to_clean)
-
-    # Step 6: 写日志
-    if entries:
-        exp_cleaner.write_clean_log(entries)
-
-    released = sum(e.size_bytes for e in entries)
-    print(f"\n清理完成！释放空间: {exp_cleaner.format_size(released)}")
-
-    args = argparse.Namespace(
+    return argparse.Namespace(
         tool_task="clean",
         tool_action="clean",
         analyses=to_clean,
+        dry_run=False,
     )
-    return args
 
 
 def build_interactive_args() -> argparse.Namespace | None:
     task = prompt_choice(
         "请选择任务类型",
-        [("cls", "cls 分类"), ("det", "det 检测"), ("seg", "seg 分割"), ("data", "data 数据集转换"), ("clean", "clean 实验清理（释放磁盘空间）")],
+        [("cls", "cls 分类"), ("det", "det 检测"), ("seg", "seg 分割"), ("clean", "clean 实验清理（释放磁盘空间）")],
     )
     if task == "clean":
         return _build_clean_args()
-    if task == "data":
-        source_dir = prompt_convert_source_dir()
-        output_name = prompt_directory_name("输出数据集目录名", source_dir.name)
-        output_task = prompt_choice(
-            "请选择输出任务",
-            [
-                ("det", "det 检测"),
-                ("cls", "cls 分类"),
-                ("seg", "seg 分割"),
-                ("all", "all 全部"),
-            ],
-        )
-        # Ask seg_type when task includes seg
-        seg_type = "auto"
-        if output_task in {"seg", "all"}:
-            seg_type = prompt_choice(
-                "请选择 seg 输出类型 --seg-type",
-                [
-                    ("auto", "auto 自动判断"),
-                    ("instance", "instance 实例分割（YOLO polygon）"),
-                    ("semantic", "semantic 语义分割（PNG mask）"),
-                ],
-            )
-        # label_format only applies to instance seg (JSON/TXT polygon labels).
-        # For semantic seg, labels ARE the PNG masks - no separate format concept.
-        # For auto seg_type, the backend auto-detects VOC-style vs JSON/TXT anyway.
-        label_format = "auto"
-        need_label_format = (
-            (output_task in {"det", "cls"})
-            or (output_task == "seg" and seg_type == "instance")
-            or (output_task == "all" and seg_type == "instance")
-        )
-        if need_label_format:
-            label_format = prompt_choice(
-                "请选择标注格式 --label-format",
-                [("auto", "auto 自动判断"), ("labelme", "labelme JSON"), ("yolo", "yolo TXT")],
-            )
-        class_ref_str = prompt_text(
-            "参考类别文件 --class-ref（data.yaml / classes.txt，留空则自动从数据收集）",
-        )
-        class_ref = str(Path(class_ref_str).resolve()) if class_ref_str else None
-        args = argparse.Namespace(
-            tool_task="data",
-            tool_action="convert",
-            source_dir=source_dir,
-            output_name=output_name,
-            output_root=(rt.ROOT_DIR / "datasets" / output_name).resolve(),
-            task=output_task,
-            label_format=label_format,
-            seg_type=seg_type,
-            class_ref=class_ref,
-            seed=None,
-            dry_run=False,
-        )
-        print(f"\n等价命令预览:\n  {build_convert_cli_preview(args)}")
-        return confirm_args("data/convert", args)
-
     action_options = [("train", "train 训练"), ("infer", "infer 推理")]
-    if task in {"cls", "seg"}:
+    if task in {"cls", "det", "seg"}:
         action_options.append(("eval", "eval 评估"))
     if task == "seg":
-        action_options.append(("eda", "EDA 语义分割数据分析"))
+        action_options.append(("eda", "EDA 分割数据分析（自动识别语义/实例）"))
         action_options.append(("curate", "curate 语义分割交互式整理"))
         action_options.append(("export", "export 数据集筛选"))
     if task == "det":
         action_options.append(("eda", "EDA 数据集分析"))
         action_options.append(("export", "export 数据集筛选"))
         action_options.append(("optimize", "optimize 训练后数据集优化（合并/删除类别）"))
+        action_options.append(("review-sample", "review-sample 数据集质检抽样"))
         action_options.append(("report", "report 生成实验报告"))
     action = prompt_choice(f"请选择 {task} 功能", action_options)
 
     if action == "train":
         return _build_train_args(task)
+    if task == "det" and action == "review-sample":
+        return build_interactive_review_sample_args()
 
     if task == "cls" and action == "eval":
-        return confirm_args(
-            "cls/eval",
-            argparse.Namespace(tool_task="cls", tool_action="eval", script_path=rt.TEST_CLS_SCRIPT),
+        experiment_dir = prompt_experiment_dir(
+            "cls", rt.EXPERIMENT_ROOT_DIR / "my_experiment_cls"
         )
+        test_dir = prompt_required_path("测试图片目录（按类别子目录组织） --test-dir")
+        default_output = experiment_dir / "eval"
+        output_raw = prompt_text("输出目录 --output-dir", str(default_output))
+        args = argparse.Namespace(
+            tool_task="cls",
+            tool_action="eval",
+            command="eval",
+            experiment_dir=experiment_dir,
+            checkpoint=None,
+            test_dir=test_dir,
+            output_dir=Path(output_raw or str(default_output)).expanduser(),
+            threshold=prompt_float("分类阈值 --threshold", rt.DEFAULT_CLS_THRESHOLD),
+            topk=prompt_int("topk", 1),
+            device=prompt_text("推理设备 --device", rt.DEFAULT_DEVICE) or rt.DEFAULT_DEVICE,
+            overwrite=False,
+        )
+        return confirm_args("cls/eval", args)
     if task == "cls" and action == "infer":
         experiment_dir = prompt_experiment_dir("cls", rt.EXPERIMENT_ROOT_DIR / "my_experiment_cls")
         mode = prompt_choice("请选择 cls 推理输入方式", [("image", "image 单张图片"), ("image_dir", "image_dir 文件夹批量推理")])
@@ -2195,13 +2375,14 @@ def build_interactive_args() -> argparse.Namespace | None:
         return confirm_args("cls/infer", args)
 
     if task == "seg" and action == "eda":
-        data_path = prompt_dataset_yaml("seg", _default_train_data_yaml("seg", "semantic"))
+        data_path = prompt_dataset_yaml("seg", _default_train_data_yaml("seg", rt.SEG_TRAIN_TYPE))
         output_dir_raw = prompt_text("输出目录 --output-dir（留空自动生成）", None)
         min_class_images = prompt_int("推荐删除阈值 --min-class-images（全局图片数低于此值的类推荐删除）", 10)
         threshold_percentile = prompt_float("压缩阈值百分位 --threshold-percentile", 0.9)
         args = argparse.Namespace(
             tool_task="seg",
             tool_action="eda",
+            seg_type="auto",
             data=data_path,
             output_dir=Path(output_dir_raw).expanduser() if output_dir_raw else None,
             overwrite=prompt_yes_no("输出目录非空时是否允许覆盖 --overwrite", False),
@@ -2211,7 +2392,7 @@ def build_interactive_args() -> argparse.Namespace | None:
         return confirm_args("seg/eda", args)
 
     if task == "seg" and action == "curate":
-        data_path = prompt_dataset_yaml("seg", _default_train_data_yaml("seg", "semantic"))
+        data_path = prompt_dataset_yaml("semantic", _default_train_data_yaml("seg", "semantic"))
         eda_dir_raw = prompt_text("EDA 输出目录 --eda-dir（留空自动查找最近的 EDA）", None)
         args = argparse.Namespace(
             tool_task="seg",
@@ -2246,14 +2427,16 @@ def build_interactive_args() -> argparse.Namespace | None:
                 image_dir=None,
                 data=None,
                 split="test",
-                output_dir=Path(prompt_text("输出目录", str(experiment_dir / "infer")) or str(experiment_dir / "infer")),
+                output_dir=None,
                 threshold=prompt_float("分割阈值 threshold", rt.DEFAULT_SEG_THRESHOLD),
                 overwrite=prompt_yes_no("输出目录非空时是否允许覆盖", False),
                 device=rt.DEFAULT_DEVICE,
             )
             if mode == "dataset":
                 args.data = prompt_dataset_yaml(
-                    "seg", _default_train_data_yaml("seg", seg_train_type)
+                    seg_train_type,
+                    _default_train_data_yaml("seg", seg_train_type),
+                    preferred_experiment_dir=experiment_dir,
                 )
                 args.split = prompt_choice(
                     "请选择数据集划分 --split",
@@ -2263,15 +2446,25 @@ def build_interactive_args() -> argparse.Namespace | None:
                 args.image = prompt_required_path("图片路径")
             else:
                 args.image_dir = prompt_required_path("图片目录")
+            input_path = args.data or args.image_dir or args.image
+            default_output = rt.build_action_output_dir(
+                experiment_dir,
+                "infer",
+                input_path=input_path,
+                split=args.split if args.data is not None else None,
+            )
+            output_raw = prompt_text("输出目录", str(default_output))
+            args.output_dir = Path(output_raw or str(default_output)).expanduser()
             return confirm_args("seg/infer", args)
-        data_path = prompt_dataset_yaml("seg", _default_train_data_yaml("seg", seg_train_type))
-        if seg_train_type == "semantic":
-            split_value = prompt_choice(
-                "请选择数据集划分 --split",
-                [("test", "test"), ("val", "val"), ("val test", "val + test（两个都评估）")],
-            ).split()
-        else:
-            split_value = [prompt_choice("请选择数据集划分 --split", [("test", "test"), ("val", "val")])]
+        data_path = prompt_dataset_yaml(
+            seg_train_type,
+            _default_train_data_yaml("seg", seg_train_type),
+            preferred_experiment_dir=experiment_dir,
+        )
+        split_value = prompt_choice(
+            "请选择数据集划分 --split",
+            [("test", "test"), ("val", "val"), ("val test", "val + test（两个都评估）")],
+        ).split()
         config_mode = prompt_choice(
             "请选择 eval 配置方式",
             [
@@ -2284,8 +2477,11 @@ def build_interactive_args() -> argparse.Namespace | None:
             print_default_seg_eval_summary(
                 seg_train_type=seg_train_type, data_path=data_path, splits=split_value
             )
+        default_eval_output = rt.build_action_output_dir(
+            experiment_dir, "eval", input_path=data_path, split=split_value,
+        )
         output_dir_raw = (
-            prompt_text("输出目录 --output-dir，直接回车写入 <experiment_dir>/eval", None)
+            prompt_text("输出目录 --output-dir", str(default_eval_output))
             if use_custom
             else None
         )
@@ -2298,7 +2494,7 @@ def build_interactive_args() -> argparse.Namespace | None:
             checkpoint=None,
             data=data_path,
             split=split_value,
-            output_dir=Path(output_dir_raw).expanduser() if output_dir_raw else experiment_dir / "eval",
+            output_dir=Path(output_dir_raw).expanduser() if output_dir_raw else default_eval_output,
             threshold=0.0
             if seg_train_type == "semantic"  # 语义分割逐像素 argmax，不过滤
             else (
@@ -2354,7 +2550,7 @@ def build_interactive_args() -> argparse.Namespace | None:
         if seg_train_type == "semantic":
             print("semantic segmentation export is not supported yet; current seg/export only supports YOLO polygon instance segmentation datasets.")
             return None
-        export_source_data = prompt_dataset_yaml("seg", Path(rt.SEG_EXPORT_DEFAULT_SOURCE_DATA))
+        export_source_data = prompt_dataset_yaml("instance", Path(rt.SEG_EXPORT_DEFAULT_SOURCE_DATA))
         target_total_images = prompt_int(
             "导出总图数 --target-total-images，0 表示按数据自动决定",
             rt.SEG_EXPORT_DEFAULT_TARGET_TOTAL_IMAGES,
@@ -2429,9 +2625,100 @@ def build_interactive_args() -> argparse.Namespace | None:
         print(f"\n等价命令预览:\n  {build_det_cli_preview(args)}")
         return confirm_args("det/export", args)
 
+    if task == "det" and action == "eval":
+        experiment_dir = prompt_experiment_dir("det", rt.INFER_DEFAULT_EXPERIMENT_DIR)
+        data_path = prompt_dataset_yaml(
+            "det",
+            Path(rt.EVAL_DEFAULT_DATA),
+            preferred_experiment_dir=experiment_dir,
+        )
+        split = prompt_choice(
+            "请选择数据集划分 --split",
+            [
+                ("test", "test"),
+                ("val", "val"),
+                ("test+val", "test + val"),
+                ("all", "all (train + test + val)"),
+                ("train", "train"),
+            ],
+        )
+        config_mode = prompt_choice(
+            "请选择 eval 配置方式",
+            [("default", "default 默认配置"), ("custom", "custom 自定义配置")],
+        )
+        use_custom = config_mode == "custom"
+        if not use_custom:
+            print_default_det_eval_summary(data_path=data_path, split=split)
+        output_dir_raw = prompt_text("输出目录 --output-dir，直接回车自动生成", None) if use_custom else None
+        args = argparse.Namespace(
+            tool_task="det",
+            tool_action="eval",
+            command="eval",
+            experiment_dir=experiment_dir,
+            checkpoint=None,
+            image=None,
+            image_dir=None,
+            data=data_path,
+            split=split,
+            output_dir=(
+                Path(output_dir_raw).expanduser()
+                if output_dir_raw
+                else (Path(rt.EVAL_DEFAULT_OUTPUT_DIR) if rt.EVAL_OUTPUT_DIR_CONFIGURED else None)
+            ),
+            score_threshold=(
+                prompt_float("置信度阈值 --score-threshold", rt.INFER_DEFAULT_SCORE_THRESHOLD)
+                if use_custom else rt.INFER_DEFAULT_SCORE_THRESHOLD
+            ),
+            report_iou_threshold=(
+                prompt_float("报告 IoU 阈值 --report-iou-threshold", rt.INFER_DEFAULT_REPORT_IOU_THRESHOLD)
+                if use_custom else rt.INFER_DEFAULT_REPORT_IOU_THRESHOLD
+            ),
+            bad_class_map50_threshold=rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD,
+            metric_classwise=(
+                prompt_yes_no("是否输出按类指标 --classwise", False) if use_custom else False
+            ),
+            classwise=False,
+            save_visualization=(
+                prompt_yes_no("是否保存抽样 GT/预测对比图", True) if use_custom else True
+            ),
+            vis_max_images=(
+                prompt_int("每个 split 最多输出多少张对比图 --vis-max-images", rt.DET_EVAL_VIS_MAX_IMAGES)
+                if use_custom else rt.DET_EVAL_VIS_MAX_IMAGES
+            ),
+            save_json=False,
+            save_txt=False,
+            compute_metrics=True,
+            save_test_report=True,
+            report_path=(
+                Path(rt.EVAL_DEFAULT_REPORT_PATH)
+                if rt.EVAL_REPORT_PATH_CONFIGURED
+                else None
+            ),
+            overwrite=(
+                prompt_yes_no("输出目录非空时是否允许覆盖 --overwrite", False)
+                if use_custom else False
+            ),
+            device=(prompt_text("推理设备 --device", rt.INFER_DEFAULT_DEVICE) or rt.INFER_DEFAULT_DEVICE)
+            if use_custom else rt.INFER_DEFAULT_DEVICE,
+            infer_config_mode=config_mode,
+            sahi=rt.INFER_DEFAULT_SAHI,
+            sahi_overlap=rt.INFER_DEFAULT_SAHI_OVERLAP,
+            sahi_nms_iou=rt.INFER_DEFAULT_SAHI_NMS_IOU,
+            sahi_global_local_iou=rt.INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU,
+            sahi_skip_small=rt.INFER_DEFAULT_SAHI_SKIP_SMALL,
+            shard_index=None,
+            num_shards=1,
+            dry_run=False,
+            skip_important_artifacts=False,
+            selected_splits=None,
+            multi_output_root=None,
+        )
+        print(f"\n等价命令预览:\n  {build_det_cli_preview(args)}")
+        return confirm_args("det/eval", args)
+
     if task == "det" and action == "infer":
         experiment_dir = prompt_experiment_dir("det", rt.INFER_DEFAULT_EXPERIMENT_DIR)
-        mode = prompt_choice("请选择输入方式", [("dataset", "dataset 数据集评测模式"), ("image", "image 单张图片"), ("image_dir", "image_dir 文件夹批量推理")])
+        mode = prompt_choice("请选择输入方式", [("dataset", "dataset 数据集批量推理"), ("image", "image 单张图片"), ("image_dir", "image_dir 文件夹批量推理")])
         is_dataset_mode = mode == "dataset"
         data_path = (
             prompt_dataset_yaml(
@@ -2479,18 +2766,11 @@ def build_interactive_args() -> argparse.Namespace | None:
             save_txt=prompt_yes_no("是否保存 TXT 预测结果 --save-txt", False)
             if use_custom
             else False,
-            compute_metrics=is_dataset_mode,
-            metric_classwise=is_dataset_mode and (
-                prompt_yes_no("是否输出按类指标 --metric-classwise", False) if use_custom else False
-            ),
+            compute_metrics=False,
+            metric_classwise=False,
             report_iou_threshold=rt.INFER_DEFAULT_REPORT_IOU_THRESHOLD,
-            bad_class_map50_threshold=prompt_float(
-                "差类别 AP@0.5 阈值 --bad-class-map50-threshold",
-                rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD,
-            )
-            if use_custom
-            else rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD,
-            save_test_report=is_dataset_mode,
+            bad_class_map50_threshold=rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD,
+            save_test_report=False,
             report_path=None,
             overwrite=prompt_yes_no("输出目录非空时是否允许覆盖 --overwrite", False)
             if use_custom
@@ -2521,6 +2801,7 @@ def build_interactive_args() -> argparse.Namespace | None:
         optimize_candidates = _collect_optimize_analysis_candidates(source_data_yaml)
         selected_candidate = _prompt_optimize_report_json(source_data_yaml, optimize_candidates)
         report_json: Path | None = None
+        report_jsons: list[Path] | None = None
         infer_output_dir: Path | None = None
 
         optimize_experiment_dir: Path | None = None
@@ -2625,22 +2906,154 @@ def _devices_arg(value: str) -> int | str | list[int]:
     return int(raw)
 
 
+def _validate_ratio_text(value: object, *, field: str, allow_empty: bool = False) -> None:
+    text = str(value or "").strip()
+    if not text and allow_empty:
+        return
+    parts = [part for part in re.split(r"[\s/:,]+", text) if part]
+    if len(parts) != 3:
+        raise ValueError(f"{field} 必须包含三个比例值，示例 8:1:1。")
+    try:
+        values = [float(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError(f"{field} 必须包含三个数字。") from exc
+    if any(not math.isfinite(item) or item < 0 for item in values) or sum(values) <= 0:
+        raise ValueError(f"{field} 必须由非负有限数字组成，且总和大于 0。")
+
+
+def validate_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Validate normalized CLI and interactive arguments with one shared contract."""
+    unit_interval_fields = {
+        "threshold",
+        "score_threshold",
+        "report_iou_threshold",
+        "bad_class_map50_threshold",
+        "sahi_nms_iou",
+        "sahi_global_local_iou",
+        "good_class_threshold",
+        "threshold_percentile",
+        "iou_dup",
+        "iou_conflict",
+        "match_iou_threshold",
+        "low_conf_threshold",
+        "outlier_class_ap",
+        "confusion_threshold",
+    }
+    for field in unit_interval_fields:
+        value = getattr(args, field, None)
+        if value is None:
+            continue
+        number = float(value)
+        if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+            raise ValueError(f"--{field.replace('_', '-')} 必须位于 [0, 1]。")
+
+    overlap = getattr(args, "sahi_overlap", None)
+    if overlap is not None:
+        number = float(overlap)
+        if not math.isfinite(number) or not 0.0 <= number < 1.0:
+            raise ValueError("--sahi-overlap 必须位于 [0, 1)。")
+
+    balance_ratio = getattr(args, "balance_ratio", None)
+    if balance_ratio is not None:
+        number = float(balance_ratio)
+        if not math.isfinite(number) or (number != 0.0 and number < 1.0):
+            raise ValueError("--balance-ratio 必须为 0（自动）或大于等于 1。")
+
+    positive_fields = {"topk", "k", "cap", "num_shards"}
+    nonnegative_fields = {
+        "vis_max_images",
+        "target_total_images",
+        "min_class_images",
+        "min_class_boxes",
+        "min_class_instances",
+        "target_images_per_class",
+        "target_boxes_per_class",
+        "target_instances_per_class",
+        "max_boxes_per_image",
+        "max_boxes_per_class_per_image",
+        "max_instances_per_image",
+        "max_instances_per_class_per_image",
+        "max_images",
+        "dense_top_n",
+        "outlier_class_gt",
+        "image_threshold",
+    }
+    for field in positive_fields | nonnegative_fields:
+        value = getattr(args, field, None)
+        if value is None:
+            continue
+        minimum = 1 if field in positive_fields else 0
+        if int(value) < minimum:
+            relation = "大于 0" if minimum else "大于或等于 0"
+            raise ValueError(f"--{field.replace('_', '-')} 必须{relation}。")
+
+    for field in (
+        "box_density_penalty",
+        "instance_density_penalty",
+        "size_balance_weight",
+        "min_box_px",
+        "alpha",
+    ):
+        value = getattr(args, field, None)
+        if value is None:
+            continue
+        number = float(value)
+        if not math.isfinite(number) or number < 0:
+            raise ValueError(f"--{field.replace('_', '-')} 必须是非负有限数字。")
+
+    for field in ("steps", "batch_size"):
+        value = getattr(args, field, None)
+        if isinstance(value, int) and value <= 0:
+            raise ValueError(f"--{field.replace('_', '-')} 必须大于 0 或使用 auto。")
+    workers = getattr(args, "num_workers", None)
+    if isinstance(workers, int) and workers < 0:
+        raise ValueError("--num-workers 必须大于或等于 0，或使用 auto。")
+    devices = getattr(args, "devices", None)
+    device_ids = devices if isinstance(devices, list) else [devices]
+    if any(isinstance(device, int) and device < 0 for device in device_ids):
+        raise ValueError("--devices 中的 GPU 编号必须大于或等于 0。")
+
+    shard_index = getattr(args, "shard_index", None)
+    num_shards = int(getattr(args, "num_shards", 1) or 1)
+    if shard_index is not None and not 0 <= int(shard_index) < num_shards:
+        raise ValueError("--shard-index 必须位于 [0, num-shards)。")
+
+    for field in ("split_ratio",):
+        if hasattr(args, field):
+            _validate_ratio_text(getattr(args, field), field=f"--{field.replace('_', '-')}")
+    if hasattr(args, "size_ratio"):
+        _validate_ratio_text(
+            getattr(args, "size_ratio"), field="--size-ratio", allow_empty=True
+        )
+
+    for minimum_field, maximum_field in (
+        ("avg_boxes_per_image_min", "avg_boxes_per_image_max"),
+        ("avg_instances_per_image_min", "avg_instances_per_image_max"),
+    ):
+        minimum = getattr(args, minimum_field, None)
+        maximum = getattr(args, maximum_field, None)
+        if minimum is None or maximum is None:
+            continue
+        minimum_value = float(minimum)
+        maximum_value = float(maximum)
+        if any(not math.isfinite(item) or item < 0 for item in (minimum_value, maximum_value)):
+            raise ValueError("平均每图数量范围必须由非负有限数字组成。")
+        if maximum_value > 0 and minimum_value > maximum_value:
+            raise ValueError("平均每图数量最小值不能大于最大值。")
+    return args
+
+
 def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Thin multi-task launcher. Detection CLI is still supported.")
+    parser = argparse.ArgumentParser(
+        description="LightlyTrain 多任务训练、推理、评估与数据治理入口。"
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="发生错误时显示完整 traceback；可放在命令前，launcher 也兼容放在末尾。",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    convert_parser = subparsers.add_parser("convert")
-    convert_parser.add_argument("source_dir", type=str, help="待转换数据集目录名或路径")
-    convert_parser.add_argument("--output-name", type=str, default=None)
-    convert_parser.add_argument("--output-root", type=Path, default=None)
-    convert_parser.add_argument("--task", choices=("det", "cls", "seg", "all"), default="all")
-    convert_parser.add_argument("--label-format", choices=("auto", "labelme", "yolo"), default="auto")
-    convert_parser.add_argument("--seg-type", choices=("auto", "instance", "semantic"), default="auto")
-    convert_parser.add_argument("--class-ref", type=str, default=None, help="参考类别文件（data.yaml / classes.txt），输出使用其完整类别列表和 ID 映射")
-    convert_parser.add_argument("--seed", type=int, default=None)
-    convert_parser.add_argument("--dry-run", action="store_true", default=False)
-
-    train_parser = subparsers.add_parser("train")
+    train_parser = _add_command_parser(subparsers, "train")
     train_parser.add_argument("--task", choices=("cls", "det", "seg"), default="det")
     train_parser.add_argument(
         "--seg-train-type",
@@ -2660,15 +3073,15 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     train_parser.add_argument("--overwrite", action="store_true", default=False)
     train_parser.add_argument("--resume-interrupted", action="store_true", default=False)
 
-    infer_parser = subparsers.add_parser("infer")
+    infer_parser = _add_command_parser(subparsers, "infer")
     infer_parser.add_argument("--task", choices=("det", "cls", "seg"), default="det")
     infer_parser.add_argument(
         "--seg-train-type",
         choices=("instance", "semantic"),
-        default=rt.SEG_TRAIN_TYPE,
-        help="Only used when --task seg.",
+        default=None,
+        help="Only used when --task seg; inferred from the experiment when omitted.",
     )
-    infer_parser.add_argument("--experiment-dir", type=Path, default=rt.INFER_DEFAULT_EXPERIMENT_DIR)
+    infer_parser.add_argument("--experiment-dir", type=Path, default=None)
     infer_parser.add_argument("--checkpoint", type=Path, default=rt.INFER_DEFAULT_CHECKPOINT)
     infer_input = infer_parser.add_mutually_exclusive_group(required=False)
     infer_input.add_argument("--image", type=Path, default=rt.INFER_DEFAULT_IMAGE)
@@ -2723,41 +3136,64 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     infer_parser.add_argument("--shard-index", type=int, default=None, help=argparse.SUPPRESS)
     infer_parser.add_argument("--num-shards", type=int, default=1, help=argparse.SUPPRESS)
 
-    eval_parser = subparsers.add_parser("eval")
-    eval_parser.add_argument("--task", choices=("cls", "seg"), default="seg")
+    eval_parser = _add_command_parser(subparsers, "eval")
+    eval_parser.add_argument("--task", choices=("cls", "det", "seg"), default="seg")
     eval_parser.add_argument(
         "--seg-train-type",
         choices=("instance", "semantic"),
-        default=rt.SEG_TRAIN_TYPE,
-        help="Only used when --task seg.",
+        default=None,
+        help="Only used when --task seg; inferred from the experiment when omitted.",
     )
-    eval_parser.add_argument("--experiment-dir", type=Path, default=rt.INFER_DEFAULT_EXPERIMENT_DIR)
+    eval_parser.add_argument("--experiment-dir", type=Path, default=None)
     eval_parser.add_argument("--checkpoint", type=Path, default=rt.INFER_DEFAULT_CHECKPOINT)
     eval_parser.add_argument("--data", type=Path, default=None)
     eval_parser.add_argument("--test-dir", type=Path, default=None)
     eval_parser.add_argument(
         "--split",
         nargs="+",
-        choices=("train", "val", "test"),
+        choices=("train", "val", "test", "test+val", "all"),
         default=["test"],
-        help="可指定多个 split（语义分割支持一次评估多个，如 --split val test）。",
+        help="可指定多个 split，如 --split val test。",
     )
     eval_parser.add_argument("--output-dir", type=Path, default=None)
     eval_parser.add_argument("--threshold", type=float, default=None)
+    eval_parser.add_argument("--score-threshold", type=float, default=rt.INFER_DEFAULT_SCORE_THRESHOLD)
+    eval_parser.add_argument("--report-iou-threshold", type=float, default=rt.INFER_DEFAULT_REPORT_IOU_THRESHOLD)
+    eval_parser.add_argument(
+        "--bad-class-map50-threshold",
+        type=float,
+        default=rt.INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD,
+    )
+    eval_parser.add_argument("--report-path", type=Path, default=None)
     eval_parser.add_argument("--topk", type=int, default=1)
     eval_parser.add_argument("--classwise", action="store_true", default=False)
     eval_parser.add_argument("--device", type=str, default=rt.INFER_DEFAULT_DEVICE)
     eval_parser.add_argument("--overwrite", action="store_true", default=rt.INFER_DEFAULT_OVERWRITE)
     eval_parser.add_argument("--save-visualization", dest="save_visualization", action="store_true")
-    eval_parser.add_argument("--no-save-visualization", dest="save_visualization", action="store_false")
+    eval_parser.add_argument(
+        "--no-save-visualization", "--skip-visualization",
+        dest="save_visualization", action="store_false",
+    )
     eval_parser.set_defaults(save_visualization=True)
     eval_parser.add_argument(
         "--vis-max-images",
         dest="vis_max_images",
         type=int,
-        default=rt.SEG_EVAL_VIS_MAX_IMAGES,
-        help="seg 实例评估对比图最多出多少张（好/差各半，类别尽量全）；0=不限制、出全部。",
+        default=None,
+        help="评估对比图每个 split 最多出多少张；0=不限制。",
     )
+    eval_parser.add_argument("--sahi", action="store_true", default=rt.INFER_DEFAULT_SAHI)
+    eval_parser.add_argument("--sahi-overlap", dest="sahi_overlap", type=float, default=rt.INFER_DEFAULT_SAHI_OVERLAP)
+    eval_parser.add_argument("--sahi-nms-iou", dest="sahi_nms_iou", type=float, default=rt.INFER_DEFAULT_SAHI_NMS_IOU)
+    eval_parser.add_argument(
+        "--sahi-global-local-iou",
+        dest="sahi_global_local_iou",
+        type=float,
+        default=rt.INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU,
+    )
+    eval_parser.add_argument("--sahi-skip-small", dest="sahi_skip_small", action="store_true")
+    eval_parser.add_argument("--no-sahi-skip-small", dest="sahi_skip_small", action="store_false")
+    eval_parser.set_defaults(sahi_skip_small=rt.INFER_DEFAULT_SAHI_SKIP_SMALL)
     eval_parser.add_argument("--dry-run", action="store_true", default=False)
     eval_parser.add_argument("--skip-important-artifacts", action="store_true", default=False, help=argparse.SUPPRESS)
     eval_parser.add_argument("--selected-splits", type=str, default=None, help=argparse.SUPPRESS)
@@ -2765,7 +3201,7 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     eval_parser.add_argument("--shard-index", type=int, default=None, help=argparse.SUPPRESS)
     eval_parser.add_argument("--num-shards", type=int, default=1, help=argparse.SUPPRESS)
 
-    export_parser = subparsers.add_parser("export")
+    export_parser = _add_command_parser(subparsers, "export")
     export_parser.add_argument("--report-json", type=Path, default=None)
     export_parser.add_argument("--export-source-data", type=Path, default=rt.EXPORT_DEFAULT_SOURCE_DATA)
     export_parser.add_argument("--good-class-threshold", type=float, default=rt.EXPORT_DEFAULT_GOOD_CLASS_THRESHOLD)
@@ -2813,7 +3249,7 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     export_parser.add_argument("--avg-boxes-per-image-max", type=float, default=rt.EXPORT_DEFAULT_AVG_BOXES_PER_IMAGE_MAX)
     export_parser.add_argument("--export-suffix", type=str, default=rt.EXPORT_DEFAULT_EXPORT_SUFFIX)
 
-    seg_export_parser = subparsers.add_parser("seg-export")
+    seg_export_parser = _add_command_parser(subparsers, "seg-export")
     seg_export_parser.add_argument(
         "--seg-train-type",
         choices=("instance", "semantic"),
@@ -2892,16 +3328,19 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--export-suffix", type=str, default=rt.SEG_EXPORT_DEFAULT_EXPORT_SUFFIX
     )
 
-    # seg-eda: 语义分割 EDA
-    seg_eda_parser = subparsers.add_parser("seg-eda")
-    seg_eda_parser.add_argument("--data", type=Path, default=rt.SEMANTIC_SEG_DEFAULT_DATA)
+    # seg-eda: 自动识别语义分割 / 实例分割 EDA
+    seg_eda_parser = _add_command_parser(subparsers, "seg-eda")
+    seg_eda_parser.add_argument("--data", type=Path, default=None)
+    seg_eda_parser.add_argument(
+        "--seg-type", choices=("auto", "instance", "semantic"), default="auto"
+    )
     seg_eda_parser.add_argument("--output-dir", type=Path, default=None)
     seg_eda_parser.add_argument("--overwrite", action="store_true", default=False)
     seg_eda_parser.add_argument("--min-class-images", type=int, default=10)
     seg_eda_parser.add_argument("--threshold-percentile", type=float, default=0.9)
 
     # seg-curate: 语义分割交互式类别整理
-    seg_curate_parser = subparsers.add_parser("seg-curate")
+    seg_curate_parser = _add_command_parser(subparsers, "seg-curate")
     seg_curate_parser.add_argument("--data", type=Path, default=rt.SEMANTIC_SEG_DEFAULT_DATA)
     seg_curate_parser.add_argument("--eda-dir", type=Path, default=None)
     seg_curate_parser.add_argument("--drop-classes", type=str, default=None, help="逗号分隔的类别 ID")
@@ -2909,13 +3348,13 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     seg_curate_parser.add_argument("--export-suffix", type=str, default="__curated")
     seg_curate_parser.add_argument("--contiguous-ids", action="store_true", default=False, help="将保留类 ID 重映射为 0..K-1 连续编号（改写 mask 像素值）")
 
-    eda_parser = subparsers.add_parser("eda")
-    eda_parser.add_argument("--data", type=Path, default=rt.INFER_DEFAULT_DATA)
+    eda_parser = _add_command_parser(subparsers, "eda")
+    eda_parser.add_argument("--data", type=Path, default=None)
     eda_parser.add_argument("--output-dir", type=Path, default=None)
     eda_parser.add_argument("--overwrite", action="store_true", default=False)
 
     # review-sample 子命令
-    review_sample_parser = subparsers.add_parser("review-sample")
+    review_sample_parser = _add_command_parser(subparsers, "review-sample")
     review_sample_parser.add_argument("--data", type=Path, default=None)
     review_sample_parser.add_argument("--experiment-dir", type=Path, default=None)
     review_sample_parser.add_argument("--infer-output-dir", type=Path, default=None)
@@ -2956,23 +3395,34 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     review_sample_parser.add_argument("--no-embed-images", dest="embed_images", action="store_false")
     review_sample_parser.add_argument("--interactive", action="store_true", default=False)
 
-    report_parser = subparsers.add_parser("report")
+    report_parser = _add_command_parser(subparsers, "report")
     report_parser.add_argument("--experiment-dir", type=Path, default=None)
     report_parser.add_argument("--search", type=str, default=None)
     report_parser.add_argument("--output-dir", type=Path, default=None)
     report_parser.add_argument("--dry-run", action="store_true", default=False)
 
+    clean_parser = _add_command_parser(subparsers, "clean")
+    clean_mode = clean_parser.add_mutually_exclusive_group()
+    clean_mode.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="扫描并预览全部可清理内容（默认）。",
+    )
+    clean_mode.add_argument(
+        "--execute", dest="dry_run", action="store_false",
+        help="执行清理；同时需要 --yes。",
+    )
+    clean_parser.set_defaults(dry_run=True)
+    clean_parser.add_argument("--yes", action="store_true", help="确认执行全部计划项。")
+
+    optimize_parser = _add_command_parser(subparsers, "optimize")
+    optimize_parser.add_argument("--source-data", dest="source_data_yaml", type=Path, default=None)
+    optimize_parser.add_argument("--report-json", type=Path, action="append", default=None)
+    optimize_parser.add_argument("--infer-output-dir", type=Path, default=None)
+    optimize_parser.add_argument("--experiment-dir", dest="optimize_experiment_dir", type=Path, default=None)
+    optimize_parser.add_argument("--confusion-threshold", type=float, default=0.15)
+
+    _complete_parser_help(subparsers)
     args = parser.parse_args(argv)
-    if args.command == "convert":
-        if args.output_root is None:
-            args.output_name = args.output_name or Path(args.source_dir).name
-            args.output_root = (rt.ROOT_DIR / "datasets" / args.output_name).resolve()
-        else:
-            args.output_root = args.output_root.expanduser().resolve()
-            args.output_name = args.output_name or args.output_root.name
-        args.tool_task = "data"
-        args.tool_action = "convert"
-        return args
     if args.command == "train":
         from . import train_tools
 
@@ -2990,6 +3440,23 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.out_dir is None:
             args.out_dir = train_tools.build_default_out_dir(args.data_yaml, args.model)
         return args
+    if args.command == "clean":
+        args.tool_task = "clean"
+        args.tool_action = "clean"
+        args.analyses = None
+        if not args.dry_run and not args.yes:
+            raise ValueError("clean --execute 需要同时提供 --yes。")
+        return args
+    if args.command == "optimize":
+        args.tool_task = "det"
+        args.tool_action = "optimize"
+        if args.source_data_yaml is None:
+            args.source_data_yaml = Path(rt.EXPORT_DEFAULT_SOURCE_DATA)
+        reports = list(args.report_json or [])
+        args.report_json = reports[0] if reports else None
+        args.report_jsons = reports if len(reports) > 1 else None
+        args.auto_infer_temp_dir = None
+        return args
     if args.command == "seg-export":
         args.tool_task = "seg"
         args.tool_action = "export"
@@ -2998,7 +3465,7 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.tool_task = "seg"
         args.tool_action = "eda"
         if args.data is None:
-            args.data = rt.SEMANTIC_SEG_DEFAULT_DATA
+            args.data = _default_train_data_yaml("seg", rt.SEG_TRAIN_TYPE)
         return args
     if args.command == "seg-curate":
         args.tool_task = "seg"
@@ -3010,39 +3477,133 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.tool_task = args.task
         args.tool_action = "infer"
         if args.task == "seg":
-            if args.experiment_dir == rt.INFER_DEFAULT_EXPERIMENT_DIR:
-                args.experiment_dir = rt.SEG_DEFAULT_EXPERIMENT_DIR
+            if args.experiment_dir is None:
+                args.experiment_dir = rt.auto_resolve_experiment_dir(
+                    "seg", rt.SEG_DEFAULT_EXPERIMENT_DIR
+                )
+            if args.seg_train_type is None:
+                seg_experiment = (
+                    rt.experiment_dir_from_checkpoint_path(args.checkpoint)
+                    if args.checkpoint is not None
+                    else Path(args.experiment_dir)
+                )
+                args.seg_train_type = rt.experiment_seg_type(seg_experiment) or rt.SEG_TRAIN_TYPE
             if args.image is None and args.image_dir is None and args.data is None:
-                args.data = _default_train_data_yaml("seg", args.seg_train_type)
+                args.data = _default_train_data_yaml(
+                    "seg",
+                    args.seg_train_type,
+                    preferred_experiment_dir=Path(args.experiment_dir),
+                )
             args.threshold = args.threshold if args.threshold is not None else rt.DEFAULT_SEG_THRESHOLD
             if args.output_dir is None:
-                args.output_dir = Path(args.experiment_dir) / "infer"
+                input_path = args.data or args.image_dir or args.image
+                args.output_dir = rt.build_action_output_dir(
+                    Path(args.experiment_dir),
+                    "infer",
+                    input_path=input_path,
+                    split=args.split if args.data is not None else None,
+                )
         elif args.task == "cls":
-            if args.experiment_dir == rt.INFER_DEFAULT_EXPERIMENT_DIR:
-                args.experiment_dir = rt.EXPERIMENT_ROOT_DIR / "my_experiment_cls"
+            if args.experiment_dir is None:
+                args.experiment_dir = rt.auto_resolve_experiment_dir(
+                    "cls", rt.EXPERIMENT_ROOT_DIR / "my_experiment_cls"
+                )
             args.threshold = args.threshold if args.threshold is not None else rt.DEFAULT_CLS_THRESHOLD
             if args.output_dir is None:
                 args.output_dir = Path(args.experiment_dir) / "infer"
             if args.image is None and args.image_dir is None:
                 raise ValueError("cls infer requires --image or --image-dir.")
         else:
+            if args.experiment_dir is None:
+                args.experiment_dir = rt.auto_resolve_experiment_dir(
+                    "det", rt.INFER_DEFAULT_EXPERIMENT_DIR
+                )
             if args.image is None and args.image_dir is None and args.data is None:
-                args.data = rt.INFER_DEFAULT_DATA
+                args.data = _default_train_data_yaml(
+                    "det", preferred_experiment_dir=Path(args.experiment_dir)
+                )
+            if args.output_dir is None and rt.INFER_OUTPUT_DIR_CONFIGURED:
+                args.output_dir = Path(rt.INFER_DEFAULT_OUTPUT_DIR)
         return args
     if args.command == "eval":
         args.tool_task = args.task
         args.tool_action = "eval"
         if args.task == "seg":
-            if args.experiment_dir == rt.INFER_DEFAULT_EXPERIMENT_DIR:
-                args.experiment_dir = rt.SEG_DEFAULT_EXPERIMENT_DIR
+            if any(split in {"test+val", "all"} for split in args.split):
+                raise ValueError("seg eval 的 split 使用 train、val、test，可一次传入多个。")
+            if args.experiment_dir is None:
+                args.experiment_dir = rt.auto_resolve_experiment_dir(
+                    "seg", rt.SEG_DEFAULT_EXPERIMENT_DIR
+                )
+            if args.seg_train_type is None:
+                seg_experiment = (
+                    rt.experiment_dir_from_checkpoint_path(args.checkpoint)
+                    if args.checkpoint is not None
+                    else Path(args.experiment_dir)
+                )
+                args.seg_train_type = rt.experiment_seg_type(seg_experiment) or rt.SEG_TRAIN_TYPE
             if args.data is None:
-                args.data = _default_train_data_yaml("seg", args.seg_train_type)
+                args.data = _default_train_data_yaml(
+                    "seg",
+                    args.seg_train_type,
+                    preferred_experiment_dir=Path(args.experiment_dir),
+                )
             args.threshold = args.threshold if args.threshold is not None else rt.DEFAULT_SEG_THRESHOLD
+            args.vis_max_images = (
+                rt.SEG_EVAL_VIS_MAX_IMAGES
+                if args.vis_max_images is None
+                else args.vis_max_images
+            )
             if args.output_dir is None:
-                args.output_dir = Path(args.experiment_dir) / "eval"
+                args.output_dir = rt.build_action_output_dir(
+                    Path(args.experiment_dir),
+                    "eval",
+                    input_path=args.data,
+                    split=args.split,
+                )
+        elif args.task == "det":
+            if args.experiment_dir is None:
+                args.experiment_dir = rt.auto_resolve_experiment_dir(
+                    "det", rt.INFER_DEFAULT_EXPERIMENT_DIR
+                )
+            if args.data is None:
+                args.data = _default_train_data_yaml(
+                    "det", preferred_experiment_dir=Path(args.experiment_dir)
+                )
+            requested = list(args.split)
+            if len(requested) == 1:
+                args.split = requested[0]
+            elif set(requested) == {"test", "val"} and len(requested) == 2:
+                args.split = "test+val"
+            elif set(requested) == {"train", "test", "val"} and len(requested) == 3:
+                args.split = "all"
+            else:
+                raise ValueError(
+                    "det eval 的多 split 组合支持 val test 或 train val test。"
+                )
+            args.image = None
+            args.image_dir = None
+            args.metric_classwise = bool(args.classwise)
+            args.compute_metrics = True
+            args.save_test_report = True
+            args.save_json = False
+            args.save_txt = False
+            args.vis_max_images = (
+                rt.DET_EVAL_VIS_MAX_IMAGES
+                if args.vis_max_images is None
+                else args.vis_max_images
+            )
+            if args.vis_max_images < 0:
+                raise ValueError("det eval --vis-max-images 必须大于或等于 0。")
+            if args.output_dir is None and rt.EVAL_OUTPUT_DIR_CONFIGURED:
+                args.output_dir = Path(rt.EVAL_DEFAULT_OUTPUT_DIR)
+            if args.report_path is None and rt.EVAL_REPORT_PATH_CONFIGURED:
+                args.report_path = Path(rt.EVAL_DEFAULT_REPORT_PATH)
         else:
-            if args.experiment_dir == rt.INFER_DEFAULT_EXPERIMENT_DIR:
-                args.experiment_dir = rt.EXPERIMENT_ROOT_DIR / "my_experiment_cls"
+            if args.experiment_dir is None:
+                args.experiment_dir = rt.auto_resolve_experiment_dir(
+                    "cls", rt.EXPERIMENT_ROOT_DIR / "my_experiment_cls"
+                )
             if args.test_dir is None:
                 raise ValueError("cls eval requires --test-dir.")
             args.threshold = args.threshold if args.threshold is not None else rt.DEFAULT_CLS_THRESHOLD
@@ -3056,6 +3617,18 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.data is None:
             args.data = Path(rt.EXPORT_DEFAULT_SOURCE_DATA)
         return args
+
+    if args.command == "report" and args.experiment_dir is None:
+        candidates = list_experiment_dirs(task="det")
+        if args.search:
+            candidates = filter_dirs_by_keyword(candidates, args.search)
+        if not candidates:
+            detail = f"（关键字: {args.search}）" if args.search else ""
+            raise ValueError(f"未找到可生成报告的 det 实验目录{detail}。")
+        args.experiment_dir = candidates[0]
+
+    if args.command == "eda" and args.data is None:
+        args.data = _default_train_data_yaml("det")
 
     args.tool_task = "det"
     args.tool_action = args.command
@@ -3087,7 +3660,7 @@ def _prompt_review_sample_experiment_dir(data_path: Path) -> Path | None:
 
     # 过滤有推理结果的实验
     experiments_with_infer = []
-    for exp_dir in all_dirs[:20]:  # 只检查最近20个
+    for exp_dir in all_dirs:
         runs = discover_infer_runs(exp_dir)
         if runs:
             # 获取最新推理结果的摘要
@@ -3187,22 +3760,8 @@ def _prompt_review_sample_infer_run(experiment_dir: Path) -> tuple[Path | None, 
 
 
 def _auto_detect_datasets() -> list[Path]:
-    """自动检测datasets目录下的data.yaml文件"""
-    datasets_dir = rt.ROOT_DIR / "datasets"
-    if not datasets_dir.exists():
-        return []
-
-    data_yamls = []
-    for data_yaml in datasets_dir.rglob("data.yaml"):
-        # 过滤掉convert_datasets等非数据集目录
-        rel = data_yaml.relative_to(datasets_dir)
-        if "convert" in str(rel).lower() or "backup" in str(rel).lower():
-            continue
-        data_yamls.append(data_yaml)
-
-    # 按修改时间排序，最新的在前
-    data_yamls.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return data_yamls
+    """使用共享检测器列出目标检测数据集。"""
+    return list_dataset_yaml_candidates(task="det")
 
 
 def _auto_detect_experiment_with_infer() -> list[dict[str, Any]]:
@@ -3214,7 +3773,7 @@ def _auto_detect_experiment_with_infer() -> list[dict[str, Any]]:
         all_dirs = list_experiment_dirs()
 
     experiments_with_infer = []
-    for exp_dir in all_dirs[:30]:  # 检查最近30个
+    for exp_dir in all_dirs:
         runs = discover_infer_runs(exp_dir)
         if runs:
             latest_run = runs[0]

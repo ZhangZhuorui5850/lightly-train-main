@@ -10,18 +10,31 @@
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import objectseg_to_mvtec  # noqa: E402
 import seg_sample_browse  # noqa: E402
+from dataset_detector import choose_dataset  # noqa: E402
+from dataset_discovery import auto_datasets_root  # noqa: E402
 from output_naming import default_output_dir  # noqa: E402
 
 
-def run_generate(src: Path, out: Path, limit: int = 500, font_path: Path | None = None) -> int:
+def run_generate(
+    src: Path,
+    out: Path,
+    limit: int = 500,
+    font_path: Path | None = None,
+    *,
+    clean: bool = False,
+) -> int:
     """第1步:生成标注预览,并打印下一步该做什么。"""
-    n = seg_sample_browse.browse(src, out, limit=limit, font_path=font_path)
+    browse_kwargs = {"limit": limit, "font_path": font_path}
+    if clean:
+        browse_kwargs["clean"] = True
+    n = seg_sample_browse.browse(src, out, **browse_kwargs)
     print(
         f"\n[第1步完成] 生成了 {n} 张标注预览到:\n  {out}\n"
         "接下来(在你本地做):\n"
@@ -46,6 +59,16 @@ def _ask_path(prompt: str) -> Path:
     return Path(input(prompt).strip())
 
 
+def _choose_seg_source() -> Path | None:
+    candidate = choose_dataset(
+        auto_datasets_root(),
+        kinds={"yolo_instance"},
+        title="选择源 YOLO Seg 数据集",
+        include_unknown=True,
+    )
+    return candidate.path if candidate is not None else None
+
+
 def _ask_output_path(prompt: str, source: Path, operation: str) -> Path:
     default = default_output_dir(source, operation)
     raw = input(f"{prompt} [默认 {default}]: ").strip()
@@ -67,7 +90,12 @@ def _ask_yes(prompt: str) -> bool:
     return input(prompt).strip().lower() in ("y", "yes", "是")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="物体版 MVTec 两步交互向导"
+    )
+    parser.add_argument("--dry-run", action="store_true", help="完成交互选择并显示计划，保持零写入")
+    args = parser.parse_args(argv)
     print(
         "物体版 MVTec 向导(分两步):\n"
         "  1 = 生成标注预览(挑数据用)\n"
@@ -76,21 +104,42 @@ def main() -> None:
     try:
         choice = input("选择步骤 [1/2,回车取消]: ").strip()
         if choice == "1":
-            src = _ask_path("源 seg 数据集路径: ")
+            src = _choose_seg_source()
+            if src is None:
+                return 0
             out = _ask_output_path("预览输出目录", src, "sample-preview")
             limit = _ask_int("抽样张数(默认 500): ", 500)
-            run_generate(src, out, limit=limit)
+            clean = False
+            if out.is_dir() and any(out.iterdir()):
+                clean = _ask_yes(f"输出已有内容，原子替换 {out}？[y/N]: ")
+                if not clean:
+                    print("已取消。")
+                    return 0
+            if args.dry_run:
+                print(f"[dry-run] 生成预览: {src} -> {out}，limit={limit}")
+            else:
+                run_generate(src, out, limit=limit, clean=clean)
         elif choice == "2":
             staging = _ask_path("staging(物体文件夹根)路径: ")
-            src = _ask_path("源 seg 数据集路径: ")
+            src = _choose_seg_source()
+            if src is None:
+                return 0
             out = _ask_output_path("MVTec 输出目录", src, "to-mvtec-object")
             clean = _ask_yes(f"输出目录 {out} 若已存在且非空要先清空重建吗? [y/N]: ")
-            run_build(staging, src, out, clean=clean)
+            if args.dry_run:
+                print(f"[dry-run] 生成 MVTec: staging={staging}, src={src}, out={out}")
+            else:
+                run_build(staging, src, out, clean=clean)
         else:
             print("已取消。")
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         print("\n已取消。")
+        return 0
+    except KeyboardInterrupt:
+        print("\n已取消。")
+        return 130
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

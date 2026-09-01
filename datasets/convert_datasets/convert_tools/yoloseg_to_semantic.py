@@ -23,13 +23,15 @@ try:
         auto_datasets_root,
         class_names,
         dataset_root_from_config,
-        inspect_config_dataset,
-        label_dir_from_image_dir,
+        find_dataset_config,
         load_yaml,
-        scan_datasets,
-        split_image_dirs,
+        split_sample_files,
     )
+    from .dataset_detector import detect_datasets, inspect_dataset
     from .output_naming import default_output_dir
+    from .dataset_transaction import staged_output, validate_output_location
+    from .progress import tqdm
+    from .text_encoding import read_text_auto
 except ImportError:
     from dataset_discovery import (  # type: ignore[no-redef]
         IMAGE_EXTENSIONS,
@@ -37,13 +39,21 @@ except ImportError:
         auto_datasets_root,
         class_names,
         dataset_root_from_config,
-        inspect_config_dataset,
-        label_dir_from_image_dir,
+        find_dataset_config,
         load_yaml,
-        scan_datasets,
-        split_image_dirs,
+        split_sample_files,
+    )
+    from dataset_detector import (  # type: ignore[no-redef]
+        detect_datasets,
+        inspect_dataset,
     )
     from output_naming import default_output_dir  # type: ignore[no-redef]
+    from dataset_transaction import (  # type: ignore[no-redef]
+        staged_output,
+        validate_output_location,
+    )
+    from progress import tqdm  # type: ignore[no-redef]
+    from text_encoding import read_text_auto  # type: ignore[no-redef]
 
 
 @dataclass
@@ -65,12 +75,7 @@ class ConversionStats:
 
 def resolve_source(source: Path) -> tuple[Path, Path, dict]:
     source = source.expanduser().resolve()
-    config_path = source if source.is_file() else source / "data.yaml"
-    if not config_path.is_file():
-        fallback = source / "dataset.yaml"
-        config_path = fallback if fallback.is_file() else config_path
-    if not config_path.is_file():
-        raise FileNotFoundError(f"数据集配置不存在: {config_path}")
+    config_path = find_dataset_config(source)
     config = load_yaml(config_path)
     root = dataset_root_from_config(config_path, config)
     return root, config_path, config
@@ -185,7 +190,7 @@ def _read_polygons(
         return []
     polygons: list[tuple[int, list[tuple[int, int]]]] = []
     for line_number, raw in enumerate(
-        label_path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1
+        read_text_auto(label_path).splitlines(), start=1
     ):
         row = raw.strip()
         if not row:
@@ -211,7 +216,7 @@ def _read_polygons(
     return polygons
 
 
-def convert_dataset(
+def _convert_dataset_unpublished(
     source: Path,
     output: Path,
     *,
@@ -220,10 +225,10 @@ def convert_dataset(
     background_name: str = "background",
     overlap: str = "last",
     image_mode: str = "copy",
-    clean: bool = False,
+    report_output: Path | None = None,
 ) -> dict:
     root, config_path, config = resolve_source(source)
-    inspected = inspect_config_dataset(config_path)
+    inspected = inspect_dataset(config_path)
     if inspected.kind != "yolo_instance":
         raise ValueError(f"源数据集类型为 {inspected.kind}，需要 YOLO polygon 实例分割数据集")
     names = class_names(config, root)
@@ -238,27 +243,28 @@ def convert_dataset(
         raise ValueError(f"未知重叠策略: {overlap}")
 
     output = output.expanduser().resolve()
-    if output.exists() and clean:
-        shutil.rmtree(output)
-    if output.exists() and any(output.iterdir()):
-        raise FileExistsError(f"输出目录已有内容: {output}；使用 --clean 重新生成")
     output.mkdir(parents=True, exist_ok=True)
 
-    image_dirs = split_image_dirs(root, config)
-    if "train" not in image_dirs or "val" not in image_dirs:
+    samples_by_split = {
+        split: split_sample_files(root, config, split, annotation="labels")
+        for split in SPLITS
+    }
+    if not samples_by_split["train"] or not samples_by_split["val"]:
         raise ValueError("源数据集需要提供 train 和 val images split")
 
     issues: list[ConversionIssue] = []
     stats: dict[str, ConversionStats] = {}
     for split in SPLITS:
-        image_dir = image_dirs.get(split)
-        if image_dir is None:
+        split_samples = samples_by_split[split]
+        if not split_samples:
             continue
-        label_dir = label_dir_from_image_dir(image_dir, root, split)
         split_stats = ConversionStats()
         stats[split] = split_stats
-        for image_path in _image_files(image_dir):
-            label_path = label_dir / f"{image_path.stem}.txt"
+        for image_path, label_path, relative_path in tqdm(
+            split_samples,
+            desc=f"转换 {root.name}/{split}",
+            unit="图片",
+        ):
             with Image.open(image_path) as image:
                 width, height = image.size
             polygons = _read_polygons(
@@ -278,8 +284,11 @@ def convert_dataset(
                 background_id=background_id,
                 overlap=overlap,
             )
-            _transfer_file(image_path, output / "images" / split / image_path.name, image_mode)
-            _save_mask(mask, output / "masks" / split / f"{image_path.stem}.png")
+            _transfer_file(image_path, output / "images" / split / relative_path, image_mode)
+            _save_mask(
+                mask,
+                (output / "masks" / split / relative_path).with_suffix(".png"),
+            )
             split_stats.images += 1
             split_stats.polygons += len(polygons)
             if not polygons:
@@ -308,7 +317,7 @@ def convert_dataset(
     report = {
         "source": str(root),
         "source_config": str(config_path),
-        "output": str(output),
+        "output": str(report_output or output),
         "class_mapping": {str(key): value for key, value in class_mapping.items()},
         "background_id": background_id,
         "overlap": overlap,
@@ -322,8 +331,36 @@ def convert_dataset(
     return report
 
 
+def convert_dataset(
+    source: Path,
+    output: Path,
+    *,
+    background_id: int = 0,
+    class_offset: int = 1,
+    background_name: str = "background",
+    overlap: str = "last",
+    image_mode: str = "copy",
+    clean: bool = False,
+) -> dict:
+    """Convert into a validated staging tree and publish it atomically."""
+    source_root, _, _ = resolve_source(source)
+    published_output = validate_output_location(output, [source_root])
+    with staged_output(published_output, clean=clean) as stage:
+        report = _convert_dataset_unpublished(
+            source,
+            stage,
+            background_id=background_id,
+            class_offset=class_offset,
+            background_name=background_name,
+            overlap=overlap,
+            image_mode=image_mode,
+            report_output=published_output,
+        )
+    return report
+
+
 def _choose_source(search_root: Path) -> Path | None:
-    candidates = [item for item in scan_datasets(search_root) if item.kind == "yolo_instance"]
+    candidates = detect_datasets(search_root, kinds={"yolo_instance"})
     if not candidates:
         print(f"在 {search_root} 下没有检索到 YOLO 实例分割数据集。")
         return None
@@ -346,7 +383,8 @@ def _choose_source(search_root: Path) -> Path | None:
         if raw.lower() in {"q", "quit", "exit"}:
             return None
         if raw.isdigit() and 1 <= int(raw) <= len(candidates):
-            return candidates[int(raw) - 1].path
+            candidate = candidates[int(raw) - 1]
+            return candidate.config_path or candidate.path
         print("请输入列表中的序号。")
 
 
@@ -370,6 +408,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--image-mode", choices=("copy", "hardlink", "symlink"), default="copy"
     )
     parser.add_argument("--clean", action="store_true", help="清理已有输出后重新生成")
+    parser.add_argument("--dry-run", action="store_true", help="只验证输入并显示输出计划，保持零写入")
     return parser.parse_args(argv)
 
 
@@ -390,6 +429,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if raw:
             output = Path(raw)
+    output = validate_output_location(output, [source_root])
+    if args.dry_run:
+        print("[dry-run] YOLO Seg → PNG Semantic")
+        print(f"  输入: {source_root}")
+        print(f"  输出: {output}")
+        print(f"  overlap={args.overlap}, image_mode={args.image_mode}, class_offset={args.class_offset}")
+        return 0
     report = convert_dataset(
         source,
         output,

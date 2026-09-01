@@ -84,6 +84,28 @@ def test_size_aware_selection_moves_ratio_toward_target():
     assert summary["selection_algorithm"] == "size_aware_greedy"
 
 
+def test_balanced_selection_always_emits_terminal_progress_event():
+    candidate = _cand("only", {0: 1})
+    events: list[tuple[int, int, str]] = []
+
+    select_balanced_train_candidates(
+        candidates=[candidate],
+        kept_class_ids=[0],
+        target_total_images=1,
+        target_boxes_per_class=1,
+        balance_ratio=1.0,
+        target_images_per_class=1,
+        box_density_penalty=0.0,
+        progress_callback=lambda current, total, detail: events.append(
+            (current, total, detail)
+        ),
+    )
+
+    assert events
+    assert events[-1][0] == events[-1][1]
+    assert "phase=complete" in events[-1][2]
+
+
 def test_size_ratio_off_uses_legacy_celf():
     c = _cand("a", {0: 2})
     selected, summary = select_balanced_train_candidates(

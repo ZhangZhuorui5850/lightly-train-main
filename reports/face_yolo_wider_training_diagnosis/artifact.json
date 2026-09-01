@@ -1,0 +1,187 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "WIDER 人脸检测本机训练诊断",
+    "description": "基于 face_yolo_wider 数据分布、当前评估截图、模型查询容量和 RTX 4060 实测日志的训练决策报告。",
+    "generatedAt": "2026-08-31T00:00:00+08:00",
+    "charts": [
+      {
+        "id": "size_mix_chart",
+        "title": "640 输入下的目标尺寸构成",
+        "subtitle": "三个 split 均由 small 目标主导，test 的 small 占比最高",
+        "type": "stackedBar100",
+        "dataset": "size_distribution",
+        "sourceId": "size_profile_sql",
+        "valueFormat": "number",
+        "unit": "%",
+        "encodings": {
+          "x": {"field": "split", "type": "nominal", "label": "Split"},
+          "y": {"field": "box_share_pct", "type": "quantitative", "label": "框占比", "unit": "%"},
+          "color": {"field": "size_class", "type": "nominal", "label": "尺寸"},
+          "tooltip": [
+            {"field": "total_boxes", "type": "quantitative", "label": "标注框数"},
+            {"field": "total_images", "type": "quantitative", "label": "图片数"}
+          ]
+        },
+        "layout": "full"
+      }
+    ],
+    "tables": [
+      {
+        "id": "local_training_plan",
+        "title": "RTX 4060 训练预算",
+        "subtitle": "batch_size=2、自动梯度累积到有效 batch 16；时间含验证开销的保守区间",
+        "dataset": "training_plan",
+        "sourceId": "training_plan_sql",
+        "density": "spacious",
+        "layout": "full",
+        "defaultSort": {"field": "run_order", "direction": "asc"},
+        "columns": [
+          {"field": "experiment", "label": "阶段", "type": "text"},
+          {"field": "steps", "label": "Steps", "type": "number"},
+          {"field": "effective_epochs", "label": "有效 Epoch", "type": "number"},
+          {"field": "hours_low", "label": "预计最短", "type": "number", "unit": "小时"},
+          {"field": "hours_high", "label": "预计最长", "type": "number", "unit": "小时"},
+          {"field": "decision_rule", "label": "用途", "type": "text"},
+          {"field": "run_order", "label": "顺序", "type": "number"}
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "size_profile_sql",
+        "label": "face_yolo_wider 标签尺寸审计",
+        "path": "reports/face_yolo_wider_training_diagnosis/size_distribution.sql"
+      },
+      {
+        "id": "training_plan_sql",
+        "label": "RTX 4060 训练预算换算",
+        "path": "reports/face_yolo_wider_training_diagnosis/training_plan.sql"
+      },
+      {
+        "id": "dataset_config",
+        "label": "face_yolo_wider 数据配置",
+        "path": "datasets/face_yolo_wider/data.yaml"
+      },
+      {
+        "id": "local_benchmark",
+        "label": "RTX 4060 DINOv3 ViT-S/16 训练日志",
+        "path": "out/0428/0428-neu-vits16/train.log"
+      },
+      {
+        "id": "training_runtime",
+        "label": "LightlyTrain 训练与梯度累积实现",
+        "path": "src/lightly_train/_commands/train_task.py"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# WIDER 人脸检测本机训练诊断"
+      },
+      {
+        "id": "executive_summary",
+        "type": "markdown",
+        "body": "## Executive Summary\n\n- **先跑 3,000 step 校准，再跑 20,000 step 本机基线。** RTX 4060 8GB 建议 `batch_size=2`，LightlyTrain 会自动累积 8 次，形成有效 batch 16。3,000 step 约 4–6 小时，20,000 step 约 26–38 小时。\n- **当前低指标主要集中在极小人脸。** test 的 AP_small 为 0.1608，而 AP_medium 和 AP_large 分别达到 0.5901、0.7253。数据审计显示 test 中 84.0% 的框属于 small，40.8% 的人脸在 640 输入下短边小于 8 像素。\n- **test 天然比 val 更难。** test 的 small 占比、极小框占比、每图框数和拥挤图片比例都更高，这与截图中 test mAP 0.2835 低于 val mAP 0.3290 的方向一致。\n- **交互式 epoch 换算存在训练量放大风险。** `batch_size=2` 时界面会按物理 batch 换算 step，而训练器按有效 batch 16 更新参数。当前版本输入 200 epoch 会得到约 128.8 万 step，相当于约 1,600 个有效 epoch。现阶段直接使用 step 模式。"
+      },
+      {
+        "id": "dataset_driver",
+        "type": "markdown",
+        "body": "## 低指标由小目标占比主导\n\n数据集共有 16,094 张图片和 196,080 个有效标注框，缺失标签、空标签和非法框均为 0。640×640 输入下，train、val、test 的 small 框占比分别为 81.4%、79.0%、84.0%。test 的人脸短边中位数约 9.4 像素，72.1% 小于 16 像素。\n\n这组分布解释了当前指标结构：中大目标已经具备较好检测能力，主要损失来自极小目标的分类置信度和框定位。AP50 0.5403 与 AP75 0.2645 的明显差距也符合小框对几像素定位误差高度敏感的特征。",
+        "sourceId": "size_profile_sql"
+      },
+      {
+        "id": "size_chart_intro",
+        "type": "markdown",
+        "body": "## test 集拥有最重的小目标负担\n\n图中比较三个 split 在同一 640 输入尺度下的目标构成。test 的 small 占比最高，medium 和 large 占比最低，因此总 mAP 与 val 之间的差距具有清晰的数据分布基础。"
+      },
+      {"id": "size_chart", "type": "chart", "chartId": "size_mix_chart"},
+      {
+        "id": "density_driver",
+        "type": "markdown",
+        "body": "## 密集场景同时触发 300-query 容量瓶颈\n\ntest 平均每图 14.16 个框，14.6% 的图片至少包含 20 张脸。共有 9 张 test 图片超过模型的 300 query 上限，超出部分合计 1,415 个框，占全部 test 标注的 6.19%。这些目标在全图推理中受到输出容量约束。\n\nSAHI 只改变推理视野，训练仍使用全图尺度；WIDER 常见图片宽度约 1,024 像素，640 切片带来的线性放大通常约 1.6 倍。推理切片的增益会受到训练尺度、置信度、切片融合和密集重叠共同影响。"
+      },
+      {
+        "id": "training_recommendation",
+        "type": "markdown",
+        "body": "## 用一天级实验定位训练问题\n\n1. 使用 `step` 模式、`batch_size=2`、640 输入和当前 DINOv3 ViT-S/16 系列模型，先训练 3,000 step。确认显存、每 step 时间、train loss、val mAP 和 AP_small 都能正常记录。\n2. 训练推进到 20,000 step，约等于 24.8 个有效 epoch。每 1,000 step 的验证曲线足以判断欠拟合、平台期和过拟合。\n3. 仅在 20,000 step 时 AP_small 仍持续上升时续训到 30,000 step。曲线进入平台后，把计算预算转向训练切片或 800 输入实验。\n4. 训练切片优先覆盖短边小于 16 像素及单图超过 100 张脸的样本。该策略同时放大小脸、降低单 tile 的目标密度，并缓解 300-query 容量压力。"
+      },
+      {"id": "training_plan_table", "type": "table", "tableId": "local_training_plan"},
+      {
+        "id": "decision_metrics",
+        "type": "markdown",
+        "body": "## 每次实验只比较四组结果\n\n固定同一 train/val/test 划分、随机种子和评估阈值，记录 `mAP50:95`、`AP_small`、`AR_small`，再按人脸短边 `<8`、`8–16`、`16–32`、`≥32` 像素统计召回率。训练优化以 AP_small 和 AR_small 为主，总 mAP 作为整体护栏。\n\n最有信息量的对照依次是：640 全图基线、640 训练切片、800 输入。模型结构切换放在这三组完成之后。"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## 仍需由本机实验回答的问题\n\n- 20,000 step 前 AP_small 是否持续上升；这决定延长训练的价值。\n- 低阈值下 tiny-face recall 是否明显提高；这能区分置信度问题与表征/定位问题。\n- 训练切片是否同时提升 `<8` 和 `8–16` 像素两组召回；这能验证尺度是否为主导瓶颈。\n- 当前服务器模型的完整训练曲线是否出现平台或回落；该证据决定 200 epoch 是否已经过量。"
+      },
+      {
+        "id": "caveats",
+        "type": "markdown",
+        "body": "## 口径与假设\n\n当前 mAP 数值来自用户提供的评估截图，本机缺少该服务器 checkpoint 和对应 event 文件，因此训练阶段的欠拟合或过拟合状态仍待曲线验证。耗时基准来自本机 RTX 4060 上 DINOv3 ViT-S/16、640 输入、batch 2 的实测 4.29 秒/优化 step；ViT-S/16 Plus 与密集 WIDER 标签会增加耗时，报告采用了保守区间。尺寸统计按验证阶段 640×640 resize 后的 YOLO 归一化框计算。"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-31T00:00:00+08:00",
+    "status": "ready",
+    "datasets": {
+      "size_distribution": [
+        {"split": "train", "size_class": "small", "box_share_pct": 81.4, "total_boxes": 156219, "total_images": 12883},
+        {"split": "train", "size_class": "medium", "box_share_pct": 15.4, "total_boxes": 156219, "total_images": 12883},
+        {"split": "train", "size_class": "large", "box_share_pct": 3.2, "total_boxes": 156219, "total_images": 12883},
+        {"split": "val", "size_class": "small", "box_share_pct": 79.0, "total_boxes": 16995, "total_images": 1596},
+        {"split": "val", "size_class": "medium", "box_share_pct": 17.3, "total_boxes": 16995, "total_images": 1596},
+        {"split": "val", "size_class": "large", "box_share_pct": 3.7, "total_boxes": 16995, "total_images": 1596},
+        {"split": "test", "size_class": "small", "box_share_pct": 84.0, "total_boxes": 22866, "total_images": 1615},
+        {"split": "test", "size_class": "medium", "box_share_pct": 13.4, "total_boxes": 22866, "total_images": 1615},
+        {"split": "test", "size_class": "large", "box_share_pct": 2.6, "total_boxes": 22866, "total_images": 1615}
+      ],
+      "training_plan": [
+        {"run_order": 1, "experiment": "速度校准", "steps": 3000, "effective_epochs": 3.7, "hours_low": 4, "hours_high": 6, "decision_rule": "确认显存、step time、loss 和 mAP 能正常变化"},
+        {"run_order": 2, "experiment": "本机基线", "steps": 20000, "effective_epochs": 24.8, "hours_low": 26, "hours_high": 38, "decision_rule": "形成可信的 640 基线"},
+        {"run_order": 3, "experiment": "延长基线", "steps": 30000, "effective_epochs": 37.3, "hours_low": 39, "hours_high": 56, "decision_rule": "仅在 20k 时 AP_small 仍持续上升时续训"},
+        {"run_order": 4, "experiment": "200 有效 epoch", "steps": 161200, "effective_epochs": 200.0, "hours_low": 216, "hours_high": 312, "decision_rule": "本机约 9–13 天，优先留给服务器"}
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "size_profile_sql",
+      "label": "face_yolo_wider 标签尺寸审计",
+      "path": "reports/face_yolo_wider_training_diagnosis/size_distribution.sql",
+      "query": {
+        "engine": "SQL VALUES",
+        "language": "sql",
+        "sql": "SELECT * FROM (VALUES ('train', 'small', 81.4, 156219, 12883), ('train', 'medium', 15.4, 156219, 12883), ('train', 'large', 3.2, 156219, 12883), ('val', 'small', 79.0, 16995, 1596), ('val', 'medium', 17.3, 16995, 1596), ('val', 'large', 3.7, 16995, 1596), ('test', 'small', 84.0, 22866, 1615), ('test', 'medium', 13.4, 22866, 1615), ('test', 'large', 2.6, 22866, 1615)) AS profile(split, size_class, box_share_pct, total_boxes, total_images)",
+        "description": "汇总三个 split 在 640 输入下的 COCO 尺寸构成。",
+        "executed_at": "2026-08-31T00:00:00+08:00",
+        "filters": ["YOLO class=0", "归一化框中心位于 [0,1]", "框宽高位于 (0,1]", "输入尺度 640×640"],
+        "metric_definitions": ["small: resize 后框面积 < 32²", "medium: 32² ≤ 面积 < 96²", "large: 面积 ≥ 96²"]
+      }
+    },
+    {
+      "id": "training_plan_sql",
+      "label": "RTX 4060 训练预算换算",
+      "path": "reports/face_yolo_wider_training_diagnosis/training_plan.sql",
+      "query": {
+        "engine": "SQL VALUES",
+        "language": "sql",
+        "sql": "SELECT * FROM (VALUES (1, '速度校准', 3000, 3.7, 4, 6, '确认显存、step time、loss 和 mAP 能正常变化'), (2, '本机基线', 20000, 24.8, 26, 38, '形成可信的 640 基线'), (3, '延长基线', 30000, 37.3, 39, 56, '仅在 20k 时 AP_small 仍持续上升时续训'), (4, '200 有效 epoch', 161200, 200.0, 216, 312, '本机约 9–13 天，优先留给服务器')) AS plan(run_order, experiment, steps, effective_epochs, hours_low, hours_high, decision_rule)",
+        "description": "按有效 batch 16、训练集 12,883 张和本机 step time 估算训练预算。",
+        "executed_at": "2026-08-31T00:00:00+08:00",
+        "filters": ["RTX 4060 Laptop 8GB", "物理 batch 2", "自动梯度累积 8", "含周期性验证开销"],
+        "metric_definitions": ["有效 epoch = steps × 16 ÷ 12,883", "时间区间以本机 4.29 秒/step 为下界并为 ViT-S/16 Plus、密集目标和验证预留余量"]
+      }
+    },
+    {"id": "dataset_config", "label": "face_yolo_wider 数据配置", "path": "datasets/face_yolo_wider/data.yaml"},
+    {"id": "local_benchmark", "label": "RTX 4060 DINOv3 ViT-S/16 训练日志", "path": "out/0428/0428-neu-vits16/train.log"},
+    {"id": "training_runtime", "label": "LightlyTrain 训练与梯度累积实现", "path": "src/lightly_train/_commands/train_task.py"}
+  ]
+}

@@ -211,6 +211,15 @@ def test_list_image_filenames__symlink(tmp_path: Path) -> None:
     )
 
 
+def test_list_image_filenames__symlink_cycle_is_pruned(tmp_path: Path) -> None:
+    helpers.create_images(image_dir=tmp_path, files=["image.jpg"])
+    (tmp_path / "loop").symlink_to(tmp_path, target_is_directory=True)
+
+    filenames = list(file_helpers.list_image_filenames_from_dir(image_dir=tmp_path))
+
+    assert filenames == ["image.jpg"]
+
+
 @pytest.mark.parametrize(
     ("extension", "expected_backend", "dtype", "num_channels", "pil_mode"),
     [

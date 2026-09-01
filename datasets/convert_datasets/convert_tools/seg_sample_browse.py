@@ -15,19 +15,23 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from yoloseg_to_mvtec import IMG_EXTS, SPLITS, load_names, parse_label  # noqa: E402
+from dataset_transaction import staged_output, validate_output_location  # noqa: E402
+from progress import tqdm  # noqa: E402
 
 try:
     from PIL import Image, ImageDraw, ImageFont
 except ModuleNotFoundError as e:  # pragma: no cover
-    sys.exit(
-        f"\n[依赖缺失] 找不到模块 '{e.name}'(需要 Pillow)。\n"
-        "请先: conda activate lightlytrain  然后重试。\n"
-        f"(当前 Python: {sys.executable})\n"
-    )
+    if not any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+        sys.exit(
+            f"\n[依赖缺失] 找不到模块 '{e.name}'(需要 Pillow)。\n"
+            "请先: conda activate lightlytrain  然后重试。\n"
+            f"(当前 Python: {sys.executable})\n"
+        )
 
 # 仓库自带中文字体:<repo>/tool_lib/msyh.ttc
 _DEFAULT_FONT = Path(__file__).resolve().parents[3] / "tool_lib" / "msyh.ttc"
@@ -63,13 +67,6 @@ def _text_size(draw, text: str, font) -> tuple[int, int]:
     """量文字像素宽高(用 textbbox,兼容新版 PIL)。"""
     left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
     return max(0, right - left), max(0, bottom - top)
-
-
-try:
-    from tqdm import tqdm
-except ModuleNotFoundError:  # pragma: no cover
-    def tqdm(it, **_kw):
-        return it
 
 
 def _render_panel(stem: str, split: str, polys: list, names: list[str],
@@ -155,11 +152,15 @@ def _find_image(src: Path, split: str, stem: str) -> Path | None:
     return None
 
 
-def browse(src: Path, out: Path, limit: int = 500, font_path: Path | None = None) -> int:
+def _browse_unpublished(
+    src: Path,
+    out: Path,
+    *,
+    limit: int,
+    font_path: Path | None,
+) -> int:
     """抽样最多 limit 张,生成标注预览 png + sample_index.csv。返回成功渲染的张数。"""
-    src, out = src.resolve(), out.resolve()
     names = load_names(src)
-    out.mkdir(parents=True, exist_ok=True)
 
     tasks: list[tuple[str, Path]] = []
     for split in SPLITS:
@@ -167,6 +168,12 @@ def browse(src: Path, out: Path, limit: int = 500, font_path: Path | None = None
         if lbl_dir.exists():
             tasks += [(split, txt) for txt in sorted(lbl_dir.glob("*.txt"))]
     tasks = tasks[:limit]
+    stem_counts = Counter(txt.stem for _, txt in tasks)
+    duplicates = sorted(stem for stem, count in stem_counts.items() if count > 1)
+    if duplicates:
+        raise ValueError(
+            f"抽样范围内存在跨 split 重名 stem: {duplicates[:10]}"
+        )
 
     rows: list[dict[str, str]] = []
     for split, txt in tqdm(tasks, desc="标注抽样", unit="img", dynamic_ncols=True, leave=False):
@@ -194,6 +201,28 @@ def browse(src: Path, out: Path, limit: int = 500, font_path: Path | None = None
     return len(rows)
 
 
+def browse(
+    src: Path,
+    out: Path,
+    limit: int = 500,
+    font_path: Path | None = None,
+    *,
+    clean: bool = False,
+) -> int:
+    """抽样生成预览，并原子发布完整输出目录。"""
+    if limit <= 0:
+        raise ValueError("limit 需要大于 0")
+    source = src.expanduser().resolve()
+    published_out = validate_output_location(out, [source])
+    with staged_output(published_out, clean=clean) as stage:
+        return _browse_unpublished(
+            source,
+            stage,
+            limit=limit,
+            font_path=font_path,
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="抽样生成带标注的预览图,帮人归纳有哪些物体")
     ap.add_argument("--src", required=True, type=Path, help="YOLO-seg 源数据集")
@@ -201,8 +230,15 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=500, help="最多抽样张数(默认 500)")
     ap.add_argument("--font", type=Path, default=None,
                     help="中文 TTF 字体路径(默认用仓库自带 tool_lib/msyh.ttc)")
+    ap.add_argument("--clean", action="store_true", help="安全替换已有预览输出")
     args = ap.parse_args()
-    n = browse(args.src, args.out, limit=args.limit, font_path=args.font)
+    n = browse(
+        args.src,
+        args.out,
+        limit=args.limit,
+        font_path=args.font,
+        clean=args.clean,
+    )
     print(f"\n生成 {n} 张标注预览到 {args.out};"
           f"看图 + sample_index.csv 归纳物体,再建 staging/<物体>/ 分图。")
 

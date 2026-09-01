@@ -28,9 +28,11 @@ def _collect_experiment_mtimes() -> dict[Path, float]:
     if not rt.EXPERIMENT_ROOT_DIR.exists():
         return {}
     mtimes: dict[Path, float] = {}
-    for path in rt.EXPERIMENT_ROOT_DIR.rglob("*"):
-        if not rt.is_experiment_dir(path):
-            continue
+    for path in rt.discover_recent_experiment_dirs(
+        None,
+        limit=None,
+        require_checkpoint=False,
+    ):
         resolved_path = path.resolve()
         mtimes[resolved_path] = resolved_path.stat().st_mtime
     return mtimes

@@ -11,14 +11,18 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from . import dataset_adapter
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -40,8 +44,16 @@ else:
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT_DIR / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+
+
+def _prioritize_repo_source() -> None:
+    """Keep the repository fork ahead of environment-installed packages."""
+    source = str(SRC_DIR)
+    sys.path[:] = [entry for entry in sys.path if entry != source]
+    sys.path.insert(0, source)
+
+
+_prioritize_repo_source()
 
 lightly_train: ModuleType | None = None
 np: ModuleType | None = None
@@ -64,6 +76,7 @@ EDA_OUTPUT_ROOT_DIR = OUT_DIR / "EDA"
 ALL_REPORT_ROOT_DIR = OUT_DIR / "all_report"
 REPORT_ARCHIVE_ROOT_DIR = OUT_DIR / "test_reports"
 DATASET_DIR = ROOT_DIR / "datasets" / "military_dataset" / "dataset_det"
+DATASET_SEARCH_ROOTS: list[Path] = []
 EXPERIMENT_DIR = OUT_DIR / "my_experiment_det_0402"
 
 DEFAULT_CHECKPOINT = None
@@ -72,6 +85,8 @@ DEFAULT_OVERWRITE = False
 DEFAULT_CLS_THRESHOLD = 0.5
 DEFAULT_SEG_THRESHOLD = 0.8
 DEFAULT_SCORE_THRESHOLD = 0.3
+# det eval 每个 split 默认抽样输出的对比图数量；0 表示关闭数量限制。
+DET_EVAL_VIS_MAX_IMAGES = 50
 # seg eval 对比图默认最多出多少张（好/差各半，类别尽量全）；0 表示不限制、出全部。
 SEG_EVAL_VIS_MAX_IMAGES = 100
 
@@ -84,6 +99,7 @@ SEG_DEFAULT_EXPERIMENT_DIR = EXPERIMENT_ROOT_DIR / "my_experiment_seg"
 INFER_DEFAULT_IMAGE = None
 INFER_DEFAULT_IMAGE_DIR = DATASET_DIR / "images" / "test"
 INFER_DEFAULT_OUTPUT_DIR = EXPERIMENT_DIR / "infer-test"
+INFER_OUTPUT_DIR_CONFIGURED = False
 INFER_DEFAULT_DATA = DATASET_DIR / "data.yaml"
 INFER_DEFAULT_SPLIT = "test"
 
@@ -99,7 +115,7 @@ INFER_DEFAULT_REPORT_IOU_THRESHOLD = 0.5
 INFER_DEFAULT_BAD_CLASS_MAP50_THRESHOLD = 0.3
 INFER_DEFAULT_COMPUTE_METRICS = False
 INFER_DEFAULT_METRIC_CLASSWISE = False
-INFER_DEFAULT_SAVE_TEST_REPORT = True
+INFER_DEFAULT_SAVE_TEST_REPORT = False
 INFER_DEFAULT_REPORT_PATH = INFER_DEFAULT_OUTPUT_DIR / "test_report.json"
 
 # SAHI 切片推理默认参数（仅 infer --sahi 时生效）
@@ -111,8 +127,10 @@ INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU = 0.1
 INFER_DEFAULT_SAHI_SKIP_SMALL = True
 
 EVAL_DEFAULT_DATA = DATASET_DIR / "data.yaml"
-EVAL_DEFAULT_OUTPUT_DIR = EXPERIMENT_DIR / "infer-test"
+EVAL_DEFAULT_OUTPUT_DIR = EXPERIMENT_DIR / "eval-test"
 EVAL_DEFAULT_REPORT_PATH = EVAL_DEFAULT_OUTPUT_DIR / "test_report.json"
+EVAL_OUTPUT_DIR_CONFIGURED = False
+EVAL_REPORT_PATH_CONFIGURED = False
 
 EXPORT_DEFAULT_REPORT_JSON = EVAL_DEFAULT_REPORT_PATH
 EXPORT_DEFAULT_SOURCE_DATA = EVAL_DEFAULT_DATA
@@ -173,6 +191,25 @@ TASK_NAME_MARKERS = {
     "seg": ("seg",),
 }
 
+TASK_VALUE_ALIASES = {
+    "cls": "cls",
+    "classify": "cls",
+    "classification": "cls",
+    "image_classification": "cls",
+    "det": "det",
+    "detect": "det",
+    "detection": "det",
+    "object_detection": "det",
+    "seg": "seg",
+    "segment": "seg",
+    "semantic": "seg",
+    "semantic_segmentation": "seg",
+    "instance": "seg",
+    "instance_segmentation": "seg",
+}
+EXPERIMENT_ARTIFACT_DIRNAMES = ("exported_models", "checkpoints")
+EXPERIMENT_EXCLUDED_TOP_LEVEL = {"eda", "all_report", "test_reports"}
+
 TRAINING_CURVE_FILENAMES = {
     "loss": "training_curve_loss.png",
     "map": "training_curve_map.png",
@@ -183,6 +220,11 @@ IMPORTANT_ARTIFACT_DIRNAME = "important"
 TRAINING_TEMP_DIRNAME = "_temp"
 INFER_TEMP_DIRNAME = "_tempfile"
 TENSORBOARD_EVENT_GLOB = "events.out.tfevents.*"
+EXPERIMENT_INTERNAL_DIRNAMES = {
+    IMPORTANT_ARTIFACT_DIRNAME,
+    TRAINING_TEMP_DIRNAME,
+    INFER_TEMP_DIRNAME,
+}
 
 
 @dataclass
@@ -193,75 +235,204 @@ class ImageSample:
 
 
 def experiment_checkpoint_candidates(experiment_dir: Path) -> list[Path]:
-    return [
+    from .file_index import find_files
+
+    experiment_dir = experiment_dir.expanduser().resolve()
+    preferred = [
         experiment_dir / "exported_models" / "exported_best.pt",
         experiment_dir / "exported_models" / "exported_last.pt",
         experiment_dir / "checkpoints" / "best.ckpt",
         experiment_dir / "checkpoints" / "last.ckpt",
     ]
+    discovered: list[Path] = []
+    for dirname in EXPERIMENT_ARTIFACT_DIRNAMES:
+        artifact_dir = experiment_dir / dirname
+        if not artifact_dir.is_dir():
+            continue
+        discovered.extend(
+            find_files(
+                [artifact_dir],
+                label="索引 checkpoint",
+                suffixes={".pt", ".ckpt", ".pth"},
+                show_progress=False,
+            )
+        )
+    preferred_resolved = [path.resolve() for path in preferred]
+    extras = sorted(
+        set(discovered) - set(preferred_resolved),
+        key=lambda path: (-_safe_path_mtime(path), str(path).casefold()),
+    )
+    return [*preferred_resolved, *extras]
+
+
+def _safe_path_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _experiment_relative_parts(path: Path) -> tuple[str, ...]:
+    try:
+        return path.resolve().relative_to(EXPERIMENT_ROOT_DIR.resolve()).parts
+    except (OSError, ValueError):
+        return path.resolve().parts
+
+
+def _is_excluded_experiment_location(path: Path) -> bool:
+    parts = _experiment_relative_parts(path)
+    if not parts:
+        return True
+    if parts[0].casefold() in EXPERIMENT_EXCLUDED_TOP_LEVEL:
+        return True
+    return path.name.casefold() in EXPERIMENT_INTERNAL_DIRNAMES
+
+
+def _task_from_train_log(path: Path) -> str | None:
+    log_paths = (path / "train.log", path / IMPORTANT_ARTIFACT_DIRNAME / "train.log")
+    for log_path in log_paths:
+        try:
+            with log_path.open("r", encoding="utf-8", errors="ignore") as stream:
+                text = stream.read(262_144)
+        except OSError:
+            continue
+        match = re.search(r'["\']task["\']\s*:\s*["\']([^"\']+)["\']', text)
+        if match:
+            task = TASK_VALUE_ALIASES.get(match.group(1).strip().casefold())
+            if task is not None:
+                return task
+    return None
+
+
+def _task_from_path(path: Path) -> str | None:
+    tokens = {
+        token
+        for part in _experiment_relative_parts(path)
+        for token in re.split(r"[^0-9a-z]+", part.casefold())
+        if token
+    }
+    matches = [
+        task
+        for task, markers in TASK_NAME_MARKERS.items()
+        if tokens.intersection(markers)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def experiment_task(path: Path) -> str | None:
+    """Infer an experiment task from train metadata, then from path tokens."""
+    return _task_from_train_log(path) or _task_from_path(path)
+
+
+def experiment_seg_type(path: Path) -> str | None:
+    """Infer the segmentation subtype recorded by an experiment."""
+    path = path.expanduser().resolve()
+    for log_path in (path / "train.log", path / IMPORTANT_ARTIFACT_DIRNAME / "train.log"):
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="ignore")[:262_144]
+        except OSError:
+            continue
+        match = re.search(r'["\']task["\']\s*:\s*["\']([^"\']+)["\']', text)
+        if match:
+            task_name = match.group(1).strip().casefold()
+            if "semantic" in task_name:
+                return "semantic"
+            if "instance" in task_name:
+                return "instance"
+    return None
+
+
+def experiment_modified_time(path: Path) -> float:
+    """Return the latest meaningful direct activity time for an experiment."""
+    mtimes = [_safe_path_mtime(path)]
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        entries = []
+    mtimes.extend(_safe_path_mtime(entry) for entry in entries)
+    mtimes.extend(
+        _safe_path_mtime(checkpoint)
+        for checkpoint in experiment_checkpoint_candidates(path)
+        if checkpoint.exists()
+    )
+    return max(mtimes, default=0.0)
+
+
+def format_experiment_modified_time(path: Path) -> str:
+    modified = experiment_modified_time(path)
+    if modified <= 0:
+        return "-"
+    return datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M")
 
 
 def is_task_experiment_dir(path: Path, task: str, *, require_checkpoint: bool = False) -> bool:
-    if not path.is_dir():
+    if not is_experiment_dir(path, require_checkpoint=require_checkpoint):
         return False
-
-    has_artifact_dir = (path / "exported_models").is_dir() or (path / "checkpoints").is_dir()
-    if not has_artifact_dir:
-        return False
-
-    if not require_checkpoint:
-        markers = TASK_NAME_MARKERS.get(task, (task,))
-        try:
-            path_text = str(path.relative_to(EXPERIMENT_ROOT_DIR)).lower()
-        except ValueError:
-            path_text = str(path).lower()
-        return any(marker in path_text for marker in markers)
-
-    markers = TASK_NAME_MARKERS.get(task, (task,))
-    try:
-        path_text = str(path.relative_to(EXPERIMENT_ROOT_DIR)).lower()
-    except ValueError:
-        path_text = str(path).lower()
-    if any(marker in path_text for marker in markers):
-        return any(candidate.exists() for candidate in experiment_checkpoint_candidates(path))
-
-    return False
+    detected_task = experiment_task(path)
+    return detected_task is None or detected_task == task
 
 
 def is_experiment_dir(path: Path, *, require_checkpoint: bool = False) -> bool:
-    if not path.is_dir():
+    if not path.is_dir() or _is_excluded_experiment_location(path):
         return False
-
-    has_artifact_dir = (path / "exported_models").is_dir() or (path / "checkpoints").is_dir()
-    if not has_artifact_dir:
-        return False
-
-    if not require_checkpoint:
-        return True
-    return any(candidate.exists() for candidate in experiment_checkpoint_candidates(path))
+    if require_checkpoint:
+        return any(
+            candidate.is_file()
+            for candidate in experiment_checkpoint_candidates(path)
+        )
+    has_artifact_dir = any(
+        (path / dirname).is_dir() for dirname in EXPERIMENT_ARTIFACT_DIRNAMES
+    )
+    has_train_record = (
+        (path / "train.log").is_file()
+        or (path / IMPORTANT_ARTIFACT_DIRNAME / "train.log").is_file()
+        or any(path.glob(TENSORBOARD_EVENT_GLOB))
+    )
+    return has_artifact_dir or has_train_record
 
 
 def discover_recent_experiment_dirs(
-    task: str,
+    task: str | None,
     *,
     limit: int | None = None,
     require_checkpoint: bool = False,
 ) -> list[Path]:
+    from .file_index import walk_tree
+
     if not EXPERIMENT_ROOT_DIR.exists():
         return []
 
-    all_candidates = [
-        path
-        for path in EXPERIMENT_ROOT_DIR.rglob("*")
-        if is_experiment_dir(path, require_checkpoint=require_checkpoint)
-    ]
-    candidates = all_candidates
+    candidates: list[Path] = []
+    for path, dirnames, _filenames in walk_tree(
+        EXPERIMENT_ROOT_DIR,
+        label="索引实验目录",
+        followlinks=True,
+    ):
+        if path.resolve() == EXPERIMENT_ROOT_DIR.resolve():
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not name.startswith(".")
+                and name.casefold() not in EXPERIMENT_EXCLUDED_TOP_LEVEL
+            ]
+            continue
+        if _is_excluded_experiment_location(path):
+            dirnames[:] = []
+            continue
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not name.startswith(".") and name not in EXPERIMENT_INTERNAL_DIRNAMES
+        ]
+        if not is_experiment_dir(path, require_checkpoint=require_checkpoint):
+            continue
+        detected_task = experiment_task(path) if task is not None else None
+        if task is None or detected_task is None or detected_task == task:
+            candidates.append(path.resolve())
+        dirnames[:] = []
+    candidates = list(dict.fromkeys(candidates))
     candidates.sort(
-        key=lambda p: (
-            p.stat().st_mtime,
-            1 if is_task_experiment_dir(p, task, require_checkpoint=require_checkpoint) else 0,
-        ),
-        reverse=True,
+        key=lambda path: (-experiment_modified_time(path), str(path).casefold())
     )
     if limit is not None:
         return candidates[:limit]
@@ -282,17 +453,21 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global EDA_OUTPUT_ROOT_DIR
     global ALL_REPORT_ROOT_DIR
     global DATASET_DIR
+    global DATASET_SEARCH_ROOTS
     global EXPERIMENT_DIR
     global REPORT_ARCHIVE_ROOT_DIR
     global INFER_DEFAULT_EXPERIMENT_DIR
     global SEG_DEFAULT_EXPERIMENT_DIR
     global INFER_DEFAULT_IMAGE_DIR
     global INFER_DEFAULT_OUTPUT_DIR
+    global INFER_OUTPUT_DIR_CONFIGURED
     global INFER_DEFAULT_DATA
     global INFER_DEFAULT_SPLIT
     global EVAL_DEFAULT_DATA
     global EVAL_DEFAULT_OUTPUT_DIR
     global EVAL_DEFAULT_REPORT_PATH
+    global EVAL_OUTPUT_DIR_CONFIGURED
+    global EVAL_REPORT_PATH_CONFIGURED
     global EXPORT_DEFAULT_REPORT_JSON
     global EXPORT_DEFAULT_SOURCE_DATA
     global EXPORT_DEFAULT_GOOD_CLASS_THRESHOLD
@@ -347,6 +522,7 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global DEFAULT_SEG_THRESHOLD
     global SEG_EVAL_VIS_MAX_IMAGES
     global DEFAULT_SCORE_THRESHOLD
+    global DET_EVAL_VIS_MAX_IMAGES
     global INFER_DEFAULT_SCORE_THRESHOLD
     global INFER_DEFAULT_REPORT_IOU_THRESHOLD
     global INFER_DEFAULT_SAHI
@@ -366,12 +542,10 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
 
     OUT_DIR = _path("out_dir", OUT_DIR)
     EXPERIMENT_ROOT_DIR = _path("experiment_root_dir", EXPERIMENT_ROOT_DIR)
-    # seg 默认实验目录：显式路径直接用；None/""/auto 时自动发现最近一次含 checkpoint 的 seg 实验。
+    # 自动模式先保留稳定 fallback；具体命令在真正需要实验时再执行发现，避免启动菜单和 --help 扫盘。
     seg_experiment_value = settings.get("seg_experiment_dir")
     if seg_experiment_value in {None, "", "auto"}:
-        SEG_DEFAULT_EXPERIMENT_DIR = auto_resolve_experiment_dir(
-            "seg", EXPERIMENT_ROOT_DIR / "my_experiment_seg"
-        )
+        SEG_DEFAULT_EXPERIMENT_DIR = EXPERIMENT_ROOT_DIR / "my_experiment_seg"
     else:
         SEG_DEFAULT_EXPERIMENT_DIR = _path("seg_experiment_dir", EXPERIMENT_ROOT_DIR / "my_experiment_seg")
     TEST_OUTPUT_ROOT_DIR = _path(
@@ -382,13 +556,31 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     ALL_REPORT_ROOT_DIR = _path("all_report_root_dir", ALL_REPORT_ROOT_DIR)
     REPORT_ARCHIVE_ROOT_DIR = _path("report_archive_root_dir", REPORT_ARCHIVE_ROOT_DIR)
     DATASET_DIR = _path("det_dataset_dir", DATASET_DIR)
+    raw_search_roots = settings.get("dataset_search_roots", DATASET_SEARCH_ROOTS)
+    if isinstance(raw_search_roots, (str, Path)):
+        raw_search_roots = [raw_search_roots]
+    elif not isinstance(raw_search_roots, (list, tuple)):
+        raise TypeError("dataset_search_roots 必须是路径字符串或路径列表")
+    DATASET_SEARCH_ROOTS = []
+    for raw_root in raw_search_roots:
+        if not isinstance(raw_root, (str, Path)):
+            raise TypeError("dataset_search_roots 中的每一项都必须是路径")
+        path = Path(raw_root).expanduser()
+        if not path.is_absolute():
+            path = ROOT_DIR / path
+        resolved = path.resolve()
+        if resolved not in DATASET_SEARCH_ROOTS:
+            DATASET_SEARCH_ROOTS.append(resolved)
     DEFAULT_CLS_THRESHOLD = float(settings.get("cls_threshold", DEFAULT_CLS_THRESHOLD))
     DEFAULT_SEG_THRESHOLD = float(settings.get("seg_threshold", DEFAULT_SEG_THRESHOLD))
     SEG_EVAL_VIS_MAX_IMAGES = int(settings.get("seg_eval_vis_max_images", SEG_EVAL_VIS_MAX_IMAGES))
     DEFAULT_SCORE_THRESHOLD = float(settings.get("det_score_threshold", DEFAULT_SCORE_THRESHOLD))
+    DET_EVAL_VIS_MAX_IMAGES = int(
+        settings.get("det_eval_vis_max_images", DET_EVAL_VIS_MAX_IMAGES)
+    )
     det_experiment_value = settings.get("det_experiment_dir")
     if det_experiment_value in {None, "", "auto"}:
-        EXPERIMENT_DIR = auto_resolve_experiment_dir("det", EXPERIMENT_DIR)
+        EXPERIMENT_DIR = EXPERIMENT_ROOT_DIR / "my_experiment_det"
     else:
         EXPERIMENT_DIR = _path("det_experiment_dir", EXPERIMENT_DIR)
     INFER_DEFAULT_SPLIT = settings.get("det_default_split", INFER_DEFAULT_SPLIT)
@@ -413,16 +605,27 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     default_data_yaml = DATASET_DIR / "data.yaml"
     default_image_dir = DATASET_DIR / "images" / INFER_DEFAULT_SPLIT
     default_infer_output_dir = build_task_infer_root("det") / f"manual_infer-{INFER_DEFAULT_SPLIT}"
-    default_report_path = build_det_report_path(default_infer_output_dir)
 
     INFER_DEFAULT_EXPERIMENT_DIR = _path("det_infer_experiment_dir", EXPERIMENT_DIR)
     INFER_DEFAULT_IMAGE_DIR = _path("det_infer_image_dir", default_image_dir)
     INFER_DEFAULT_OUTPUT_DIR = _path("det_infer_output_dir", default_infer_output_dir)
+    INFER_OUTPUT_DIR_CONFIGURED = settings.get("det_infer_output_dir") not in {None, ""}
     INFER_DEFAULT_DATA = _path("det_data_yaml", default_data_yaml)
 
     EVAL_DEFAULT_DATA = _path("det_eval_data_yaml", INFER_DEFAULT_DATA)
-    EVAL_DEFAULT_OUTPUT_DIR = _path("det_eval_output_dir", default_infer_output_dir)
-    EVAL_DEFAULT_REPORT_PATH = _path("det_eval_report_path", default_report_path)
+    default_eval_output_dir = build_action_output_dir(
+        EXPERIMENT_DIR,
+        "eval",
+        input_path=EVAL_DEFAULT_DATA,
+        split=INFER_DEFAULT_SPLIT,
+    )
+    EVAL_DEFAULT_OUTPUT_DIR = _path("det_eval_output_dir", default_eval_output_dir)
+    EVAL_DEFAULT_REPORT_PATH = _path(
+        "det_eval_report_path",
+        build_det_report_path(EVAL_DEFAULT_OUTPUT_DIR, split=INFER_DEFAULT_SPLIT),
+    )
+    EVAL_OUTPUT_DIR_CONFIGURED = settings.get("det_eval_output_dir") not in {None, ""}
+    EVAL_REPORT_PATH_CONFIGURED = settings.get("det_eval_report_path") not in {None, ""}
 
     EXPORT_DEFAULT_REPORT_JSON = _path("det_export_report_json", EVAL_DEFAULT_REPORT_PATH)
     EXPORT_DEFAULT_SOURCE_DATA = _path("det_export_source_data", EVAL_DEFAULT_DATA)
@@ -614,6 +817,16 @@ def import_runtime_dependencies() -> None:
     global yaml
     global yolo_helpers
 
+    _prioritize_repo_source()
+    loaded_module = sys.modules.get("lightly_train")
+    if loaded_module is not None:
+        loaded_file = Path(str(getattr(loaded_module, "__file__", ""))).resolve()
+        if not loaded_file.is_relative_to(SRC_DIR.resolve()):
+            raise RuntimeError(
+                "当前进程已从其他位置导入 lightly_train: "
+                f"{loaded_file}。launcher 需要仓库 fork: {SRC_DIR.resolve()}。"
+            )
+
     try:
         import lightly_train as lightly_train_module
         import numpy as np_module
@@ -660,6 +873,31 @@ def import_runtime_dependencies() -> None:
     InstanceSegmentationTaskMetricArgs = instance_segmentation_task_metric_args_module
 
 
+def import_data_dependencies() -> None:
+    """Load lightweight dependencies used by EDA, reports and dataset curation."""
+    global Image
+    global ImageDraw
+    global ImageFont
+    global np
+    global yaml
+
+    try:
+        import numpy as np_module
+        import yaml as yaml_module
+        from PIL import Image as image_module
+        from PIL import ImageDraw as image_draw_module
+        from PIL import ImageFont as image_font_module
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Missing data-tool dependency. Install numpy, Pillow and PyYAML."
+        ) from exc
+    np = np_module
+    yaml = yaml_module
+    Image = image_module
+    ImageDraw = image_draw_module
+    ImageFont = image_font_module
+
+
 def resolve_device(device: str) -> Any:
     if device == "auto":
         return None
@@ -699,23 +937,20 @@ def prepare_output_dir(output_dir: Path, overwrite: bool, *, clean: bool = False
     overwrite=False 且目录非空时报错（保持原有保护）。
     overwrite=True 时：
       - clean=False（默认，向后兼容）：直接复用目录，新文件覆盖/并入旧文件。
-      - clean=True：清空旧产物以避免新旧混杂，但保留缓存目录
-        （_tempfile 的预测 JSON、_temp 的训练曲线等"画图的东西"），方便复用/重绘。
+      - clean=True：清空全部旧产物。缓存也属于某次运行，未通过完整指纹验证时
+        不能跨运行保留，否则旧预测会混入新报告。
     """
     if output_dir.exists() and any(output_dir.iterdir()) and not overwrite:
         raise ValueError(f"Output directory is not empty: {output_dir}. Use overwrite to continue.")
     if clean and overwrite and output_dir.exists():
-        preserve = {INFER_TEMP_DIRNAME, TRAINING_TEMP_DIRNAME}
         for child in output_dir.iterdir():
-            if child.name in preserve:
-                continue
             try:
                 if child.is_dir() and not child.is_symlink():
-                    shutil.rmtree(child, ignore_errors=True)
+                    shutil.rmtree(child)
                 else:
                     child.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as exc:
+                raise RuntimeError(f"无法清理旧输出: {child}: {exc}") from exc
     output_dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -731,19 +966,9 @@ def load_data_config(data_path: Path) -> dict[str, Any]:
         raise ValueError(f"Invalid data config: {data_path}")
 
     base_dir = data_path.parent
-    root = cfg.get("path")
-    root_dir = base_dir if root is None else resolve_data_yaml_path(Path(root), base_dir=base_dir)
     cfg["_data_yaml_path"] = data_path
     cfg["_base_dir"] = base_dir
-    cfg["_root_dir"] = resolve_dataset_root_dir(
-        configured_root_dir=root_dir,
-        data_yaml_dir=base_dir,
-        split_values={
-            "train": cfg.get("train"),
-            "val": cfg.get("val"),
-            "test": cfg.get("test"),
-        },
-    )
+    cfg["_root_dir"] = dataset_adapter.resolve_dataset_root(data_path, cfg)
     return cfg
 
 
@@ -811,55 +1036,51 @@ def resolve_dataset_root_dir(
     """
     resolved_root_dir = configured_root_dir.expanduser().resolve()
     resolved_data_yaml_dir = data_yaml_dir.expanduser().resolve()
-    if resolved_root_dir.exists():
-        return resolved_root_dir
-    if not resolved_data_yaml_dir.exists():
-        return resolved_root_dir
 
-    declared_splits = split_values or {}
-    for split_name in ("train", "val", "test"):
-        split_value = declared_splits.get(split_name)
-        if split_value in {None, ""}:
-            continue
-        split_path = Path(str(split_value))
-        candidate_dir = resolve_split_dir_path(
-            split_path=split_path,
-            root_dir=resolved_data_yaml_dir,
-            base_dir=resolved_data_yaml_dir,
-        )
-        if candidate_dir.exists():
-            return resolved_data_yaml_dir
+    def has_split_source(root: Path) -> bool:
+        for split_name, raw_value in (split_values or {}).items():
+            if raw_value is None or raw_value == "":
+                continue
+            if isinstance(raw_value, dict):
+                raw_value = raw_value.get("images", raw_value.get("image"))
+            values = raw_value if isinstance(raw_value, list) else [raw_value]
+            for value in values:
+                if value is None or value == "":
+                    continue
+                candidate = Path(str(value)).expanduser()
+                if not candidate.is_absolute():
+                    candidate = root / candidate
+                if candidate.exists() or (candidate / "images").is_dir():
+                    return True
+            if (root / "images" / split_name).is_dir():
+                return True
+            if (root / split_name / "images").is_dir():
+                return True
+        return False
+
+    if has_split_source(resolved_root_dir):
+        return resolved_root_dir
+    if has_split_source(resolved_data_yaml_dir):
+        return resolved_data_yaml_dir
     return resolved_root_dir
 
 
 def resolve_dataset_split_paths(data_cfg: dict[str, Any], split: str) -> tuple[Path, Path | None, dict[int, str]]:
-    root_dir = Path(data_cfg["_root_dir"])
-    base_dir = Path(data_cfg.get("_base_dir", data_cfg["_data_yaml_path"]).parent)
     names = normalize_names(data_cfg.get("names"))
-    train = Path(str(data_cfg.get("train", "")))
-    val = Path(str(data_cfg.get("val", "")))
-    test_value = data_cfg.get("test")
-    test = Path(str(test_value)) if test_value else None
-
-    split_path_map = {
-        "train": train,
-        "val": val,
-        "test": test,
-    }
-    split_path = split_path_map[split]
-    if split_path is None:
-        raise ValueError(f"Split '{split}' is not defined in the data config.")
-
-    image_dir = resolve_split_dir_path(
-        split_path=split_path,
-        root_dir=root_dir,
-        base_dir=base_dir,
+    config_path = Path(data_cfg["_data_yaml_path"])
+    image_dir, label_dir = dataset_adapter.resolve_split_paths(
+        config_path,
+        data_cfg,
+        split,
+        annotation="labels",
     )
-    label_dir = infer_label_dir_from_image_dir(image_dir=image_dir, root_dir=root_dir)
     if image_dir is None:
-        raise ValueError(f"Split '{split}' is not defined in the data config.")
-    if not image_dir.exists():
-        raise FileNotFoundError(f"Image directory does not exist: {image_dir}")
+        diagnostics = "\n  ".join(
+            dataset_adapter.path_diagnostics(config_path, data_cfg)
+        )
+        raise ValueError(
+            f"Split '{split}' 无法解析。\n  {diagnostics}"
+        )
     if label_dir is not None and not label_dir.exists():
         label_dir = None
     return image_dir, label_dir, names
@@ -903,18 +1124,30 @@ def infer_label_dir_from_image_dir(*, image_dir: Path, root_dir: Path) -> Path |
 
 
 def list_dataset_samples(data_cfg: dict[str, Any], split: str) -> tuple[list[ImageSample], dict[int, str]]:
-    image_dir, label_dir, names = resolve_dataset_split_paths(data_cfg=data_cfg, split=split)
-    samples: list[ImageSample] = []
-    for rel_image in file_helpers.list_image_filenames_from_dir(image_dir=image_dir):
-        rel_path = Path(rel_image)
-        samples.append(
-            ImageSample(
-                image_path=image_dir / rel_path,
-                relative_path=rel_path,
-                label_path=(label_dir / rel_path).with_suffix(".txt") if label_dir else None,
-            )
+    names = normalize_names(data_cfg.get("names"))
+    config_path = Path(data_cfg["_data_yaml_path"])
+    resolved = dataset_adapter.resolve_split_samples(
+        config_path,
+        data_cfg,
+        split,
+        annotation="labels",
+    )
+    if not resolved:
+        diagnostics = "\n  ".join(
+            dataset_adapter.path_diagnostics(config_path, data_cfg)
         )
-    return samples, names
+        raise ValueError(f"Split '{split}' 没有可读取的图片。\n  {diagnostics}")
+    return (
+        [
+            ImageSample(
+                image_path=image_path,
+                relative_path=relative_path,
+                label_path=label_path if label_path.exists() else None,
+            )
+            for image_path, label_path, relative_path in resolved
+        ],
+        names,
+    )
 
 
 def list_directory_samples(image_dir: Path) -> list[ImageSample]:
@@ -1023,6 +1256,35 @@ def dataset_tag_from_dir(dataset_dir: Path) -> str:
     return sanitize_tag(name.removesuffix("_dataset"))
 
 
+def path_identity_tag(path: Path, *, prefix: str | None = None) -> str:
+    """Build a readable, collision-resistant tag for an input path."""
+    resolved = path.expanduser().resolve()
+    identity_dir = resolved.parent if resolved.is_file() or resolved.suffix else resolved
+    readable = dataset_tag_from_dir(identity_dir)
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:8]
+    parts = [prefix, readable, digest] if prefix else [readable, digest]
+    return sanitize_tag("-".join(str(part) for part in parts if part))
+
+
+def build_action_output_dir(
+    experiment_dir: Path,
+    action: str,
+    *,
+    input_path: Path | None = None,
+    split: str | list[str] | tuple[str, ...] | None = None,
+) -> Path:
+    """Build a default action directory carrying input identity and split identity."""
+    output = experiment_dir.expanduser().resolve() / sanitize_tag(action)
+    if input_path is not None:
+        output /= path_identity_tag(input_path)
+    else:
+        output /= "manual"
+    if split is not None:
+        split_items = [split] if isinstance(split, str) else list(split)
+        output /= sanitize_tag("-".join(str(item) for item in split_items))
+    return output
+
+
 def extract_date_token(value: str) -> str | None:
     text = value.strip()
     if len(text) == 4 and text.isdigit():
@@ -1110,13 +1372,16 @@ def build_det_run_name(*, checkpoint_path: Path, dataset_dir: Path, split: str) 
     return sanitize_tag(f"infer-{dataset_tag_from_dir(dataset_dir)}-{split}")
 
 
-def build_det_report_path(output_dir: Path) -> Path:
+def build_det_report_path(output_dir: Path, *, split: str = "test") -> Path:
     date_tag = date_tag_now()
     output_name = output_dir.name
-    if output_name.startswith(f"{date_tag}-"):
-        report_name = f"{output_name}-test_report.json"
+    split_tag = sanitize_tag(split)
+    if output_name.casefold() == split_tag.casefold():
+        report_name = f"{date_tag}-{split_tag}_report.json"
+    elif output_name.startswith(f"{date_tag}-"):
+        report_name = f"{output_name}-{split_tag}_report.json"
     else:
-        report_name = f"{date_tag}-{output_name}-test_report.json"
+        report_name = f"{date_tag}-{output_name}-{split_tag}_report.json"
     return output_dir / report_name
 
 
@@ -1140,13 +1405,30 @@ def copy_file_if_exists(source_path: Path, destination_path: Path) -> Path | Non
     return destination_path
 
 
-def copy_tree_contents(source_dir: Path, target_dir: Path) -> list[Path]:
+def copy_tree_contents(
+    source_dir: Path,
+    target_dir: Path,
+    *,
+    progress_label: str | None = None,
+) -> list[Path]:
     if not source_dir.exists():
         return []
+    source_paths = [path for path in sorted(source_dir.rglob("*")) if path.is_file()]
+    if not source_paths:
+        return []
+    if progress_label:
+        from .progress import track
+
+        paths = track(
+            source_paths,
+            label=progress_label,
+            total=len(source_paths),
+            unit="file",
+        )
+    else:
+        paths = iter(source_paths)
     copied_paths: list[Path] = []
-    for path in sorted(source_dir.rglob("*")):
-        if not path.is_file():
-            continue
+    for path in paths:
         rel_path = path.relative_to(source_dir)
         destination_path = target_dir / rel_path
         destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1329,33 +1611,31 @@ def ensure_matplotlib_dependencies():
         return None
 
 
-def select_best_event_file(experiment_dir: Path) -> Path | None:
-    best_file = None
-    best_score = (-1, -1.0)
+def load_merged_scalar_series(
+    experiment_dir: Path,
+    tags: tuple[str, ...],
+) -> dict[str, list[tuple[int, float]]]:
+    """Merge scalar histories from every training session by tag and global step."""
+    merged: dict[str, dict[int, tuple[float, float]]] = {tag: {} for tag in tags}
     for event_file in list_event_files(experiment_dir):
         accumulator = load_event_accumulator(event_file)
         if accumulator is None:
             continue
-        scalar_tags = accumulator.Tags().get("scalars", [])
-        preferred_tags = {"train_loss", "val_metric/map"}
-        score = (
-            sum(1 for tag in scalar_tags if tag in preferred_tags),
-            len(scalar_tags),
-        )
-        if score > best_score:
-            best_score = score
-            best_file = event_file
-    return best_file
+        scalar_tags = set(accumulator.Tags().get("scalars", []))
+        for tag in tags:
+            if tag not in scalar_tags:
+                continue
+            for item in accumulator.Scalars(tag):
+                step = int(item.step)
+                wall_time = float(item.wall_time)
+                current = merged[tag].get(step)
+                if current is None or wall_time > current[0]:
+                    merged[tag][step] = (wall_time, float(item.value))
 
-
-def load_scalar_series(event_file: Path, tag: str) -> list[tuple[int, float]]:
-    accumulator = load_event_accumulator(event_file)
-    if accumulator is None:
-        return []
-    if tag not in accumulator.Tags().get("scalars", []):
-        return []
-    values = accumulator.Scalars(tag)
-    return [(int(item.step), float(item.value)) for item in values]
+    return {
+        tag: [(step, value) for step, (_wall_time, value) in sorted(points.items())]
+        for tag, points in merged.items()
+    }
 
 
 def _safe_text_size(draw, text: str, font) -> tuple[int, int]:
@@ -1698,9 +1978,23 @@ def compose_training_dashboard(
 def generate_training_curve_artifacts(experiment_dir: Path) -> list[Path]:
     experiment_dir = experiment_dir.expanduser().resolve()
     consolidate_training_artifacts(experiment_dir)
-    event_file = select_best_event_file(experiment_dir)
-    if event_file is None or not ensure_plot_dependencies():
+    if not list_event_files(experiment_dir) or not ensure_plot_dependencies():
         return []
+
+    scalar_tags = (
+        "train_loss",
+        "val_loss",
+        "val_metric/map",
+        "val_metric/map_50",
+        "val_metric/map_small",
+        "val_metric/map_medium",
+        "val_metric/map_large",
+        "learning_rate/backbone",
+        "learning_rate/backbone_no_wd",
+        "learning_rate/detector",
+        "learning_rate/detector_no_wd",
+    )
+    scalar_series = load_merged_scalar_series(experiment_dir, scalar_tags)
 
     temp_dir = training_temp_dir(experiment_dir)
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -1710,8 +2004,8 @@ def generate_training_curve_artifacts(experiment_dir: Path) -> list[Path]:
         loss_path,
         title="Training and Validation Loss",
         series_map={
-            "train_loss": load_scalar_series(event_file, "train_loss"),
-            "val_loss": load_scalar_series(event_file, "val_loss"),
+            "train_loss": scalar_series["train_loss"],
+            "val_loss": scalar_series["val_loss"],
         },
     ):
         created_paths.append(loss_path)
@@ -1721,11 +2015,11 @@ def generate_training_curve_artifacts(experiment_dir: Path) -> list[Path]:
         map_path,
         title="Validation mAP Curves",
         series_map={
-            "val_metric/map": load_scalar_series(event_file, "val_metric/map"),
-            "val_metric/map_50": load_scalar_series(event_file, "val_metric/map_50"),
-            "val_metric/map_small": load_scalar_series(event_file, "val_metric/map_small"),
-            "val_metric/map_medium": load_scalar_series(event_file, "val_metric/map_medium"),
-            "val_metric/map_large": load_scalar_series(event_file, "val_metric/map_large"),
+            "val_metric/map": scalar_series["val_metric/map"],
+            "val_metric/map_50": scalar_series["val_metric/map_50"],
+            "val_metric/map_small": scalar_series["val_metric/map_small"],
+            "val_metric/map_medium": scalar_series["val_metric/map_medium"],
+            "val_metric/map_large": scalar_series["val_metric/map_large"],
         },
     ):
         created_paths.append(map_path)
@@ -1735,10 +2029,10 @@ def generate_training_curve_artifacts(experiment_dir: Path) -> list[Path]:
         lr_path,
         title="Learning Rate Curves",
         series_map={
-            "learning_rate/backbone": load_scalar_series(event_file, "learning_rate/backbone"),
-            "learning_rate/backbone_no_wd": load_scalar_series(event_file, "learning_rate/backbone_no_wd"),
-            "learning_rate/detector": load_scalar_series(event_file, "learning_rate/detector"),
-            "learning_rate/detector_no_wd": load_scalar_series(event_file, "learning_rate/detector_no_wd"),
+            "learning_rate/backbone": scalar_series["learning_rate/backbone"],
+            "learning_rate/backbone_no_wd": scalar_series["learning_rate/backbone_no_wd"],
+            "learning_rate/detector": scalar_series["learning_rate/detector"],
+            "learning_rate/detector_no_wd": scalar_series["learning_rate/detector_no_wd"],
         },
     ):
         created_paths.append(lr_path)

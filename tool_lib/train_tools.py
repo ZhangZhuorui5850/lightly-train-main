@@ -187,6 +187,23 @@ def _count_train_images(data_yaml: Path) -> int:
 
     `train` 字段可以是单个路径或路径列表（YOLO 格式允许多目录），都正确处理。
     """
+    data_yaml = data_yaml.expanduser().resolve()
+    if data_yaml.is_dir():
+        train_root = next(
+            (
+                data_yaml / name
+                for name in ("train", "training")
+                if (data_yaml / name).is_dir()
+            ),
+            None,
+        )
+        if train_root is None:
+            return 0
+        return sum(
+            1
+            for path in train_root.rglob("*")
+            if path.is_file() and path.suffix.casefold() in _IMAGE_SUFFIXES
+        )
     try:
         import yaml  # PyYAML，比 common.lazy-load 更早可用
     except ImportError:
@@ -198,6 +215,17 @@ def _count_train_images(data_yaml: Path) -> int:
         return 0
     if not isinstance(cfg, dict):
         return 0
+    try:
+        return len(
+            rt.dataset_adapter.resolve_split_samples(
+                data_yaml,
+                cfg,
+                "train",
+                annotation="labels",
+            )
+        )
+    except (OSError, TypeError, ValueError):
+        pass
     root = Path(cfg.get("path", data_yaml.parent)).expanduser()
     if not root.is_absolute():
         root = (data_yaml.parent / root).resolve()
@@ -219,6 +247,41 @@ def _count_train_images(data_yaml: Path) -> int:
             if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES
         )
     return total
+
+
+def load_classification_directory_data_config(root: Path) -> dict[str, Any]:
+    """Build a classification config from train/val ImageFolder directories."""
+    root = root.expanduser().resolve()
+
+    def split_dir(names: tuple[str, ...], *, required: bool) -> Path | None:
+        path = next((root / name for name in names if (root / name).is_dir()), None)
+        if path is None and required:
+            raise ValueError(f"分类目录缺少 {'/'.join(names)} split: {root}")
+        return path
+
+    train_dir = split_dir(("train", "training"), required=True)
+    val_dir = split_dir(("val", "valid", "validation"), required=True)
+    test_dir = split_dir(("test", "testing"), required=False)
+    assert train_dir is not None and val_dir is not None
+    classes = sorted(
+        {
+            child.name
+            for split_root in (train_dir, val_dir)
+            for child in split_root.iterdir()
+            if child.is_dir()
+        },
+        key=str.casefold,
+    )
+    if not classes:
+        raise ValueError(f"分类目录中没有类别子目录: {root}")
+    data: dict[str, Any] = {
+        "train": str(train_dir),
+        "val": str(val_dir),
+        "classes": {index: name for index, name in enumerate(classes)},
+    }
+    if test_dir is not None:
+        data["test"] = str(test_dir)
+    return data
 
 
 def estimate_steps_from_epochs(
@@ -379,7 +442,7 @@ def build_default_out_dir(data_yaml: Path, model_str: str) -> Path:
     mmdd = datetime.now().strftime("%m%d")
     dataset_short = extract_dataset_short(data_yaml)
     model_short = extract_model_short(model_str)
-    return rt.ROOT_DIR / "out" / mmdd / f"{mmdd}-{dataset_short}-{model_short}"
+    return rt.EXPERIMENT_ROOT_DIR / mmdd / f"{mmdd}-{dataset_short}-{model_short}"
 
 
 # ---------------------------------------------------------------------------
@@ -402,12 +465,14 @@ def run_train(args) -> None:
     data_yaml = getattr(args, "data_yaml", None) or rt.ROOT_DIR
     data_yaml_path = Path(data_yaml).expanduser().resolve()
     if not data_yaml_path.exists():
-        raise FileNotFoundError(f"数据集 yaml 不存在: {data_yaml_path}")
+        raise FileNotFoundError(f"数据集路径不存在: {data_yaml_path}")
     data = str(data_yaml_path)
     data_display = str(data_yaml_path)
     if data_config is not None:
         data = data_config
         data_display = "<data_config>"
+    elif task == "cls" and data_yaml_path.is_dir():
+        data = load_classification_directory_data_config(data_yaml_path)
     elif task == "seg" and get_seg_train_type(args) == "semantic":
         data = load_semantic_segmentation_data_config(data_yaml_path)
 

@@ -651,7 +651,10 @@ class TestRunSizeSupplementIntegration:
 
 class TestInteractiveEntryWiring:
     def test_scripted_run_produces_dataset(self, tmp_path, monkeypatch):
-        import size_supplement as entry
+        entry = pytest.importorskip(
+            "size_supplement",
+            reason="旧 size_supplement.py 入口已移除",
+        )
 
         base_root = tmp_path / "ds" / "dataset_det_A"
         _make_det_dataset(
@@ -684,4 +687,3 @@ class TestInteractiveEntryWiring:
         assert len(produced) == 1
         assert (produced[0] / "supplement_report.json").exists()
         assert _count_images(produced[0]) == 20
-

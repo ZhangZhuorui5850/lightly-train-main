@@ -7,6 +7,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 import yaml
 
 TOOLS = Path(__file__).resolve().parents[1]
@@ -74,6 +75,8 @@ def test_convert_both_outputs_seg_and_det_with_empty_good_labels(tmp_path: Path)
     det = output / "dataset_det"
     assert yaml.safe_load((seg / "data.yaml").read_text(encoding="utf-8"))["task"] == "segment"
     assert yaml.safe_load((det / "data.yaml").read_text(encoding="utf-8"))["task"] == "detect"
+    assert yaml.safe_load((seg / "data.yaml").read_text(encoding="utf-8"))["path"] == "."
+    assert ".staging-" not in (det / "data.yaml").read_text(encoding="utf-8")
     assert len(list((seg / "images" / "train").glob("*.png"))) == 3
     assert len(list((det / "images" / "train").glob("*.png"))) == 3
     assert (seg / "labels" / "train" / "gear__good__a.txt").read_text() == ""
@@ -116,9 +119,8 @@ def test_missing_mask_is_reported_and_anomaly_is_skipped(tmp_path: Path) -> None
     output = tmp_path / "det"
     result = converter.convert(source, output, task="detect", verbose=False)
     assert result["scan_issues"] == 1
-    rows = list(csv.DictReader(
-        (output / "conversion_report.csv").open(encoding="utf-8-sig")
-    ))
+    with (output / "conversion_report.csv").open(encoding="utf-8-sig") as stream:
+        rows = list(csv.DictReader(stream))
     assert any(row["status"] == "missing_mask" and row["stem"] == "c" for row in rows)
     assert not (output / "images" / "train" / "gear__scratch__c.png").exists()
 
@@ -145,6 +147,17 @@ def test_cli_runs_end_to_end(tmp_path: Path) -> None:
     assert len(list((output / "labels" / "train").glob("*.txt"))) == 3
 
 
+def test_cli_dry_run_validates_without_creating_output(tmp_path: Path) -> None:
+    source = _mvtec(tmp_path / "mvtec")
+    output = tmp_path / "det"
+
+    assert converter.main(
+        ["--src", str(source), "--out", str(output), "--task", "detect", "--dry-run"]
+    ) == 0
+
+    assert not output.exists()
+
+
 def test_interactive_cli_scans_source_and_uses_default_output(
     tmp_path: Path,
     monkeypatch,
@@ -156,3 +169,33 @@ def test_interactive_cli_scans_source_and_uses_default_output(
     output = source.parent / "mvtec__mvtec_to_yolo"
     assert (output / "dataset_seg" / "data.yaml").is_file()
     assert (output / "dataset_det" / "data.yaml").is_file()
+
+
+def test_convert_rejects_source_as_output(tmp_path: Path) -> None:
+    source = _mvtec(tmp_path / "mvtec")
+
+    with pytest.raises(ValueError, match="输出目录"):
+        converter.convert(source, source, clean=True, verbose=False)
+
+    assert (source / "gear" / "test" / "scratch" / "c.png").is_file()
+
+
+def test_cli_confirmation_passes_effective_clean_value(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _mvtec(tmp_path / "mvtec")
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "old.txt").write_text("old", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+    monkeypatch.setattr(
+        converter,
+        "convert",
+        lambda *_args, **kwargs: captured.update(kwargs),
+    )
+
+    assert converter.main(["--src", str(source), "--out", str(output)]) == 0
+    assert captured["clean"] is True

@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, cast
 
 from . import common as rt
+from .file_index import find_files
+from .progress import track
 from .det_analysis import (
     allocate_box_targets_per_split,
     allocate_split_targets_from_source,
@@ -55,6 +57,8 @@ RATIO_BUCKET_NAMES = ("small", "medium", "large")
 
 
 def _progress_bar(current: int, total: int, width: int = 28) -> str:
+    if total <= 0:
+        return f"[{'.' * width}] 0/0"
     safe_total = max(total, 1)
     clamped_current = min(max(current, 0), safe_total)
     filled = int(round(width * clamped_current / safe_total))
@@ -63,7 +67,11 @@ def _progress_bar(current: int, total: int, width: int = 28) -> str:
 
 def _print_progress_line(label: str, current: int, total: int, detail: str = "", *, end: str = "\n") -> None:
     suffix = f" {detail}" if detail else ""
-    print(f"[det/export] {label} {_progress_bar(current, total)}{suffix}", end=end, flush=True)
+    line = f"[det/export] {label} {_progress_bar(current, total)}{suffix}"
+    if end == "\r":
+        print(f"\r{line}\033[K", end="", flush=True)
+    else:
+        print(line, end=end, flush=True)
 
 
 def _make_live_progress_callback(label: str, *, single_line: bool = False):
@@ -77,19 +85,16 @@ def _make_live_progress_callback(label: str, *, single_line: bool = False):
         nonlocal last_print_at
         now = time.monotonic()
         done = current >= total
-        # 交互终端: 一律 \r 单行原地刷新, 只有结束时才换行 -> 固定一行不刷屏。
-        # 非终端(重定向日志): 每 0.8s 提交一行, 便于日志留痕。
-        periodic_commit = (not is_tty) and (not single_line) and (now - last_print_at) >= 0.8
-        commit_line = done or periodic_commit
+        if not is_tty and not done and (now - last_print_at) < 5.0:
+            return
         _print_progress_line(
             label,
             current,
             total,
             detail,
-            end="\n" if commit_line else "\r",
+            end="\n" if (done or not is_tty) else "\r",
         )
-        if commit_line:
-            last_print_at = now
+        last_print_at = now
     return _callback
 
 
@@ -700,16 +705,15 @@ def _report_matches_source_data(report_payload: dict[str, Any], source_data_path
 
 
 def _iter_report_candidates() -> list[Path]:
-    patterns = ["*-test_report.json", "test_report.json"]
+    patterns = ["*test_report.json", "*val_report.json", "*train_report.json"]
     roots = [rt.EXPERIMENT_ROOT_DIR, rt.TEST_OUTPUT_ROOT_DIR]
     results: dict[str, Path] = {}
-    for root in roots:
-        if not root.exists():
-            continue
-        for pattern in patterns:
-            for path in root.rglob(pattern):
-                if path.is_file():
-                    results[str(path.resolve())] = path.resolve()
+    for path in find_files(
+        roots,
+        label="索引 Det export 报告",
+        patterns=patterns,
+    ):
+        results[str(path.resolve())] = path.resolve()
     ordered = sorted(
         results.values(),
         key=lambda item: (item.stat().st_mtime, str(item)),
@@ -1274,36 +1278,36 @@ def _export_filtered_dataset_impl(
         current=stage_idx,
         total=total_stage_count,
     )
-    for split_name, candidates in selected_candidates_by_split.items():
-        if not candidates:
-            continue
+    copy_items = (
+        (split_name, candidate)
+        for split_name, candidates in selected_candidates_by_split.items()
+        for candidate in candidates
+    )
+    for split_name, candidate in track(
+        copy_items,
+        label="det/export 写入文件",
+        total=total_copy_items,
+        unit="img",
+    ):
         rel_split_image_dir = Path("images") / split_name
         rel_split_label_dir = Path("labels") / split_name
         dst_image_dir = export_root / rel_split_image_dir
         dst_label_dir = export_root / rel_split_label_dir
         dst_image_dir.mkdir(parents=True, exist_ok=True)
         dst_label_dir.mkdir(parents=True, exist_ok=True)
-        for candidate in candidates:
-            dst_rel_path = resolve_destination_rel_path(
-                candidate=candidate,
-                used_paths=used_output_paths_by_split[split_name],
-            )
-            dst_image_path = dst_image_dir / dst_rel_path
-            dst_label_path = dst_label_dir / dst_rel_path.with_suffix(".txt")
-            dst_image_path.parent.mkdir(parents=True, exist_ok=True)
-            dst_label_path.parent.mkdir(parents=True, exist_ok=True)
-            remapped_lines = remap_yolo_label_lines(candidate.filtered_lines, class_id_mapping)
-            shutil.copy2(candidate.src_image_path, dst_image_path)
-            dst_label_path.write_text("\n".join(remapped_lines) + "\n", encoding="utf-8")
-            copied_images += 1
-            copied_labels += 1
-            _print_progress_line(
-                f"Copy {split_name}",
-                copied_images,
-                total_copy_items,
-                f"latest={candidate.rel_path.as_posix()}",
-                end="\r" if copied_images < total_copy_items else "\n",
-            )
+        dst_rel_path = resolve_destination_rel_path(
+            candidate=candidate,
+            used_paths=used_output_paths_by_split[split_name],
+        )
+        dst_image_path = dst_image_dir / dst_rel_path
+        dst_label_path = dst_label_dir / dst_rel_path.with_suffix(".txt")
+        dst_image_path.parent.mkdir(parents=True, exist_ok=True)
+        dst_label_path.parent.mkdir(parents=True, exist_ok=True)
+        remapped_lines = remap_yolo_label_lines(candidate.filtered_lines, class_id_mapping)
+        shutil.copy2(candidate.src_image_path, dst_image_path)
+        dst_label_path.write_text("\n".join(remapped_lines) + "\n", encoding="utf-8")
+        copied_images += 1
+        copied_labels += 1
 
     resolved_export_suffix = rt.resolve_det_export_dir_suffix(
         export_suffix=export_suffix,

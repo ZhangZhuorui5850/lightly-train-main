@@ -17,11 +17,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 from . import common as rt
+from .file_index import find_files
+from .progress import track
 
 
 # 决策结果
@@ -44,7 +47,7 @@ def _read_run_meta(output_dir: Path) -> dict[str, Any] | None:
         return None
     try:
         data = json.loads(meta_path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
+        return data if isinstance(data, dict) and data.get("complete") is True else None
     except (OSError, ValueError):
         return None
 
@@ -75,6 +78,102 @@ def _norm_num(value: Any) -> float | None:
         return None
 
 
+def _path_signature(value: Any) -> dict[str, Any] | None:
+    normalized = _norm_path(value)
+    if normalized is None:
+        return None
+    path = Path(normalized)
+    try:
+        stat = path.stat()
+    except OSError:
+        return {"path": normalized, "missing": True}
+    return {
+        "path": normalized,
+        "kind": "dir" if path.is_dir() else "file",
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _dataset_signature(value: Any) -> dict[str, Any] | None:
+    """Return a metadata digest for a dataset config and its effective root.
+
+    Inference reuse must become stale when an image, label, mask, or manifest is
+    added, removed, or edited.  Hashing the full image payload would make every
+    precheck unnecessarily expensive, so image files contribute path/size/mtime
+    metadata while small text annotations and configs also contribute content.
+    """
+    normalized = _norm_path(value)
+    if normalized is None:
+        return None
+    config_path = Path(normalized)
+    if not config_path.exists():
+        return _path_signature(value)
+
+    root = config_path if config_path.is_dir() else config_path.parent
+    if config_path.is_file() and config_path.suffix.casefold() in {".yaml", ".yml"}:
+        try:
+            import yaml
+
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            if isinstance(config, dict):
+                root = rt.dataset_adapter.resolve_dataset_root(config_path, config)
+        except Exception:  # 配置读取失败时仍可对配置所在目录生成保守指纹
+            root = config_path.parent
+
+    digest = hashlib.sha256()
+    file_count = 0
+    total_size = 0
+    latest_mtime_ns = 0
+    try:
+        paths = sorted(
+            find_files(
+                [root],
+                label="索引数据集指纹",
+                patterns=["*"],
+            ),
+            key=lambda path: path.as_posix().casefold(),
+        )
+    except OSError:
+        return {"path": normalized, "root": str(root), "unreadable": True}
+
+    for path in track(
+        paths,
+        label="计算数据集指纹",
+        total=len(paths),
+        unit="file",
+    ):
+        try:
+            stat = path.stat()
+            relative = path.relative_to(root).as_posix()
+        except (OSError, ValueError):
+            continue
+        file_count += 1
+        total_size += int(stat.st_size)
+        latest_mtime_ns = max(latest_mtime_ns, int(stat.st_mtime_ns))
+        digest.update(relative.encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0")
+        digest.update(str(int(stat.st_size)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(int(stat.st_mtime_ns)).encode("ascii"))
+        digest.update(b"\0")
+        if path.suffix.casefold() in {".txt", ".json", ".yaml", ".yml", ".csv"}:
+            try:
+                digest.update(path.read_bytes())
+            except OSError:
+                digest.update(b"<unreadable>")
+        digest.update(b"\n")
+
+    return {
+        "path": normalized,
+        "root": str(root.resolve()),
+        "file_count": file_count,
+        "total_size": total_size,
+        "latest_mtime_ns": latest_mtime_ns,
+        "metadata_sha256": digest.hexdigest(),
+    }
+
+
 def make_fingerprint(
     *,
     task: str,
@@ -87,6 +186,7 @@ def make_fingerprint(
     image: Any = None,
     image_dir: Any = None,
     seg_train_type: Any = None,
+    options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造当前请求的指纹（与 run_meta 字段对齐后可比较）。"""
     return {
@@ -100,11 +200,21 @@ def make_fingerprint(
         "image": _norm_path(image),
         "image_dir": _norm_path(image_dir),
         "seg_train_type": str(seg_train_type) if seg_train_type is not None else None,
+        "source_signatures": {
+            "checkpoint": _path_signature(checkpoint),
+            "data": _dataset_signature(data),
+            "image": _path_signature(image),
+            "image_dir": _dataset_signature(image_dir),
+        },
+        "options": options or {},
     }
 
 
 def fingerprint_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     """从 run_meta.json 还原成同结构指纹。det 与 seg 的 schema 略有差异，这里统一兼容。"""
+    saved_fingerprint = meta.get("fingerprint")
+    if isinstance(saved_fingerprint, dict):
+        return saved_fingerprint
     paths = meta.get("paths", {}) or {}
     settings = meta.get("settings", {}) or {}
     # 阈值：det 用 score_threshold，seg 用 threshold。
@@ -122,11 +232,16 @@ def fingerprint_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "image": _norm_path(paths.get("image")),
         "image_dir": _norm_path(paths.get("image_dir")),
         "seg_train_type": meta.get("seg_train_type"),
+        "source_signatures": None,
+        "options": None,
     }
 
 
 # 核心指纹：两套 schema（det/seg）都可靠记录，恒比较。
-_CORE_KEYS = ("checkpoint", "data", "split", "threshold", "seg_train_type")
+_CORE_KEYS = (
+    "checkpoint", "data", "split", "threshold", "seg_train_type",
+    "source_signatures", "options",
+)
 # 辅助指纹：det 记录、seg 旧 meta 不记录。仅当 meta 里有值时才比较，
 # 这样不会因 seg meta 缺这些字段而误判"不一致"。
 _AUX_KEYS = ("input_mode", "image", "image_dir")

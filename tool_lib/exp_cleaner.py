@@ -230,10 +230,30 @@ def scan_experiments(root_dir: Path | None = None) -> list[ExperimentAnalysis]:
     if not root_dir.exists():
         return []
 
-    analyses: list[ExperimentAnalysis] = []
-    for path in root_dir.rglob("*"):
+    from .file_index import walk_tree
+    from .progress import track
+
+    experiment_dirs: list[Path] = []
+    for path, dirnames, _filenames in walk_tree(
+        root_dir,
+        label="索引待清理实验",
+        followlinks=True,
+    ):
+        if path == root_dir.resolve():
+            continue
         if rt.is_experiment_dir(path):
-            analyses.append(analyze_experiment(path))
+            experiment_dirs.append(path.resolve())
+            dirnames[:] = []
+
+    analyses = [
+        analyze_experiment(path)
+        for path in track(
+            experiment_dirs,
+            label="分析实验占用",
+            total=len(experiment_dirs),
+            unit="exp",
+        )
+    ]
 
     analyses.sort(key=lambda a: _exp_mtime(a.exp_dir), reverse=True)
     return analyses
@@ -414,5 +434,21 @@ def write_clean_log(entries: list[CleanLogEntry], log_path: Path | None = None) 
 
 def run_clean(args) -> None:
     """实验清理主入口（供 dispatch 调用）。"""
-    analyses = scan_experiments()
-    print_clean_report(analyses)
+    analyses = list(getattr(args, "analyses", []) or [])
+    if not analyses:
+        analyses = scan_experiments()
+        if not analyses:
+            print("未扫描到任何实验目录，无需清理。")
+            return
+        print_clean_report(analyses)
+        print_clean_preview(analyses)
+    dry_run = bool(getattr(args, "dry_run", False))
+    if not dry_run and not bool(getattr(args, "yes", True)):
+        raise ValueError("执行清理需要明确确认。")
+    print("\n正在预览清理..." if dry_run else "\n正在清理...")
+    entries = execute_clean(analyses, dry_run=dry_run)
+    if entries and not dry_run:
+        write_clean_log(entries)
+    released = sum(entry.size_bytes for entry in entries)
+    action = "预计释放" if dry_run else "释放空间"
+    print(f"\n清理完成！{action}: {format_size(released)}")

@@ -16,15 +16,17 @@ from generated_mask_to_yoloseg import (  # noqa: E402
 )
 from dataset_discovery import (  # noqa: E402
     auto_datasets_root,
-    scan_generated_mask_roots,
 )
+from dataset_detector import detect_datasets  # noqa: E402
 from output_naming import default_output_dir  # noqa: E402
 
 
 def scan_candidates(root: Path) -> list[Path]:
     """Group leaves as ``root/object/defect/{image,fg}`` candidate roots."""
-    candidates = scan_generated_mask_roots(root)
-    return sorted(candidates, key=lambda p: natural_key(str(p.relative_to(root.resolve()))))
+    return [
+        candidate.path
+        for candidate in detect_datasets(root, kinds={"generated_mask"})
+    ]
 
 
 def inspect_candidate(path: Path) -> dict:
@@ -103,7 +105,7 @@ def print_analysis(src: Path, names_from: Path | None) -> tuple[list, list, list
     return pairs, issues, names, config_source
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="交互式生成 image/fg -> YOLO Seg")
     parser.add_argument("--src", type=Path, help="输入目录；省略时自动扫描并选择")
     parser.add_argument("--out", type=Path, help="输出目录；省略时交互确认默认路径")
@@ -115,7 +117,8 @@ def main() -> None:
     parser.add_argument("--no-auto-invert", action="store_true")
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--yes", action="store_true", help="使用默认值并直接执行")
-    args = parser.parse_args()
+    parser.add_argument("--dry-run", action="store_true", help="分析输入并显示输出计划，保持零写入")
+    args = parser.parse_args(argv)
 
     try:
         if args.src:
@@ -124,7 +127,7 @@ def main() -> None:
             src = choose_source(args.datasets or auto_datasets_root())
             if src is None:
                 print("已退出。")
-                return
+                return 0
 
         print_analysis(src, args.names_from)
         default_out = default_output(src).resolve()
@@ -136,6 +139,12 @@ def main() -> None:
             raw_out = input(f"\nYOLO Seg 输出目录 [默认 {default_out}]: ").strip()
             out = Path(raw_out).expanduser().resolve() if raw_out else default_out
 
+        if args.dry_run:
+            print("\n[dry-run] image/fg → YOLO Seg")
+            print(f"  输入: {src}")
+            print(f"  输出: {out}")
+            return 0
+
         clean = args.clean
         if out.exists() and any(out.iterdir()) and not clean:
             if args.yes:
@@ -145,13 +154,13 @@ def main() -> None:
             )
             if not clean:
                 print("已取消。")
-                return
+                return 0
 
         if not args.yes:
             answer = input(f"开始转换到 {out}？[Y/n]: ").strip().lower()
             if answer in ("n", "no", "否"):
                 print("已取消。")
-                return
+                return 0
 
         convert(
             src, out, names_from=args.names_from, threshold=args.threshold,
@@ -160,9 +169,14 @@ def main() -> None:
         )
     except (ValueError, FileExistsError) as exc:
         parser.error(str(exc))
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         print("\n已退出。")
+        return 0
+    except KeyboardInterrupt:
+        print("\n已退出。")
+        return 130
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

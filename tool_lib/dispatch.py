@@ -11,42 +11,52 @@
 from __future__ import annotations
 
 from . import common as rt
-from . import cls_tools, det_tools, seg_tools
-from . import convert_tools
-from . import det_optimize
-from . import train_tools
-from . import seg_semantic_eda
-from . import seg_semantic_curate
 
 
 def dispatch(args) -> None:
+    if args.tool_task == "clean" and args.tool_action == "clean":
+        from . import exp_cleaner
+
+        exp_cleaner.run_clean(args)
+        return
+
     # 训练：所有任务统一走 train_tools（不再依赖外部脚本）
     if args.tool_action == "train" and args.tool_task in {"det", "cls", "seg"}:
+        from . import train_tools
         train_tools.run_train(args)
         return
 
-    if args.tool_task == "data" and args.tool_action == "convert":
-        convert_tools.run_convert(args)
-        return
-    if args.tool_task == "det" and args.tool_action in {"report", "eda", "optimize", "review-sample"}:
+    if args.tool_task == "det" and args.tool_action in {"eda", "optimize"}:
+        rt.import_data_dependencies()
+    if args.tool_task == "det" and args.tool_action == "review-sample":
         rt.import_runtime_dependencies()
-    # seg eda / curate：语义分割 EDA 和交互式整理
+    # seg eda：自动识别语义 PNG mask / 实例 YOLO polygon。
     if args.tool_task == "seg" and args.tool_action == "eda":
-        rt.import_runtime_dependencies()
-        seg_semantic_eda.run_semantic_eda(args)
+        from . import seg_eda
+        rt.import_data_dependencies()
+        seg_eda.run_seg_eda(args)
         return
     if args.tool_task == "seg" and args.tool_action == "curate":
-        rt.import_runtime_dependencies()
+        from . import seg_semantic_curate
+        rt.import_data_dependencies()
         seg_semantic_curate.run_semantic_curate(args)
         return
     if args.tool_task == "det" and args.tool_action == "report":
+        from . import det_tools
         det_tools.run_report(args)
         return
     if args.tool_task == "det" and args.tool_action == "eda":
+        from . import det_tools
         det_tools.run_eda(args)
         return
     if args.tool_task == "det" and args.tool_action == "optimize":
-        det_optimize.run_optimize(args)
+        from . import det_optimize
+        try:
+            det_optimize.run_optimize(args)
+        finally:
+            det_optimize._cleanup_auto_infer_temp_dir(
+                getattr(args, "auto_infer_temp_dir", None)
+            )
         return
     if args.tool_task == "det" and args.tool_action == "review-sample":
         _dispatch_review_sample(args)
@@ -54,6 +64,7 @@ def dispatch(args) -> None:
     rt.import_runtime_dependencies()
 
     if args.tool_task == "cls":
+        from . import cls_tools
         if args.tool_action == "infer":
             cls_tools.run_infer(args)
             return
@@ -61,13 +72,18 @@ def dispatch(args) -> None:
             cls_tools.run_eval(args)
             return
     if args.tool_task == "det":
+        from . import det_tools
         if args.tool_action == "infer":
             det_tools.run_infer(args)
+            return
+        if args.tool_action == "eval":
+            det_tools.run_eval(args)
             return
         if args.tool_action == "export":
             det_tools.run_export(args)
             return
     if args.tool_task == "seg":
+        from . import seg_tools
         if args.tool_action == "infer":
             seg_tools.run_infer(args)
             return

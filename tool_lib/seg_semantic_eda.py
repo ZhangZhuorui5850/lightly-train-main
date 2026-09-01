@@ -18,23 +18,9 @@ from . import train_tools
 from . import seg_tools
 from .det_eda import _distribution_metrics, _gini, _entropy_evenness, _distribution, _js_divergence
 from .det_analysis import percentile_int
+from .progress import track
 
 SPLIT_ORDER = ("train", "val", "test")
-
-
-def _progress_bar(current: int, total: int, width: int = 20) -> str:
-    safe_total = max(total, 1)
-    clamped_current = min(max(current, 0), safe_total)
-    filled = int(round(width * clamped_current / safe_total))
-    bar = "█" * filled + "░" * (width - filled)
-    pct = int(round(100 * clamped_current / safe_total))
-    return f"{bar} {pct:3d}% {clamped_current}/{safe_total}"
-
-
-def _print_progress(label: str, current: int, total: int, detail: str = "", *, newline: bool = False) -> None:
-    suffix = f" {detail}" if detail else ""
-    end = "\n" if newline else "\r"
-    print(f"  {label} {_progress_bar(current, total)}{suffix}  ", end=end, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +207,12 @@ def _collect_semantic_eda(
         split_entries[split] = split_entry
 
         total_samples = len(samples)
-        for sample_idx, (image_path, mask_path) in enumerate(samples):
-            _print_progress(f"[semantic-eda] 扫描 {split}", sample_idx + 1, total_samples, detail=mask_path.name, newline=(sample_idx + 1 == total_samples))
+        for image_path, mask_path in track(
+            samples,
+            label=f"semantic-eda/{split}",
+            total=total_samples,
+            unit="mask",
+        ):
             try:
                 class_ids, per_class_pixels, total_labeled, ignore_pixels, width, height = \
                     _scan_mask_pixels_fast(mask_path, classes, ignore_classes)
@@ -319,6 +309,8 @@ def _collect_semantic_eda(
     # 组装报告
     report: dict[str, Any] = {
         "meta": {
+            "segmentation_type": "semantic",
+            "annotation_format": "png_mask",
             "source_data": str(source_data_path),
             "split_order": [s for s in SPLIT_ORDER if s in split_entries],
             "total_classes": len(classes),
@@ -556,8 +548,7 @@ def _default_eda_output_dir(source_data_path: Path) -> Path:
     else:
         source_root = source_data_path.resolve().parent
     dataset_tag = rt.dataset_tag_from_dir(source_root)
-    base_dir = rt.EDA_OUTPUT_ROOT_DIR / f"{dataset_tag}-semantic-eda"
-    return rt.deduplicate_path(base_dir)
+    return rt.EDA_OUTPUT_ROOT_DIR / f"{dataset_tag}-semantic-eda"
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +565,11 @@ def generate_semantic_eda_report(
 ) -> Path:
     """生成语义分割 EDA 报告，返回输出目录。"""
     source_data_path = source_data_path.expanduser().resolve()
-    final_output_dir = output_dir.expanduser().resolve() if output_dir is not None else _default_eda_output_dir(source_data_path)
+    if output_dir is not None:
+        final_output_dir = output_dir.expanduser().resolve()
+    else:
+        base_dir = _default_eda_output_dir(source_data_path)
+        final_output_dir = base_dir if overwrite else rt.deduplicate_path(base_dir)
     rt.prepare_output_dir(final_output_dir, overwrite=overwrite)
 
     print(f"[semantic-eda] 扫描数据集: {source_data_path}")
@@ -663,7 +658,7 @@ def generate_semantic_eda_report(
 
     print(f"\n  ── 下一步 ──")
     print(f"  运行 seg curate 进行交互式类别整理:")
-    print(f"    python launcher.py seg curate --eda-dir {final_output_dir}")
+    print(f"    python launcher.py seg-curate --eda-dir {final_output_dir}")
     print()
 
     return final_output_dir

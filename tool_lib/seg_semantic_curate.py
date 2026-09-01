@@ -18,23 +18,9 @@ from . import common as rt
 from . import train_tools
 from . import seg_tools
 from . import interactive
+from .progress import track
 
 SPLIT_ORDER = ("train", "val", "test")
-
-
-def _progress_bar(current: int, total: int, width: int = 20) -> str:
-    safe_total = max(total, 1)
-    clamped_current = min(max(current, 0), safe_total)
-    filled = int(round(width * clamped_current / safe_total))
-    bar = "█" * filled + "░" * (width - filled)
-    pct = int(round(100 * clamped_current / safe_total))
-    return f"{bar} {pct:3d}% {clamped_current}/{safe_total}"
-
-
-def _print_progress(label: str, current: int, total: int, detail: str = "", *, newline: bool = False) -> None:
-    suffix = f" {detail}" if detail else ""
-    end = "\n" if newline else "\r"
-    print(f"  {label} {_progress_bar(current, total)}{suffix}  ", end=end, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -393,11 +379,10 @@ def _materialize_curated_dataset(
     linked_test = 0
     total_rows = len(all_rows)
 
-    for row_idx, row in enumerate(all_rows):
+    for row in track(all_rows, label="seg-curate/链接文件", total=total_rows, unit="file"):
         split = row["split"]
         image_path = Path(row["image_path"])
         mask_path = Path(row["mask_path"])
-        _print_progress("[curate] 链接文件", row_idx + 1, total_rows, detail=image_path.name, newline=(row_idx + 1 == total_rows))
 
         # 确定目标路径
         # 从源配置获取 split 的 images/masks 目录

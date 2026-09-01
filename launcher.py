@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import math
+import re
 import sys
+from pathlib import Path
 
 from tool_lib import common as rt
 from tool_lib.dispatch import dispatch
-from tool_lib.interactive import build_interactive_args, parse_cli_args
+from tool_lib.interactive import (
+    InputCancelled,
+    build_interactive_args,
+    cleanup_pending_optimize_temp_dirs,
+    parse_cli_args,
+    validate_args,
+)
 
 # ============================================================
 # 统一配置区
@@ -14,7 +23,11 @@ from tool_lib.interactive import build_interactive_args, parse_cli_args
 COMMON_SETTINGS = {
     "out_dir": "out",
     "experiment_root_dir": "out",
-    "infer_output_root_dir": "out",
+    # 自动发现会递归扫描这些根目录；可继续添加挂载盘或仓库外数据目录。
+    # 临时扩展可设置 LIGHTLY_DATASET_SEARCH_ROOTS=/mnt/data1:/mnt/data2。
+    "dataset_search_roots": ["datasets"],
+    # 用于搜索历史推理结果；新结果默认归档到对应实验目录。
+    "test_output_root_dir": "out",
     "eda_output_root_dir": "out/EDA",
     "all_report_root_dir": "out/all_report",
 }
@@ -23,7 +36,7 @@ COMMON_SETTINGS = {
 DET_SETTINGS = {
     # 基础配置
     # 这两个最常改：改数据集或实验目录时，下面大部分 det 默认路径会自动跟着变
-    "det_dataset_dir": "datasets/wuwanPic_dataset/dataset_det",
+    "det_dataset_dir": "datasets/convert_datasets/NEU-DET811kuozeng1bei",
     # 留空 / None / "auto" 时，会自动从 out/ 下检索最近的 det 实验目录
     "det_experiment_dir": None,
     "det_default_split": "test",
@@ -37,22 +50,25 @@ DET_SETTINGS = {
     "det_score_threshold": 0.3,
     "det_report_iou_threshold": 0.5,
 
+    # det eval 默认只抽样输出少量 [原图|GT|预测] 对比图，完整指标仍覆盖全部图片。
+    # 0 表示关闭数量限制。
+    "det_eval_vis_max_images": 50,
+
     # 可选覆盖项
     # 如果你不填，系统会自动推导：
     # det_data_yaml          -> <det_dataset_dir>/data.yaml
     # det_infer_image_dir    -> <det_dataset_dir>/images/<det_default_split>
-    # det_infer_output_dir   -> <experiment_dir>/infer-<dataset>-<split>
-    # det_eval_output_dir    -> 同 det_infer_output_dir
-    # det_eval_report_path   -> <det_infer_output_dir>/<run_name>-test_report.json
-    # det_export_report_json -> 同 det_eval_report_path
+    # det_infer_output_dir   -> <experiment_dir>/infer/<dataset>-<id>/<split>
+    # det_eval_output_dir    -> <experiment_dir>/eval/<dataset>-<id>/<split>
+    # det eval 会在同一目录生成对应 split 的指标与 *_report.json。
+    # det_export_report_json 默认自动匹配当前数据集最近的 eval 报告。
     #
     # 只有你确实想和自动规则不一样时，再单独打开某一项覆盖。
     # "det_data_yaml": "datasets/wuwanPic_dataset/dataset_det/data.yaml",
     # "det_infer_image_dir": "datasets/wuwanPic_dataset/dataset_det/images/test",
     # "det_infer_output_dir": "out/2026-04-14/NEU_train/infer-neu-test",
-    # "det_eval_output_dir": "out/2026-04-14/NEU_train/infer-neu-test",
-    # "det_eval_report_path": "out/2026-04-14/NEU_train/infer-neu-test/infer-neu-test-test_report.json",
-    # "det_export_report_json": "out/2026-04-14/NEU_train/infer-neu-test/infer-neu-test-test_report.json",
+    # "det_eval_output_dir": "out/2026-04-14/NEU_train/eval-neu-test",
+    # "det_export_report_json": "out/2026-04-14/NEU_train/eval-neu-test/eval-neu-test-test_report.json",
 
     # export 默认配置
     # det_export_source_data 不填时，默认跟 det_data_yaml 一致
@@ -145,7 +161,7 @@ CLS_SETTINGS = {
 SEG_SETTINGS = {
     # 基础配置
     # 改 seg 数据集时，下面 seg_export_* 的源数据会自动跟着变
-    "seg_dataset_dir": "datasets/neu_dataset/dataset_seg",
+    "seg_dataset_dir": "datasets/convert_datasets/sample_yoloseg",
     "seg_train_type": "instance",
 
     # seg_experiment_dir:
@@ -223,25 +239,132 @@ SEG_SETTINGS = {
 }
 
 def build_user_settings() -> dict[str, object]:
+    groups = [COMMON_SETTINGS, CLS_SETTINGS, DET_SETTINGS, SAHI_SETTINGS, SEG_SETTINGS]
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for group in groups:
+        for key in group:
+            if key in seen:
+                duplicates.add(key)
+            seen.add(key)
+    if duplicates:
+        raise ValueError(f"配置项重复定义: {', '.join(sorted(duplicates))}")
+
     # 把分组配置合并成底层模块统一使用的一份 settings
     settings: dict[str, object] = {}
-    settings.update(COMMON_SETTINGS)
-    settings.update(CLS_SETTINGS)
-    settings.update(DET_SETTINGS)
-    settings.update(SAHI_SETTINGS)
-    settings.update(SEG_SETTINGS)
+    for group in groups:
+        settings.update(group)
+
+    for key, value in settings.items():
+        if isinstance(value, str) and value.strip().casefold() in {"true", "false"}:
+            raise TypeError(f"布尔配置 {key} 必须写 True/False，不能写字符串 {value!r}")
+        if key.endswith("_balance_ratio"):
+            if type(value) not in {int, float}:
+                raise TypeError(f"配置 {key} 必须是数字，实际为 {value!r}")
+            ratio = float(value)
+            if not math.isfinite(ratio):
+                raise ValueError(f"配置 {key} 必须是有限数字，实际为 {value}")
+            if ratio != 0.0 and ratio < 1.0:
+                raise ValueError(f"配置 {key} 必须为 0（自动）或大于等于 1，实际为 {value}")
+            continue
+        if key.endswith(("_threshold", "_overlap", "_iou")):
+            if "_auto_" in key and isinstance(value, bool):
+                continue
+            if type(value) not in {int, float}:
+                raise TypeError(f"配置 {key} 必须是数字，实际为 {value!r}")
+            number = float(value)
+            if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+                raise ValueError(f"配置 {key} 必须位于 [0, 1]，实际为 {value}")
+            if key.endswith("_overlap") and number >= 1.0:
+                raise ValueError(f"配置 {key} 必须位于 [0, 1)，实际为 {value}")
+        if key.endswith(("_workers", "_images", "_instances", "_boxes")):
+            if type(value) is bool:
+                continue
+            if type(value) is not int:
+                raise TypeError(f"配置 {key} 必须是整数，实际为 {value!r}")
+            if value < 0:
+                raise ValueError(f"配置 {key} 不能为负数，实际为 {value}")
+        if key.endswith(("_penalty", "_weight")):
+            if type(value) not in {int, float} or not math.isfinite(float(value)):
+                raise TypeError(f"配置 {key} 必须是有限数字，实际为 {value!r}")
+            if float(value) < 0.0:
+                raise ValueError(f"配置 {key} 不能为负数，实际为 {value}")
+    roots = settings.get("dataset_search_roots")
+    if not isinstance(roots, (str, Path, list, tuple)):
+        raise TypeError("配置 dataset_search_roots 必须是路径字符串或路径列表")
+    if isinstance(roots, (list, tuple)) and any(
+        not isinstance(root, (str, Path)) for root in roots
+    ):
+        raise TypeError("配置 dataset_search_roots 中的每一项都必须是路径")
+    if settings.get("det_default_split") not in {"train", "val", "test"}:
+        raise ValueError("配置 det_default_split 必须是 train、val 或 test")
+    if settings.get("seg_train_type") not in {"instance", "semantic"}:
+        raise ValueError("配置 seg_train_type 必须是 instance 或 semantic")
+    for prefix, unit in (("det_export", "框"), ("seg_export", "实例")):
+        minimum = float(settings[f"{prefix}_avg_{'boxes' if prefix == 'det_export' else 'instances'}_per_image_min"])
+        maximum = float(settings[f"{prefix}_avg_{'boxes' if prefix == 'det_export' else 'instances'}_per_image_max"])
+        if not math.isfinite(minimum) or not math.isfinite(maximum):
+            raise ValueError(f"配置 {prefix} 的平均每图{unit}数必须是有限数字")
+        if minimum < 0 or maximum < 0:
+            raise ValueError(f"配置 {prefix} 的平均每图{unit}数不能为负数")
+        if minimum > maximum and maximum > 0:
+            raise ValueError(f"配置 {prefix} 的平均每图{unit}数最小值不能大于最大值")
+        split_ratio = str(settings[f"{prefix}_split_ratio"]).strip()
+        parts = [part.strip() for part in split_ratio.split(":")]
+        if len(parts) != 3:
+            raise ValueError(f"配置 {prefix}_split_ratio 必须使用 train:val:test 三段格式")
+        try:
+            ratios = [float(part) for part in parts]
+        except ValueError as exc:
+            raise ValueError(f"配置 {prefix}_split_ratio 必须包含三个数字") from exc
+        if any(not math.isfinite(ratio) or ratio < 0 for ratio in ratios) or sum(ratios) <= 0:
+            raise ValueError(f"配置 {prefix}_split_ratio 必须是总和大于 0 的非负有限数字")
+        size_ratio = str(settings[f"{prefix}_size_ratio"]).strip()
+        if size_ratio:
+            size_parts = [part for part in re.split(r"[\s/:,]+", size_ratio) if part]
+            if len(size_parts) != 3:
+                raise ValueError(f"配置 {prefix}_size_ratio 必须包含小、中、大三个数字")
+            try:
+                size_values = [float(part) for part in size_parts]
+            except ValueError as exc:
+                raise ValueError(f"配置 {prefix}_size_ratio 必须包含三个数字") from exc
+            if any(not math.isfinite(ratio) or ratio < 0 for ratio in size_values) or sum(size_values) <= 0:
+                raise ValueError(f"配置 {prefix}_size_ratio 必须是总和大于 0 的非负有限数字")
     return settings
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
-    rt.apply_user_settings(build_user_settings())
-    args = parse_cli_args(argv) if argv else build_interactive_args()
-    if args is None:
-        return
-    dispatch(args)
+    debug = "--debug" in argv
+    argv = [arg for arg in argv if arg != "--debug"]
+    if any(arg in {"-h", "--help"} for arg in argv):
+        parse_cli_args(argv)
+        return 0
+    try:
+        rt.apply_user_settings(build_user_settings())
+        if debug:
+            print(f"[debug] LightlyTrain 源码目录: {rt.SRC_DIR}", file=sys.stderr)
+        args = parse_cli_args(argv) if argv else build_interactive_args()
+        if args is None:
+            return 0
+        dispatch(validate_args(args))
+        return 0
+    except InputCancelled as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 0
+    except KeyboardInterrupt:
+        print("\n已取消。", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        if debug:
+            raise
+        print(f"错误: {exc}", file=sys.stderr)
+        print("使用 --debug 查看完整 traceback。", file=sys.stderr)
+        return 2
+    finally:
+        cleanup_pending_optimize_temp_dirs()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

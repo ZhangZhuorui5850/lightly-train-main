@@ -1473,6 +1473,12 @@ def _select_balanced_train_candidates_legacy(
             )
 
     selected.sort(key=lambda item: item.rel_path.as_posix())
+    if progress_callback is not None:
+        progress_callback(
+            selection_progress_total,
+            selection_progress_total,
+            f"phase=complete pick={len(selected)}/{planned_rounds} eval={evaluation_count}",
+        )
     return selected, {
         "target_total_images": target_total_images,
         "effective_target_total_images": effective_target_total_images,
@@ -1615,6 +1621,8 @@ def select_balanced_train_candidates(
 
     n_candidates = len(candidates)
     if n_candidates == 0:
+        if progress_callback is not None:
+            progress_callback(1, 1, "phase=complete pick=0/0")
         return [], summary_template
 
     picked = [False] * n_candidates
@@ -1793,6 +1801,12 @@ def select_balanced_train_candidates(
     summary["phase2_picks"] = phase2_picks
     summary["phase1_heap_pops"] = heap_pops
     summary["phase1_stale_pops"] = stale_pops
+    if progress_callback is not None:
+        progress_callback(
+            progress_denom,
+            progress_denom,
+            f"phase=complete pick={len(selected)}/{planned_rounds}",
+        )
     return selected, summary
 
 
@@ -1974,6 +1988,12 @@ def _select_size_aware_candidates(
         "avg_boxes_per_image_min": avg_boxes_per_image_min,
         "avg_boxes_per_image_max": avg_boxes_per_image_max,
     }
+    if progress_callback is not None:
+        progress_callback(
+            max(target_n, 1),
+            max(target_n, 1),
+            f"phase=complete size-aware pick={len(selected)}/{target_n}",
+        )
     return selected, summary
 
 

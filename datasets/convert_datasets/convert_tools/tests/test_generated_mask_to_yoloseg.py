@@ -8,6 +8,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 import yaml
 
 TOOLS = Path(__file__).resolve().parents[1]
@@ -102,6 +103,7 @@ def test_convert_without_yaml_generates_complete_yolo_dataset(tmp_path):
 
     config = yaml.safe_load((out / "data.yaml").read_text(encoding="utf-8"))
     assert config["task"] == "segment"
+    assert config["path"] == "."
     assert config["nc"] == 2
     assert config["names"] == {0: "abrasion", 1: "scratch"}
     assert (out / "classes.txt").read_text(encoding="utf-8").splitlines() == ["abrasion", "scratch"]
@@ -129,6 +131,15 @@ def test_convert_merges_same_defect_class_and_avoids_numeric_name_collisions(tmp
     assert scratch["sources"] == ["bearing/scratch", "gear/scratch"]
 
 
+def test_convert_rejects_source_as_output(tmp_path):
+    src = _dataset(tmp_path / "generated")
+
+    with pytest.raises(ValueError, match="输出目录"):
+        gm.convert(src, src, clean=True, verbose=False)
+
+    assert any(src.rglob("*.png"))
+
+
 def test_local_yaml_order_is_used_and_new_defect_is_appended(tmp_path):
     src = _dataset(tmp_path / "generated")
     (src / "data.yaml").write_text(
@@ -151,7 +162,8 @@ def test_size_mismatch_is_skipped_and_written_to_report(tmp_path):
     out = tmp_path / "out"
     result = gm.convert(src, out, verbose=False)
     assert result["skipped"] == 1
-    rows = list(csv.DictReader((out / "conversion_report.csv").open(encoding="utf-8-sig")))
+    with (out / "conversion_report.csv").open(encoding="utf-8-sig") as stream:
+        rows = list(csv.DictReader(stream))
     assert rows[0]["status"] == "size_mismatch"
     assert list((out / "images" / "train").iterdir()) == []
 

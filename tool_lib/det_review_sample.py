@@ -202,19 +202,17 @@ def scan_dataset(
         if not cfg.get(split):
             continue
         try:
-            img_dir, lbl_dir, _ = rt.resolve_dataset_split_paths(cfg, split)
+            samples, _ = rt.list_dataset_samples(cfg, split)
         except (FileNotFoundError, ValueError):
             continue
-        if not img_dir.exists():
-            continue
 
-        for rel_img in track(
-            rt.file_helpers.list_image_filenames_from_dir(image_dir=img_dir),
-            label=f"det/review 校验 {split}", unit="img",
+        for sample in track(
+            samples,
+            label=f"det/review 校验 {split}", total=len(samples), unit="img",
         ):
-            rel_path = Path(rel_img)
-            src_img = img_dir / rel_path
-            src_lbl = (lbl_dir / rel_path.with_suffix(".txt")) if lbl_dir else None
+            rel_path = sample.relative_path
+            src_img = sample.image_path
+            src_lbl = sample.label_path
 
             if src_lbl is None or not src_lbl.exists():
                 report.mismatched_pairs.append(f"{split}/{rel_path}")

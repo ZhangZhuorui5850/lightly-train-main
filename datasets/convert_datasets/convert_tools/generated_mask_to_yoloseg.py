@@ -24,7 +24,20 @@ try:
     import numpy as np
     import yaml
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
-    sys.exit(f"缺少依赖 {exc.name}，请在项目训练环境中运行。当前 Python: {sys.executable}")
+    if not any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+        sys.exit(f"缺少依赖 {exc.name}，请在项目训练环境中运行。当前 Python: {sys.executable}")
+
+try:
+    from .dataset_transaction import staged_output, validate_output_location
+    from .progress import tqdm
+    from .text_encoding import read_text_auto
+except ImportError:
+    from dataset_transaction import (  # type: ignore[no-redef]
+        staged_output,
+        validate_output_location,
+    )
+    from progress import tqdm  # type: ignore[no-redef]
+    from text_encoding import read_text_auto  # type: ignore[no-redef]
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
 SPLITS = ("train", "val", "test")
@@ -81,7 +94,12 @@ def discover_pairs(src: Path) -> tuple[list[Pair], list[ScanIssue]]:
 
     pairs: list[Pair] = []
     issues: list[ScanIssue] = []
-    for image_dir in sorted(image_dirs):
+    for image_dir in tqdm(
+        sorted(image_dirs),
+        desc="检测 image/fg 数据",
+        unit="目录",
+        leave=False,
+    ):
         leaf = image_dir.parent
         fg_dir = leaf / "fg"
         defect = leaf.name
@@ -120,14 +138,14 @@ def _names_from_config(path: Path) -> list[str]:
     if not config.is_file():
         return []
     if config.suffix.lower() in (".yaml", ".yml"):
-        data = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
+        data = yaml.safe_load(read_text_auto(config)) or {}
         raw = data.get("names", data.get("classes"))
         if isinstance(raw, dict):
             return [str(v).strip() for _, v in sorted(raw.items(), key=lambda kv: int(kv[0]))]
         if isinstance(raw, list):
             return [str(v).strip() for v in raw]
         return []
-    return [line.strip() for line in config.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [line.strip() for line in read_text_auto(config).splitlines() if line.strip()]
 
 
 def _automatic_config(src: Path, defects: set[str]) -> Path | None:
@@ -231,7 +249,7 @@ def _output_stem(pair: Pair, src: Path, used: set[str]) -> str:
 
 def _write_dataset_metadata(out: Path, names: list[str], mapping_sources: dict[str, set[str]]) -> None:
     data = {
-        "path": str(out),
+        "path": ".",
         "train": "images/train",
         "val": "images/val",
         "test": "images/test",
@@ -258,7 +276,7 @@ REPORT_FIELDS = (
 )
 
 
-def convert(
+def _convert_unpublished(
     src: Path,
     out: Path,
     *,
@@ -267,8 +285,8 @@ def convert(
     min_area: float = 1.0,
     epsilon: float = 0.001,
     auto_invert: bool = True,
-    clean: bool = False,
     verbose: bool = True,
+    report_output: Path | None = None,
 ) -> dict:
     """Convert all discovered generated image/mask pairs into one YOLO-seg dataset."""
     src, out = src.expanduser().resolve(), out.expanduser().resolve()
@@ -283,10 +301,7 @@ def convert(
     names, config_source = resolve_class_names(src, pairs, names_from)
     class_ids = {name: i for i, name in enumerate(names)}
 
-    if clean and out.exists():
-        shutil.rmtree(out)
-    if out.exists() and any(out.iterdir()):
-        raise FileExistsError(f"输出目录已存在且含有文件: {out}")
+    published_root = report_output or out
     for split in SPLITS:
         (out / "images" / split).mkdir(parents=True, exist_ok=True)
         (out / "labels" / split).mkdir(parents=True, exist_ok=True)
@@ -303,7 +318,12 @@ def convert(
 
     used_stems: set[str] = set()
     converted = empty_masks = skipped = 0
-    for pair in pairs:
+    for pair in tqdm(
+        pairs,
+        desc=f"转换 {src.name}",
+        unit="图片",
+        disable=not verbose,
+    ):
         class_id = class_ids[pair.defect_name]
         mapping_sources[pair.defect_name].add(f"{pair.object_name}/{pair.defect_name}")
         image = cv2.imread(str(pair.image), cv2.IMREAD_COLOR)
@@ -339,7 +359,12 @@ def convert(
                     coords.extend((f"{nx:.6f}", f"{ny:.6f}"))
                 lines.append(f"{class_id} " + " ".join(coords))
             label_dst.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-            output_image, output_label = str(image_dst), str(label_dst)
+            output_image = str(
+                published_root / image_dst.relative_to(out)
+            )
+            output_label = str(
+                published_root / label_dst.relative_to(out)
+            )
             converted += 1
             if not polygons:
                 status, detail = "empty_mask", "阈值处理后未提取到有效轮廓"
@@ -362,16 +387,46 @@ def convert(
         writer.writerows(rows)
 
     result = {
-        "src": src, "out": out, "pairs": len(pairs), "converted": converted,
+        "src": src, "out": published_root, "pairs": len(pairs), "converted": converted,
         "empty_masks": empty_masks, "skipped": skipped, "scan_issues": len(scan_issues),
         "names": names, "config_source": config_source,
     }
     if verbose:
-        print(f"转换完成: {src} -> {out}")
+        print(f"转换完成: {src} -> {published_root}")
         print(f"配对 {len(pairs)}，写入 {converted}，空掩码 {empty_masks}，跳过 {skipped}，配对问题 {len(scan_issues)}")
         print("类别: " + ", ".join(f"{i}={name}" for i, name in enumerate(names)))
         print(f"类别来源: {config_source or '根据缺陷目录自动生成'}")
-        print(f"报告: {out / 'conversion_report.csv'}")
+        print(f"报告: {published_root / 'conversion_report.csv'}")
+    return result
+
+
+def convert(
+    src: Path,
+    out: Path,
+    *,
+    names_from: Path | None = None,
+    threshold: int = 127,
+    min_area: float = 1.0,
+    epsilon: float = 0.001,
+    auto_invert: bool = True,
+    clean: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """Convert into a validated staging tree and publish it atomically."""
+    source = src.expanduser().resolve()
+    published_output = validate_output_location(out, [source])
+    with staged_output(published_output, clean=clean) as stage:
+        result = _convert_unpublished(
+            source,
+            stage,
+            names_from=names_from,
+            threshold=threshold,
+            min_area=min_area,
+            epsilon=epsilon,
+            auto_invert=auto_invert,
+            verbose=verbose,
+            report_output=published_output,
+        )
     return result
 
 

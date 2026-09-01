@@ -53,6 +53,23 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+try:
+    from .output_naming import safe_path_component
+    from .progress import tqdm, write as progress_write
+    from .text_encoding import read_text_auto
+    from .dataset_transaction import (
+        staged_output,
+        validate_output_location,
+    )
+except ImportError:
+    from output_naming import safe_path_component  # type: ignore[no-redef]
+    from progress import tqdm, write as progress_write  # type: ignore[no-redef]
+    from text_encoding import read_text_auto  # type: ignore[no-redef]
+    from dataset_transaction import (  # type: ignore[no-redef]
+        staged_output,
+        validate_output_location,
+    )
+
 # ============================================================
 # 配置区  ── 按需修改
 # ============================================================
@@ -95,11 +112,10 @@ CREATE_EMPTY_TXT_FOR_IMAGE_WITHOUT_JSON = False
 
 # shapes 为空的 JSON 是否生成空 txt
 ALLOW_EMPTY_SHAPES_JSON = True
-PROGRESS_EVERY = 100
 # ============================================================
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="将 LabelMe 或已存在的 YOLO 数据整理为统一 det/cls/seg 输出目录",
     )
@@ -130,7 +146,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="参考类别文件（data.yaml / classes.txt），输出将使用其中的完整类别列表和 ID 映射",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def normalize_selected_tasks(task: str) -> set[str]:
@@ -153,16 +169,8 @@ def safe_mkdir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def log_progress(prefix: str, current: int, total: int) -> None:
-    if total <= 0:
-        return
-    if current == 1 or current == total or current % PROGRESS_EVERY == 0:
-        print(f"  [INFO] {prefix}: {current}/{total}")
-
-
 def load_json(path: Path) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return json.loads(read_text_auto(path))
 
 
 def handle_existing_output(target_root: Path) -> None:
@@ -472,7 +480,7 @@ def normalize_label(label: str) -> str:
 
 def load_class_ref(ref_path: Path) -> Dict[str, int]:
     """从参考文件（data.yaml / dataset.yaml / classes.txt）加载完整类别映射。"""
-    text = ref_path.read_text(encoding="utf-8")
+    text = read_text_auto(ref_path)
     names = None
     # classes.txt 格式：每行一个类别名
     if ref_path.suffix == ".txt" or "names:" not in text:
@@ -536,7 +544,7 @@ def write_data_yaml(class_map: Dict[str, int], target_root: Path, task: str) -> 
     """task: 'detect' 或 'segment'"""
     inverse = {v: k for k, v in class_map.items()}
     lines = [
-        f"path: {target_root.resolve()}",
+        "path: .",
         "train: images/train",
         "val: images/val",
         "test: images/test",
@@ -555,7 +563,7 @@ def write_data_yaml(class_map: Dict[str, int], target_root: Path, task: str) -> 
 def write_cls_data_yaml(class_map: Dict[str, int], target_root: Path) -> None:
     inverse = {v: k for k, v in class_map.items()}
     lines = [
-        f"path: {target_root.resolve()}",
+        "path: .",
         "train: train",
         "val: val",
         "test: test",
@@ -591,14 +599,14 @@ def load_yolo_class_names_from_metadata(source_root: Path) -> Optional[List[str]
         if path.name == "classes.txt":
             names = [
                 line.strip()
-                for line in path.read_text(encoding="utf-8").splitlines()
+                for line in read_text_auto(path).splitlines()
                 if line.strip()
             ]
             if names:
                 return names
             continue
 
-        text = path.read_text(encoding="utf-8")
+        text = read_text_auto(path)
         names = parse_names_from_yaml_text(text)
         if names:
             return names
@@ -681,7 +689,7 @@ def collect_classes_from_yolo(source_root: Path, splits: List[str]) -> Dict[str,
         if not split_dir.exists():
             continue
         for txt in sorted(split_dir.rglob("*.txt")):
-            for raw_line in txt.read_text(encoding="utf-8").splitlines():
+            for raw_line in read_text_auto(txt).splitlines():
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -799,7 +807,12 @@ def convert_split_from_yolo(
     )
 
     total_annotated_images = len(annotated_image_paths)
-    for img_index, img in enumerate(annotated_image_paths, start=1):
+    for img in tqdm(
+        annotated_image_paths,
+        desc="复制图片",
+        unit="img",
+        total=total_annotated_images,
+    ):
         relkey = str(img.relative_to(src_dir).with_suffix("")).replace("\\", "/")
         stem = image_to_stem[img.resolve()]
         dst_name = stem + img.suffix.lower()
@@ -812,10 +825,14 @@ def convert_split_from_yolo(
             copied = True
         if copied:
             stats["images_copied"] += 1
-        log_progress("复制图片", img_index, total_annotated_images)
 
     total_txt_files = len(txt_files)
-    for txt_index, txt_file in enumerate(txt_files, start=1):
+    for txt_file in tqdm(
+        txt_files,
+        desc="转换 YOLO 标注",
+        unit="label",
+        total=total_txt_files,
+    ):
         relkey = str(txt_file.relative_to(src_dir).with_suffix("")).replace("\\", "/")
         out_stem = relkey_to_stem.get(relkey, unique_stem(txt_file, src_dir))
         matched_image = relkey_to_image.get(relkey)
@@ -836,10 +853,10 @@ def convert_split_from_yolo(
         cls_crop_index = 0
 
         try:
-            raw_lines = txt_file.read_text(encoding="utf-8").splitlines()
+            raw_lines = read_text_auto(txt_file).splitlines()
         except Exception as e:
             reason = f"{SKIP_JSON_ERROR}: {e}"
-            print(f"  [SKIP] {txt_file.name} | {reason}")
+            progress_write(f"  [SKIP] {txt_file.name} | {reason}")
             skipped_detail.append({"file": txt_file.name, "shape": None, "reason": reason})
             stats["skipped_json"] += 1
             continue
@@ -875,7 +892,7 @@ def convert_split_from_yolo(
                         save_crop_image(
                             matched_image,
                             (x_min, y_min, x_max, y_max),
-                            dst_img_cls / class_name / crop_name,  # type: ignore[operator]
+                            dst_img_cls / safe_path_component(class_name) / crop_name,  # type: ignore[operator]
                         )
                         cls_crop_index += 1
                         stats["cls_crops"] += 1
@@ -905,7 +922,6 @@ def convert_split_from_yolo(
                 stats["empty_labels_seg"] += 1
 
         stats["json_converted"] += 1
-        log_progress("转换标注", txt_index, total_txt_files)
 
     if CREATE_EMPTY_TXT_FOR_IMAGE_WITHOUT_JSON:
         for _, out_stem in image_to_stem.items():
@@ -990,7 +1006,12 @@ def convert_split(
 
     # ── 复制图片（有标注才复制，det/seg 各一份）───────────────
     total_annotated_images = len(annotated_image_paths)
-    for img_index, img in enumerate(annotated_image_paths, start=1):
+    for img in tqdm(
+        annotated_image_paths,
+        desc="复制图片",
+        unit="img",
+        total=total_annotated_images,
+    ):
         stem     = image_to_stem[img.resolve()]
         dst_name = stem + img.suffix.lower()
         copied = False
@@ -1002,18 +1023,22 @@ def convert_split(
             copied = True
         if copied:
             stats["images_copied"] += 1
-        log_progress("复制图片", img_index, total_annotated_images)
 
     # ── 转换标注 → det txt + seg txt ─────────────────────────
     total_json_files = len(json_files)
-    for json_index, json_file in enumerate(json_files, start=1):
+    for json_file in tqdm(
+        json_files,
+        desc="转换 LabelMe 标注",
+        unit="json",
+        total=total_json_files,
+    ):
         try:
             data         = load_json(json_file)
             img_w, img_h = get_image_size(data, json_file)
             shapes       = data.get("shapes", [])
         except Exception as e:
             reason = f"{SKIP_JSON_ERROR}: {e}"
-            print(f"  [SKIP] {json_file.name} | {reason}")
+            progress_write(f"  [SKIP] {json_file.name} | {reason}")
             skipped_detail.append({"file": json_file.name, "shape": None, "reason": reason})
             stats["skipped_json"] += 1
             continue
@@ -1087,7 +1112,7 @@ def convert_split(
                         save_crop_image(
                             matched_image,
                             bbox,
-                            dst_img_cls / label / crop_name,  # type: ignore[operator]
+                            dst_img_cls / safe_path_component(label) / crop_name,  # type: ignore[operator]
                         )
                         cls_crop_index += 1
                         stats["cls_crops"] += 1
@@ -1133,7 +1158,6 @@ def convert_split(
                 stats["empty_labels_seg"] += 1
 
         stats["json_converted"] += 1
-        log_progress("转换标注", json_index, total_json_files)
 
     # ── 无标注图片补空 txt（可选）────────────────────────────
     if CREATE_EMPTY_TXT_FOR_IMAGE_WITHOUT_JSON:
@@ -1242,10 +1266,16 @@ def integrity_check_cls(target_root: Path, splits: List[str]) -> bool:
 # ============================================================
 # 主函数
 # ============================================================
-def main() -> None:
-    args = parse_args()
-    source_root = Path(args.source_root)
-    output_root = Path(args.output_root)
+def _main_unpublished(
+    args: argparse.Namespace,
+    source_root: Path,
+    output_root: Path,
+    published_output_root: Path,
+    publish_policy: str,
+) -> None:
+    global FIXED_CLASS_MAP, EXISTING_OUTPUT_POLICY
+    FIXED_CLASS_MAP = {}
+    EXISTING_OUTPUT_POLICY = publish_policy
     selected_tasks = normalize_selected_tasks(args.task)
 
     if args.class_ref:
@@ -1253,7 +1283,6 @@ def main() -> None:
         if not ref_path.exists():
             print(f"[ERROR] --class-ref 文件不存在: {ref_path}")
             sys.exit(1)
-        global FIXED_CLASS_MAP
         FIXED_CLASS_MAP = load_class_ref(ref_path)
     target_det = output_root / "dataset_det"
     target_cls = output_root / "dataset_cls"
@@ -1268,14 +1297,14 @@ def main() -> None:
     print("  数据集转换（LabelMe / YOLO -> 统一 YOLO 输出）")
     print("=" * 60)
     print(f"SOURCE_ROOT : {source_root.resolve()}")
-    print(f"OUTPUT_ROOT : {output_root.resolve()}")
+    print(f"OUTPUT_ROOT : {published_output_root}")
     print(f"TASKS       : {sorted(selected_tasks)}")
     if "det" in selected_tasks:
-        print(f"TARGET_DET  : {target_det.resolve()}")
+        print(f"TARGET_DET  : {published_output_root / 'dataset_det'}")
     if "cls" in selected_tasks:
-        print(f"TARGET_CLS  : {target_cls.resolve()}")
+        print(f"TARGET_CLS  : {published_output_root / 'dataset_cls'}")
     if "seg" in selected_tasks:
-        print(f"TARGET_SEG  : {target_seg.resolve()}")
+        print(f"TARGET_SEG  : {published_output_root / 'dataset_seg'}")
     print(f"SPLITS      : {SPLITS}")
     print(f"RECURSIVE   : {RECURSIVE_SCAN}")
     print(f"SOURCE_FMT  : {source_format}")
@@ -1365,12 +1394,42 @@ def main() -> None:
             integrity_check(target_seg, SPLITS, "seg")
 
     if "det" in selected_tasks:
-        print(f"\n检测输出: {target_det.resolve()}")
+        print(f"\n检测输出: {published_output_root / 'dataset_det'}")
     if "cls" in selected_tasks:
-        print(f"分类输出: {target_cls.resolve()}")
+        print(f"分类输出: {published_output_root / 'dataset_cls'}")
     if "seg" in selected_tasks:
-        print(f"分割输出: {target_seg.resolve()}")
+        print(f"分割输出: {published_output_root / 'dataset_seg'}")
     print("\n转换完成 ✓  原数据集未被修改。")
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    source_root = Path(args.source_root).expanduser().resolve()
+    published_output_root = validate_output_location(
+        Path(args.output_root), [source_root]
+    )
+    publish_policy = EXISTING_OUTPUT_POLICY
+    if (
+        publish_policy == "ask"
+        and published_output_root.is_dir()
+        and any(published_output_root.iterdir())
+    ):
+        answer = input(
+            f"\n[!] 输出目录已有数据: {published_output_root}\n"
+            "    输入 y 重新生成，输入 n 合并到旧输出 [y/n]: "
+        ).strip().lower()
+        publish_policy = "clean" if answer == "y" else "keep"
+    with staged_output(published_output_root, clean=True) as output_root:
+        if publish_policy == "keep" and published_output_root.exists():
+            shutil.copytree(published_output_root, output_root, dirs_exist_ok=True)
+        _main_unpublished(
+            args,
+            source_root,
+            output_root,
+            published_output_root,
+            publish_policy,
+        )
+    print(f"原子发布: {published_output_root}")
 
 
 if __name__ == "__main__":

@@ -70,6 +70,52 @@ def test_convert_yolo_polygons_to_train_seg_dataset(tmp_path: Path) -> None:
     assert report["splits"]["val"]["background_images"] == 1
 
 
+def test_convert_rejects_output_inside_source(tmp_path: Path) -> None:
+    source = _make_yolo_seg(tmp_path / "dataset_seg")
+
+    with pytest.raises(ValueError, match="输出目录"):
+        converter.convert_dataset(source, source / "converted", clean=True)
+
+    assert (source / "images" / "train" / "a.jpg").is_file()
+
+
+def test_cli_dry_run_validates_without_creating_output(tmp_path: Path) -> None:
+    source = _make_yolo_seg(tmp_path / "dataset_seg")
+    output = tmp_path / "dataset_semantic"
+
+    assert converter.main(["--src", str(source), "--out", str(output), "--dry-run"]) == 0
+
+    assert not output.exists()
+
+
+def test_convert_preserves_manifest_membership_and_nested_paths(tmp_path: Path) -> None:
+    source = _make_yolo_seg(tmp_path / "dataset_seg")
+    _image(source / "images/train/nested/selected.jpg")
+    selected_label = source / "labels/train/nested/selected.txt"
+    selected_label.parent.mkdir(parents=True)
+    selected_label.write_text(
+        "0 0.1 0.1 0.8 0.1 0.8 0.8 0.1 0.8\n",
+        encoding="utf-8",
+    )
+    (source / "train.txt").write_text(
+        "images/train/nested/selected.jpg\n",
+        encoding="utf-8",
+    )
+    config = yaml.safe_load((source / "data.yaml").read_text(encoding="utf-8"))
+    config["train"] = "train.txt"
+    (source / "data.yaml").write_text(
+        yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+    )
+    output = tmp_path / "semantic"
+
+    report = converter.convert_dataset(source, output)
+
+    assert report["splits"]["train"]["images"] == 1
+    assert (output / "images/train/nested/selected.jpg").is_file()
+    assert (output / "masks/train/nested/selected.png").is_file()
+    assert not (output / "images/train/a.jpg").exists()
+
+
 def test_converter_rejects_detection_labels(tmp_path: Path) -> None:
     source = _make_yolo_seg(tmp_path / "dataset_det")
     (source / "labels/train/a.txt").write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
@@ -104,7 +150,13 @@ def test_discovery_classifies_supported_datasets(tmp_path: Path) -> None:
     assert kinds[det.resolve()] == "yolo_detection"
     assert kinds[semantic.resolve()] == "semantic_mask"
     candidate = discovery.inspect_config_dataset(seg / "data.yaml")
-    assert discovery.conversion_actions(candidate) == ("to-semantic", "to-mvtec")
+    assert discovery.conversion_actions(candidate) == (
+        "edit-classes",
+        "to-semantic",
+        "to-mvtec",
+    )
+    semantic_candidate = discovery.inspect_config_dataset(semantic / "data.yaml")
+    assert discovery.conversion_actions(semantic_candidate) == ("edit-classes",)
 
 
 def test_output_directory_uses_source_and_operation(tmp_path: Path) -> None:
@@ -114,6 +166,9 @@ def test_output_directory_uses_source_and_operation(tmp_path: Path) -> None:
     )
     assert output_naming.default_output_dir(source, "to-mvtec") == (
         tmp_path / "dataset_seg__to_mvtec_ad"
+    )
+    assert output_naming.default_output_dir(source, "edit-classes") == (
+        tmp_path / "dataset_seg__edit_classes"
     )
 
 
@@ -129,7 +184,7 @@ def test_wizard_selects_operation_before_scanning(
         class_count=2,
     )
     events: list[str] = []
-    answers = iter(["1", "1", ""])
+    answers = iter(["2", "1", ""])
 
     def fake_input(_prompt: str) -> str:
         events.append("prompt")

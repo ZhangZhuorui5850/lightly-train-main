@@ -479,21 +479,48 @@ def collect_source_image_infos(source_cfg: dict[str, Any], source_root: Path) ->
         split_value = source_cfg.get(split_name)
         if not split_value:
             continue
-        split_image_dir, split_label_dir, _ = rt.resolve_dataset_split_paths(source_cfg, split_name)
-        if split_label_dir is None or not split_image_dir.exists():
+        try:
+            samples, _ = rt.list_dataset_samples(source_cfg, split_name)
+        except ValueError:
             continue
-        rel_split_image_dir, rel_split_label_dir = resolve_export_split_dirs(
-            split_name=split_name,
-            source_root=source_root,
-            split_image_dir=split_image_dir,
-            split_label_dir=split_label_dir,
-        )
-        source_infos_by_split[split_name] = scan_source_split(
-            split_name=split_name,
-            split_image_dir=split_image_dir,
-            split_label_dir=split_label_dir,
-            rel_split_image_dir=rel_split_image_dir,
-            rel_split_label_dir=rel_split_label_dir,
+        complex_source = isinstance(split_value, (list, dict)) or Path(
+            str(split_value)
+        ).suffix.casefold() in ({".txt"} | rt.VISUALIZATION_SUFFIXES)
+        if complex_source:
+            rel_split_image_dir = Path("images") / split_name
+            rel_split_label_dir = Path("labels") / split_name
+        else:
+            split_image_dir, split_label_dir, _ = rt.resolve_dataset_split_paths(
+                source_cfg, split_name
+            )
+            if split_label_dir is None:
+                split_label_dir = source_root / "labels" / split_name
+            rel_split_image_dir, rel_split_label_dir = resolve_export_split_dirs(
+                split_name=split_name,
+                source_root=source_root,
+                split_image_dir=split_image_dir,
+                split_label_dir=split_label_dir,
+            )
+        infos: list[SourceImageInfo] = []
+        for sample in samples:
+            src_label_path = sample.label_path or (
+                source_root / ".missing_labels" / split_name / sample.relative_path
+            ).with_suffix(".txt")
+            label_lines, class_box_counts = read_yolo_label_lines(src_label_path)
+            infos.append(
+                SourceImageInfo(
+                    split_name=split_name,
+                    rel_split_image_dir=rel_split_image_dir,
+                    rel_split_label_dir=rel_split_label_dir,
+                    rel_path=sample.relative_path,
+                    src_image_path=sample.image_path,
+                    src_label_path=src_label_path,
+                    label_lines=label_lines,
+                    class_box_counts=class_box_counts,
+                )
+            )
+        source_infos_by_split[split_name] = sorted(
+            infos, key=lambda item: item.rel_path.as_posix()
         )
         export_split_paths[split_name] = rel_split_image_dir.as_posix()
     return source_infos_by_split, export_split_paths

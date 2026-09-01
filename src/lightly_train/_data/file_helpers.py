@@ -131,7 +131,18 @@ def _get_image_filenames(
     image_extensions = (
         _supported_image_extensions() if image_extensions is None else image_extensions
     )
-    for dirpath, _, filenames in os.walk(image_dir, followlinks=True):
+    visited_directories: set[tuple[int, int]] = set()
+    for dirpath, dirnames, filenames in os.walk(image_dir, followlinks=True):
+        try:
+            stat_result = os.stat(dirpath)
+            identity = (stat_result.st_dev, stat_result.st_ino)
+        except OSError:
+            dirnames[:] = []
+            continue
+        if identity in visited_directories:
+            dirnames[:] = []
+            continue
+        visited_directories.add(identity)
         # Make paths relative to image_dir. `dirpath` is absolute.
         parent = os.path.relpath(dirpath, start=image_dir)
         parent = "" if parent == "." else parent

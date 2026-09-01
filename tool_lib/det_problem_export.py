@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import common as rt
+from .file_index import find_files
 from .progress import track
 
 
@@ -259,7 +260,11 @@ def discover_infer_runs(experiment_dir: Path) -> list[dict[str, Any]]:
     experiment_dir = experiment_dir.expanduser().resolve()
     runs: list[dict[str, Any]] = []
 
-    for run_meta_path in experiment_dir.rglob("run_meta.json"):
+    for run_meta_path in find_files(
+        [experiment_dir],
+        label="索引推理结果",
+        filenames={"run_meta.json"},
+    ):
         try:
             run_meta = json.loads(run_meta_path.read_text(encoding="utf-8"))
         except Exception:
@@ -270,31 +275,36 @@ def discover_infer_runs(experiment_dir: Path) -> list[dict[str, Any]]:
         if run_meta.get("task") != "det" or run_meta.get("action") != "infer":
             continue
 
-        # 检查是否属于当前实验
+        # run_meta 的物理位置是当前实验的权威归属；记录的绝对路径可能因项目搬迁而过期。
         paths_payload = run_meta.get("paths", {})
-        recorded_experiment_dir = paths_payload.get("experiment_dir")
-        if recorded_experiment_dir:
-            recorded_path = Path(recorded_experiment_dir).expanduser().resolve()
-            if recorded_path != experiment_dir:
-                continue
+        if not isinstance(paths_payload, dict):
+            paths_payload = {}
+        output_dir = run_meta_path.parent.resolve()
 
-        output_dir = paths_payload.get("output_dir")
-        if output_dir:
-            output_dir = Path(output_dir).expanduser().resolve()
-        else:
-            output_dir = run_meta_path.parent
-
-        # 查找report_path
+        # 优先按原 output_dir 的相对位置将 report 重定位到当前目录。
         report_path = None
         report_path_str = paths_payload.get("report_path")
         if report_path_str:
-            report_path = Path(report_path_str).expanduser().resolve()
-            if not report_path.exists():
-                report_path = None
+            recorded_report = Path(report_path_str).expanduser()
+            recorded_output = paths_payload.get("output_dir")
+            if recorded_output:
+                try:
+                    relative_report = recorded_report.resolve().relative_to(
+                        Path(recorded_output).expanduser().resolve()
+                    )
+                    rebased_report = output_dir / relative_report
+                    if rebased_report.is_file():
+                        report_path = rebased_report
+                except (OSError, ValueError):
+                    pass
+            if report_path is None:
+                local_report = output_dir / recorded_report.name
+                if local_report.is_file():
+                    report_path = local_report
 
-        # 自动查找test_report.json
+        # 自动查找各 split 的评估报告。
         if report_path is None:
-            for pattern in ["*test_report.json", "test_report.json"]:
+            for pattern in ["*_report.json", "test_report.json"]:
                 candidates = sorted(output_dir.glob(pattern))
                 if candidates:
                     report_path = candidates[-1]
@@ -313,7 +323,13 @@ def discover_infer_runs(experiment_dir: Path) -> list[dict[str, Any]]:
         })
 
     # 按时间排序，最新的在前
-    runs.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    runs.sort(
+        key=lambda x: (
+            x.get("created_at") or "",
+            x["run_meta_path"].stat().st_mtime,
+        ),
+        reverse=True,
+    )
     return runs
 
 

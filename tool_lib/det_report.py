@@ -19,6 +19,7 @@ from typing import Any
 from PIL import Image
 
 from . import common as rt
+from .file_index import find_files
 
 REPORT_BASENAME = "single_report"
 SMALL_OBJECT_AREA_THRESHOLD = 32.0 * 32.0
@@ -599,17 +600,17 @@ def _find_report_path(output_dir: Path, run_meta: dict[str, Any]) -> Path | None
     if report_path is not None and report_path.exists():
         return report_path
     split_name = str(run_meta.get("split") or "").strip().lower()
-    candidates = sorted(output_dir.glob("*test_report.json"))
+    candidates = sorted(output_dir.glob("*_report.json"))
     if candidates:
         prioritized = []
         for candidate in candidates:
             score = 0
             name = candidate.name.lower()
-            if name.endswith("test_report.json"):
+            if name.endswith("_report.json"):
                 score += 10
             if split_name and f"-{split_name}-" in name:
                 score += 6
-            if split_name and name.endswith(f"-{split_name}-test_report.json"):
+            if split_name and name.endswith(f"-{split_name}_report.json"):
                 score += 8
             if split_name and split_name in name:
                 score += 2
@@ -630,54 +631,60 @@ def _discover_infer_runs(experiment_dir: Path) -> list[InferRunRecord]:
         search_roots.append(rt.TEST_OUTPUT_ROOT_DIR)
 
     seen_run_meta_paths: set[Path] = set()
-    for search_root in search_roots:
-        if not search_root.exists():
+    for run_meta_path in find_files(
+        search_roots,
+        label="索引 infer/eval 记录",
+        filenames={"run_meta.json"},
+    ):
+        resolved_run_meta_path = run_meta_path.resolve()
+        if resolved_run_meta_path in seen_run_meta_paths:
             continue
-        for run_meta_path in search_root.rglob("run_meta.json"):
-            resolved_run_meta_path = run_meta_path.resolve()
-            if resolved_run_meta_path in seen_run_meta_paths:
-                continue
-            seen_run_meta_paths.add(resolved_run_meta_path)
-            run_meta = _load_json(run_meta_path)
-            if run_meta is None:
-                continue
-            if run_meta.get("task") != "det" or run_meta.get("action") != "infer":
-                continue
-            paths_payload = run_meta.get("paths", {})
-            recorded_experiment_dir = _resolve_optional_path(paths_payload.get("experiment_dir"))
-            if recorded_experiment_dir != expected_experiment_dir:
-                continue
+        seen_run_meta_paths.add(resolved_run_meta_path)
+        run_meta = _load_json(run_meta_path)
+        if run_meta is None:
+            continue
+        if run_meta.get("task") != "det" or run_meta.get("action") not in {"eval", "infer"}:
+            continue
+        paths_payload = run_meta.get("paths", {})
+        recorded_experiment_dir = _resolve_optional_path(paths_payload.get("experiment_dir"))
+        try:
+            physically_inside = resolved_run_meta_path.is_relative_to(expected_experiment_dir)
+        except AttributeError:  # pragma: no cover - Python < 3.9 compatibility
+            physically_inside = expected_experiment_dir in resolved_run_meta_path.parents
+        if not physically_inside and recorded_experiment_dir != expected_experiment_dir:
+            continue
 
-            output_dir = _resolve_optional_path(paths_payload.get("output_dir"))
-            if output_dir is None:
-                output_dir = run_meta_path.parent
-            report_path = _find_report_path(output_dir, run_meta)
-            metrics_path = _resolve_optional_path(run_meta.get("artifacts", {}).get("metrics_summary"))
-            if metrics_path is None:
-                candidate = output_dir / "metrics_summary.json"
-                metrics_path = candidate if candidate.exists() else None
+        output_dir = run_meta_path.parent.resolve()
+        report_path = _find_report_path(output_dir, run_meta)
+        metrics_path = _resolve_optional_path(run_meta.get("artifacts", {}).get("metrics_summary"))
+        if metrics_path is None or not metrics_path.exists():
+            candidate = output_dir / "metrics_summary.json"
+            metrics_path = candidate if candidate.exists() else None
 
-            report_payload = _load_json(report_path)
-            metrics_payload = _load_json(metrics_path)
-            report_config = report_payload.get("config", {}) if isinstance(report_payload, dict) else {}
-            split = str(run_meta.get("split") or report_config.get("split") or "unknown")
-            runs.append(
-                InferRunRecord(
-                    output_dir=output_dir,
-                    split=split,
-                    created_at=str(run_meta.get("created_at")) if run_meta.get("created_at") else None,
-                    report_path=report_path,
-                    metrics_path=metrics_path,
-                    run_meta_path=run_meta_path,
-                    report_payload=report_payload,
-                    metrics_payload=metrics_payload,
-                    run_meta=run_meta,
-                    mtime=run_meta_path.stat().st_mtime,
-                )
+        report_payload = _load_json(report_path)
+        metrics_payload = _load_json(metrics_path)
+        if report_payload is None and metrics_payload is None:
+            continue
+        report_config = report_payload.get("config", {}) if isinstance(report_payload, dict) else {}
+        split = str(run_meta.get("split") or report_config.get("split") or "unknown")
+        runs.append(
+            InferRunRecord(
+                output_dir=output_dir,
+                split=split,
+                created_at=str(run_meta.get("created_at")) if run_meta.get("created_at") else None,
+                report_path=report_path,
+                metrics_path=metrics_path,
+                run_meta_path=run_meta_path,
+                report_payload=report_payload,
+                metrics_payload=metrics_payload,
+                run_meta=run_meta,
+                mtime=run_meta_path.stat().st_mtime,
             )
+        )
 
     runs.sort(
         key=lambda item: (
+            item.run_meta.get("action") == "eval",
             item.created_at or "",
             item.mtime,
             item.output_dir.name,

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import time
@@ -26,6 +27,7 @@ from typing import Any
 from . import common as rt
 from . import gpu_parallel
 from . import run_reuse
+from .artifact_transaction import staged_directory
 from . import train_tools
 from .progress import track
 from .seg_export import run_export  # noqa: F401  re-export to keep dispatch wiring simple
@@ -117,6 +119,33 @@ def _seg_infer_image_paths(args: Any) -> list[Path]:
         samples, _ = rt.list_dataset_samples(data_cfg=data_cfg, split=args.split)
         return [sample.image_path for sample in samples]
     return rt.list_image_files(args.image if args.image is not None else args.image_dir)
+
+
+def _seg_infer_relative_paths(args: Any, image_paths: list[Path]) -> dict[Path, Path]:
+    """Build collision-free output paths while preserving input subdirectories."""
+    if not image_paths:
+        return {}
+    if getattr(args, "image", None) is not None:
+        return {image_paths[0]: Path(image_paths[0].name)}
+    explicit_dir = getattr(args, "image_dir", None)
+    if explicit_dir is not None:
+        root = Path(explicit_dir).expanduser().resolve()
+    else:
+        common = Path(os.path.commonpath([str(path.resolve()) for path in image_paths]))
+        root = common if common.is_dir() else common.parent
+    result: dict[Path, Path] = {}
+    used: set[str] = set()
+    for image_path in image_paths:
+        try:
+            relative = image_path.resolve().relative_to(root)
+        except ValueError:
+            relative = Path(image_path.name)
+        key = relative.as_posix().casefold()
+        if key in used:
+            raise ValueError(f"分割推理输出路径冲突: {relative}（来源 {image_path}）")
+        used.add(key)
+        result[image_path] = relative
+    return result
 
 
 def _seg_infer_gt_lookup(args: Any) -> dict[Path, Path | None]:
@@ -252,7 +281,7 @@ def _semantic_class_mapping(model: Any, data_path: Path, split: str) -> dict[str
     data_cfg = train_tools.load_semantic_segmentation_split_config(data_path, split)
     classes = data_cfg["classes"]
     ignore_classes = {int(item) for item in data_cfg.get("ignore_classes", set()) or set()}
-    class_names = rt.get_model_class_names(model)
+    class_names = model if isinstance(model, dict) else rt.get_model_class_names(model)
     model_class_ids = sorted(class_names)
     model_class_to_idx = {cid: i for i, cid in enumerate(model_class_ids)}
     data_class_ids_sorted = sorted(set(classes) - ignore_classes)
@@ -467,7 +496,12 @@ def save_instance_comparison(image_path: Path, output_path: Path, prediction: di
     )
 
 
-def _eval_compare_dir(output_like: Path) -> Path:
+def _eval_compare_dir(
+    output_like: Path,
+    *,
+    split: str | None = None,
+    multi_split: bool = False,
+) -> Path:
     """对比图的稳定落盘目录。
 
     分片子进程的 output_dir 形如 <final>/_shards/shard_xx，该目录评估后会被整体删除，
@@ -475,7 +509,11 @@ def _eval_compare_dir(output_like: Path) -> Path:
     """
     path = Path(output_like)
     if path.parent.name == "_shards":
-        return path.parent.parent / "compare"
+        path = path.parent.parent
+    if multi_split:
+        if split is None:
+            raise ValueError("split is required when multi_split is enabled.")
+        path = path / split
     return path / "compare"
 
 
@@ -536,7 +574,7 @@ def save_semantic_comparison(image_path: Path, output_path: Path, gt_idx: Any, p
 
 
 def _render_semantic_visualizations(
-    model: Any,
+    model: Any | None,
     data_path: Path,
     split: str,
     rows: list[dict[str, Any]],
@@ -582,15 +620,28 @@ def _render_semantic_visualizations(
     def _render_bucket(bucket: list[dict[str, Any]], subdir: str | None) -> None:
         target_dir = compare_root / subdir if subdir else compare_root
         for rank, row in enumerate(
-            track(bucket, label=f"seg/eval 出图 {subdir or 'all'}", total=len(bucket), unit="img"),
+            track(
+                bucket,
+                label=f"seg/eval 出图 {subdir or 'all'}",
+                total=len(bucket),
+                unit="img",
+                aggregate="extra",
+            ),
             start=1,
         ):
             image_path = Path(row["image_path"])
             mask_path = Path(row["mask_path"])
             score = float(row.get("vis_miou", 0.0))
             try:
-                prediction = predict_model(model, image_path, 0.0)
-                pred_np = _prediction_to_numpy(prediction)
+                prediction_path = row.get("prediction_path")
+                if prediction_path:
+                    with rt.Image.open(Path(prediction_path)) as prediction_image:
+                        pred_np = rt.np.array(prediction_image)
+                else:
+                    if model is None:
+                        raise ValueError("缺少缓存预测，且父进程没有加载模型")
+                    prediction = predict_model(model, image_path, 0.0)
+                    pred_np = _prediction_to_numpy(prediction)
                 target_np = _load_semantic_mask(mask_path, mapping["classes"], mapping["ignore_classes"])
                 pred_np = _resize_prediction_if_needed(pred_np, target_np.shape)
                 target_remapped, pred_remapped = _remap_semantic_arrays(pred_np, target_np, mapping)
@@ -680,26 +731,50 @@ def _seg_reuse_precheck(args, action: str) -> str:
         threshold=getattr(args, "threshold", None), input_mode=input_mode,
         image=getattr(args, "image", None), image_dir=getattr(args, "image_dir", None),
         seg_train_type=seg_type,
+        options={
+            "save_visualization": bool(getattr(args, "save_visualization", True)),
+            "classwise": bool(getattr(args, "classwise", False)),
+            "vis_max_images": getattr(args, "vis_max_images", None),
+        },
     )
-    # 所需产物：infer 看 run_meta（末尾才写=跑完）；eval 看评估摘要，
-    # 开了可视化还要求对比图齐全，否则视为"数据不足"自动重跑。
+    # run_meta 只有成功完成后才原子写入。对比图可能因数据没有有效标注而合法为空，
+    # 因此不把非空 compare/ 当作完成条件。
     if action == "eval":
         summary = "seg_semantic_eval_summary.json" if seg_type == "semantic" else "seg_eval_summary.json"
-        required = [summary]
-        if getattr(args, "save_visualization", True):
-            required.append("compare")
+        splits = _normalize_splits(getattr(args, "split", None))
+        prefixes = [f"{split}/" for split in splits] if len(splits) > 1 else [""]
+        required = [f"{prefix}{summary}" for prefix in prefixes]
+        required.extend(f"{prefix}run_meta.json" for prefix in prefixes)
     else:
         required = ["run_meta.json"]
     return run_reuse.precheck(args, args.output_dir, fingerprint, action_label=f"seg/{action}", required=required)
 
 
 def run_infer(args) -> None:
+    if _is_seg_shard_child(args) or getattr(args, "dry_run", False):
+        _run_infer_impl(args)
+        return
+    if _seg_reuse_precheck(args, "infer") == run_reuse.REUSE:
+        print(f"[seg/infer] 已复用上次结果，未重新推理：{args.output_dir}")
+        return
+    final_output_dir = Path(args.output_dir).expanduser().resolve()
+    original_output_dir = args.output_dir
+    original_overwrite = args.overwrite
+    try:
+        with staged_directory(final_output_dir, overwrite=args.overwrite) as stage:
+            args.output_dir = stage
+            args.overwrite = True
+            args._published_output_dir = final_output_dir
+            _run_infer_impl(args)
+    finally:
+        args.output_dir = original_output_dir
+        args.overwrite = original_overwrite
+        if hasattr(args, "_published_output_dir"):
+            delattr(args, "_published_output_dir")
+
+
+def _run_infer_impl(args) -> None:
     action = "infer"
-    # 初步复用检测（仅父进程、非 dry-run）：数据齐全且一致就复用，否则自动重跑。
-    if not _is_seg_shard_child(args) and not getattr(args, "dry_run", False):
-        if _seg_reuse_precheck(args, "infer") == run_reuse.REUSE:
-            print(f"[seg/infer] 已复用上次结果，未重新推理：{args.output_dir}")
-            return
     if not _is_seg_shard_child(args) and run_parallel_seg_infer(args):
         return
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
@@ -725,7 +800,9 @@ def run_infer(args) -> None:
             print(f"[seg/{action}] {message}")
         else:
             eligible = gpu_parallel.filter_high_memory_gpus(all_gpus)
-            chosen, choose_msg = gpu_parallel.select_fallback_single_gpu(all_gpus, eligible)
+            chosen, choose_msg = gpu_parallel.select_fallback_single_gpu(
+                all_gpus, eligible, component=f"seg/{action}"
+            )
             print(f"[seg/{action}] {choose_msg}")
             if chosen is not None:
                 resolved_device_arg = chosen
@@ -737,9 +814,11 @@ def run_infer(args) -> None:
     image_paths = _seg_infer_image_paths(args)
     if not image_paths:
         raise ValueError("没有找到可推理的图片。")
+    relative_outputs = _seg_infer_relative_paths(args, image_paths)
     if _is_seg_shard_child(args):
         subset = gpu_parallel.filter_indices_for_shard(
-            len(image_paths), shard_index=args.shard_index, num_shards=args.num_shards
+            len(image_paths), shard_index=args.shard_index, num_shards=args.num_shards,
+            weights=[float(path.stat().st_size) if path.exists() else 1.0 for path in image_paths],
         )
         image_paths = [image_paths[i] for i in subset]
     # 数据集模式（实例分割）下能拿到真值，额外产出 [原图|GT|预测] 三联对比图。
@@ -748,11 +827,17 @@ def run_infer(args) -> None:
     images_dir = output_dir / "images"
     compare_dir = output_dir / "compare"
     for idx, image_path in enumerate(
-        track(image_paths, label="seg/infer 推理", total=len(image_paths), unit="img"),
+        track(
+            image_paths,
+            label="seg/infer 推理",
+            total=len(image_paths),
+            unit="img",
+            shard_scope="inference",
+        ),
         start=1,
     ):
         prediction = predict_model(model, image_path, args.threshold)
-        out_path = images_dir / image_path.name
+        out_path = images_dir / relative_outputs[image_path]
         if isinstance(prediction, dict) and "masks" in prediction:
             save_instance_visualization(image_path, out_path, prediction, class_names)
             label_path = gt_lookup.get(image_path)
@@ -761,7 +846,10 @@ def run_infer(args) -> None:
                 image_size = (int(masks.shape[-1]), int(masks.shape[-2]))  # (width, height)
                 target, has_label = load_instance_ground_truth(label_path, image_size)
                 if has_label:
-                    compare_path = compare_dir / f"{out_path.stem}_compare.png"
+                    relative_out = out_path.relative_to(images_dir)
+                    compare_path = (compare_dir / relative_out).with_name(
+                        f"{relative_out.stem}_compare.png"
+                    )
                     save_instance_comparison(image_path, compare_path, prediction, target, class_names)
         else:
             save_semantic_visualization(image_path, out_path, prediction, class_names)
@@ -854,9 +942,18 @@ def _deserialize_instance_entry(entry: dict[str, Any]) -> tuple[dict[str, Any], 
 
 def _write_seg_run_meta(meta_path, *, action, checkpoint_path, output_dir, args, num_images, device_mode):
     split_value = getattr(args, "split", None)
+    recorded_output_dir = Path(output_dir)
+    published_root = getattr(args, "_published_output_dir", None)
+    stage_root = getattr(args, "output_dir", None)
+    if published_root is not None and stage_root is not None:
+        try:
+            recorded_output_dir = Path(published_root) / Path(output_dir).relative_to(Path(stage_root))
+        except ValueError:
+            pass
     payload = {
         "task": "seg",
         "action": action,
+        "complete": True,
         "created_at": rt.timestamp_now_iso(),
         "seg_train_type": str(getattr(args, "seg_train_type", "instance")),
         "split": split_value if isinstance(split_value, str) else _normalize_splits(split_value or []),
@@ -866,7 +963,7 @@ def _write_seg_run_meta(meta_path, *, action, checkpoint_path, output_dir, args,
             else ("image" if getattr(args, "image", None) is not None else "image_dir")
         ),
         "paths": {
-            "output_dir": str(output_dir),
+            "output_dir": str(recorded_output_dir),
             "checkpoint_path": str(checkpoint_path),
             "data": str(getattr(args, "data", None)) if getattr(args, "data", None) is not None else None,
             "image": str(getattr(args, "image", None)) if getattr(args, "image", None) is not None else None,
@@ -879,8 +976,23 @@ def _write_seg_run_meta(meta_path, *, action, checkpoint_path, output_dir, args,
             "overwrite": getattr(args, "overwrite", None),
         },
     }
+    payload["fingerprint"] = run_reuse.make_fingerprint(
+        task="seg", action=action, checkpoint=checkpoint_path,
+        data=getattr(args, "data", None), split=getattr(args, "split", None),
+        threshold=getattr(args, "threshold", None),
+        input_mode=payload["input_mode"], image=getattr(args, "image", None),
+        image_dir=getattr(args, "image_dir", None),
+        seg_train_type=_normalize_seg_type(args),
+        options={
+            "save_visualization": bool(getattr(args, "save_visualization", True)),
+            "classwise": bool(getattr(args, "classwise", False)),
+            "vis_max_images": getattr(args, "vis_max_images", None),
+        },
+    )
     meta_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temp_meta = meta_path.with_name(f".{meta_path.name}.{os.getpid()}.tmp")
+    temp_meta.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temp_meta.replace(meta_path)
 
 
 def _is_seg_shard_child(args: Any) -> bool:
@@ -893,17 +1005,18 @@ def _write_instance_shard_result(
     *,
     split: str,
     class_names: dict[int, str],
-    entries: list[dict[str, Any]],
+    entries: list[dict[str, Any]] | None,
     images_with_labels: int,
     num_images: int,
     infer_time_sum_ms: float,
     failed: int,
+    entries_path: Path | None = None,
 ) -> Path:
     shard_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "split": split,
         "class_names": {str(k): v for k, v in class_names.items()},
-        "entries": entries,
+        "entries_file": "seg_instance_entries.jsonl" if entries or (entries_path is not None and entries_path.is_file()) else None,
         "images_with_labels": int(images_with_labels),
         "num_images": int(num_images),
         "infer_time_sum_ms": float(infer_time_sum_ms),
@@ -911,12 +1024,19 @@ def _write_instance_shard_result(
     }
     path = shard_dir / "seg_instance_shard_result.json"
     path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+    if entries:
+        entries_path = shard_dir / "seg_instance_entries.jsonl"
+        with entries_path.open("w", encoding="utf-8") as stream:
+            for entry in entries:
+                stream.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+    elif entries_path is not None and entries_path.resolve() != (shard_dir / "seg_instance_entries.jsonl").resolve():
+        shutil.copy2(entries_path, shard_dir / "seg_instance_entries.jsonl")
     return path
 
 
 def _merge_instance_shard_results(shard_dirs: list[Path], *, classwise: bool) -> dict[str, Any]:
     class_names: dict[int, str] = {}
-    entries: list[dict[str, Any]] = []
+    entry_paths: list[Path] = []
     num_images = 0
     images_with_labels = 0
     infer_time_sum_ms = 0.0
@@ -925,16 +1045,33 @@ def _merge_instance_shard_results(shard_dirs: list[Path], *, classwise: bool) ->
         payload = json.loads((shard_dir / "seg_instance_shard_result.json").read_text(encoding="utf-8"))
         for cid_raw, name in payload.get("class_names", {}).items():
             class_names[int(cid_raw)] = str(name)
-        entries.extend(payload.get("entries", []))
+        entries_file = payload.get("entries_file")
+        if entries_file:
+            entry_paths.append(shard_dir / str(entries_file))
         num_images += int(payload.get("num_images", 0))
         images_with_labels += int(payload.get("images_with_labels", 0))
         infer_time_sum_ms += float(payload.get("infer_time_sum_ms", 0.0))
         failed += int(payload.get("failed", 0))
     metric, label_mapping = create_metric(class_names, classwise)
-    for entry in entries:
+
+    def _entries():
+        for entries_path in entry_paths:
+            with entries_path.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    if line.strip():
+                        yield json.loads(line)
+
+    for entry in track(
+        _entries(),
+        label="seg/eval 聚合实例指标",
+        total=images_with_labels,
+        unit="img",
+    ):
         prediction, target = _deserialize_instance_entry(entry)
         update_metric(metric, label_mapping, prediction, target)
+    print("[seg/eval] 阶段: 计算聚合指标", flush=True)
     metric_values = metric.compute_aggregated_values().metric_values
+    print("[seg/eval] 阶段完成: 聚合指标", flush=True)
     return {
         "metric_values": metric_values,
         "class_names": class_names,
@@ -955,6 +1092,7 @@ def _accumulate_instance_eval(
     num_shards: int = 1,
     vis_dir: Path | None = None,
     vis_threshold: float = 0.0,
+    entries_path: Path | None = None,
 ) -> dict[str, Any]:
     """加载样本并累积实例分割评估，可分片、带容错与计时。
 
@@ -967,7 +1105,8 @@ def _accumulate_instance_eval(
     metric, label_mapping = create_metric(class_names, classwise)
 
     shard_indices = gpu_parallel.filter_indices_for_shard(
-        len(samples), shard_index=shard_index, num_shards=num_shards
+        len(samples), shard_index=shard_index, num_shards=num_shards,
+        weights=[float(sample.image_path.stat().st_size) if sample.image_path.exists() else 1.0 for sample in samples],
     )
     shard_samples = [samples[i] for i in shard_indices]
 
@@ -986,8 +1125,13 @@ def _accumulate_instance_eval(
             return None, exc
 
     for idx, (sample, (image, load_error)) in enumerate(
-        track(_prefetch_iter(shard_samples, _load_image),
-              label="seg/eval 评估", total=len(shard_samples), unit="img"),
+        track(
+            _prefetch_iter(shard_samples, _load_image),
+            label="seg/eval 评估",
+            total=len(shard_samples),
+            unit="img",
+            shard_scope="inference",
+        ),
         start=1,
     ):
         try:
@@ -1009,11 +1153,22 @@ def _accumulate_instance_eval(
         if has_label:
             images_with_labels += 1
         update_metric(metric, label_mapping, prediction, target)
-        entries.append(_serialize_instance_entry(prediction, target))
+        serialized_entry = _serialize_instance_entry(prediction, target)
+        if entries_path is not None:
+            entries_path.parent.mkdir(parents=True, exist_ok=True)
+            with entries_path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(serialized_entry, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
+        else:
+            entries.append(serialized_entry)
         # 指标用全量预测（0.0）；对比图按展示阈值过滤，避免低分实例糊满画面。
         if vis_dir is not None and has_label:
             try:
-                compare_path = vis_dir / f"{Path(sample.image_path).stem}_compare.png"
+                relative = Path(getattr(sample, "relative_path", Path(sample.image_path).name))
+                compare_path = (vis_dir / relative).with_name(
+                    f"{relative.stem}_compare.png"
+                )
                 shown = _filter_instance_prediction(prediction, vis_threshold)
                 save_instance_comparison(sample.image_path, compare_path, shown, target, class_names)
             except Exception as exc:  # noqa: BLE001 可视化失败绝不能中断评估
@@ -1123,6 +1278,7 @@ def _accumulate_semantic_confusion(
     *,
     shard_index: int | None = None,
     num_shards: int = 1,
+    prediction_cache_dir: Path | None = None,
 ) -> dict[str, Any] | None:
     """加载样本并累积混淆矩阵，可分片、带容错与计时。无样本/无该 split 时返回 None。
 
@@ -1171,7 +1327,8 @@ def _accumulate_semantic_confusion(
     failed = 0
 
     shard_indices = gpu_parallel.filter_indices_for_shard(
-        len(samples), shard_index=shard_index, num_shards=num_shards
+        len(samples), shard_index=shard_index, num_shards=num_shards,
+        weights=[float(sample[0].stat().st_size) if sample[0].exists() else 1.0 for sample in samples],
     )
     shard_samples = [samples[i] for i in shard_indices]
 
@@ -1191,8 +1348,13 @@ def _accumulate_semantic_confusion(
             return None, exc
 
     for idx, ((image_path, mask_path), (image, load_error)) in enumerate(
-        track(_prefetch_iter(shard_samples, _load_image),
-              label="seg/eval 语义评估", total=len(shard_samples), unit="img"),
+        track(
+            _prefetch_iter(shard_samples, _load_image),
+            label="seg/eval 语义评估",
+            total=len(shard_samples),
+            unit="img",
+            shard_scope="inference",
+        ),
         start=1,
     ):
         try:
@@ -1238,12 +1400,19 @@ def _accumulate_semantic_confusion(
         # 必须看完所有图（多卡时还要汇总各分片）后再渲染选中的一小批。
         vis_miou = _semantic_image_quality(target_remapped, pred_remapped, valid, num_eval_classes)
         vis_class = _semantic_dominant_class(target_remapped, valid)
+        prediction_path = None
+        if prediction_cache_dir is not None:
+            prediction_cache_dir.mkdir(parents=True, exist_ok=True)
+            prediction_path = prediction_cache_dir / f"prediction_{len(rows):08d}.png"
+            prediction_dtype = rt.np.uint8 if int(pred_np.max()) <= 255 else rt.np.uint16
+            rt.Image.fromarray(pred_np.astype(prediction_dtype)).save(prediction_path)
         rows.append({
             "image_path": str(image_path),
             "mask_path": str(mask_path),
             "valid_pixels": int(valid.sum()),
             "vis_miou": round(float(vis_miou), 6),
             "vis_class": vis_class,
+            "prediction_path": str(prediction_path) if prediction_path is not None else None,
         })
         # 进度由 track() 单行进度条展示
 
@@ -1285,6 +1454,8 @@ def _write_semantic_summary(
         "data": str(data_path),
         "split": split,
         "num_images": num_samples,
+        "attempted_images": num_samples + failed,
+        "succeeded_images": num_samples,
         "num_classes": num_classes,
         "class_names": class_names,
         "metrics": metrics,
@@ -1325,6 +1496,11 @@ def _evaluate_semantic_split(
     accumulated = _accumulate_semantic_confusion(
         model, data_path, split, threshold,
         shard_index=shard_index, num_shards=num_shards,
+        prediction_cache_dir=(
+            output_dir / split / "_prediction_cache"
+            if shard_index is not None and int(num_shards or 1) > 1 and save_visualization
+            else None
+        ),
     )
     if accumulated is None:
         return None
@@ -1378,19 +1554,23 @@ def run_semantic_eval(args) -> None:
     action = "eval"
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
     data_path = Path(args.data).expanduser().resolve()
+    splits = _normalize_splits(args.split)
     if getattr(args, "dry_run", False):
         print(f"[seg/{action}] dry-run 计划")
         print(f"  checkpoint: {checkpoint_path}")
         print(f"  seg_train_type: {_normalize_seg_type(args)}")
         print(f"  split: {getattr(args, 'split', None)}")
         print(f"  output_dir: {args.output_dir}")
-        for split in _normalize_splits(args.split):
+        for split in splits:
             try:
                 samples, _, _ = _semantic_image_mask_samples(data_path, split)
                 print(f"  num_images[{split}]: {len(samples)}")
             except Exception:  # noqa: BLE001 dry-run 仅尽力打印，拿不到数量就跳过
                 pass
         return
+
+    if not _is_seg_shard_child(args) and len(splits) > 1:
+        rt.prepare_output_dir(args.output_dir, args.overwrite, clean=True)
 
     device_mode = args.device
     resolved_device_arg = args.device
@@ -1400,7 +1580,9 @@ def run_semantic_eval(args) -> None:
             print(f"[seg/{action}] {message}")
         else:
             eligible = gpu_parallel.filter_high_memory_gpus(all_gpus)
-            chosen, choose_msg = gpu_parallel.select_fallback_single_gpu(all_gpus, eligible)
+            chosen, choose_msg = gpu_parallel.select_fallback_single_gpu(
+                all_gpus, eligible, component=f"seg/{action}"
+            )
             print(f"[seg/{action}] {choose_msg}")
             if chosen is not None:
                 resolved_device_arg = chosen
@@ -1409,7 +1591,6 @@ def run_semantic_eval(args) -> None:
     model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(resolved_device_arg))
     model.eval()
 
-    splits = _normalize_splits(args.split)
     summaries: dict[str, Any] = {}
     for split in splits:
         # 多 split 时各自写入子目录；单 split 时保持原有的直接写入输出目录。
@@ -1457,6 +1638,16 @@ def run_semantic_eval(args) -> None:
         return
     if not summaries:
         raise ValueError("No image/mask pairs found for semantic segmentation eval.")
+    if len(splits) > 1:
+        _write_seg_run_meta(
+            args.output_dir / "run_meta.json",
+            action=action,
+            checkpoint_path=checkpoint_path,
+            output_dir=args.output_dir,
+            args=args,
+            num_images=sum(int(summary.get("num_images", 0)) for summary in summaries.values()),
+            device_mode=device_mode,
+        )
 
 
 def _build_seg_eval_child_command(args, *, shard_index, num_shards, output_dir, device="auto") -> list[str]:
@@ -1474,6 +1665,9 @@ def _build_seg_eval_child_command(args, *, shard_index, num_shards, output_dir, 
     command += ["--shard-index", str(shard_index), "--num-shards", str(num_shards)]
     command += ["--skip-important-artifacts"]
     command += ["--save-visualization"] if getattr(args, "save_visualization", True) else ["--no-save-visualization"]
+    if getattr(args, "threshold", None) is not None:
+        command += ["--threshold", str(args.threshold)]
+    command += ["--vis-max-images", str(getattr(args, "vis_max_images", rt.SEG_EVAL_VIS_MAX_IMAGES))]
     if getattr(args, "classwise", False):
         command += ["--classwise"]
     if getattr(args, "overwrite", False):
@@ -1509,26 +1703,61 @@ def _run_parallel_seg_eval_impl(args, eligible) -> bool:
         else rt.experiment_dir_from_checkpoint_path(checkpoint_path) / "eval"
     )
     splits = _normalize_splits(args.split)
+    split_weights: list[list[float]] = []
+    if semantic:
+        for split in splits:
+            samples = _semantic_image_mask_samples(data_path, split)[0]
+            split_weights.append(
+                [float(image_path.stat().st_size) if image_path.exists() else 1.0 for image_path, _ in samples]
+            )
+    else:
+        data_cfg = rt.load_data_config(data_path)
+        for split in splits:
+            samples = rt.list_dataset_samples(data_cfg=data_cfg, split=split)[0]
+            split_weights.append(
+                [
+                    float(sample.image_path.stat().st_size) if sample.image_path.exists() else 1.0
+                    for sample in samples
+                ]
+            )
+    sample_count = sum(len(weights) for weights in split_weights)
+    if sample_count < 2:
+        print(f"[seg/eval] 待评估样本数量为 {sample_count}，进入单卡顺序模式。")
+        return False
     rt.prepare_output_dir(final_output_dir, args.overwrite, clean=True)
 
-    num_shards = len(eligible)
+    # 子进程在每个 split 内独立分片，因此 shard 数由最大 split 决定，
+    # 保证每个启动的子进程至少获得一个样本。
+    num_shards = min(len(eligible), max((len(weights) for weights in split_weights), default=0))
+    if num_shards < 2:
+        print("[seg/eval] 单个 split 可分配的 shard 数小于 2，进入单卡顺序模式。")
+        return False
+    shard_totals = {shard: 0 for shard in range(num_shards)}
+    for weights in split_weights:
+        per_split = gpu_parallel.shard_item_totals(
+            len(weights), num_shards=num_shards, weights=weights,
+        )
+        for shard, count in per_split.items():
+            shard_totals[shard] += count
     shard_root = final_output_dir / "_shards"
     shard_dirs = [shard_root / f"shard_{i:02d}" for i in range(num_shards)]
 
-    jobs: list[tuple[int, int, list[str]]] = []
-    for i, gpu in enumerate(eligible):
+    jobs: list[tuple[int, int | str, list[str]]] = []
+    for i, gpu in enumerate(eligible[:num_shards]):
         command = _build_seg_eval_child_command(
             args, shard_index=i, num_shards=num_shards, output_dir=shard_dirs[i], device="auto"
         )
-        jobs.append((i, int(gpu["index"]), command))
+        jobs.append((i, gpu.get("device_token", int(gpu["index"])), command))
 
     print("[seg/eval] 已进入自动多卡并行模式。")
-    for gpu in eligible:
+    for gpu in eligible[:num_shards]:
         print(f"[seg/eval] 保留 {gpu_parallel.format_gpu_summary(gpu)}")
     for shard_index, gpu_index, _ in jobs:
         print(f"[seg/eval] shard={shard_index}/{num_shards} -> CUDA_VISIBLE_DEVICES={gpu_index}")
 
-    failed = gpu_parallel.run_sharded_subprocesses(jobs, cwd=rt.ROOT_DIR)
+    failed = gpu_parallel.run_sharded_subprocesses(
+        jobs, cwd=rt.ROOT_DIR, shard_totals=shard_totals,
+    )
     if failed:
         raise RuntimeError(f"seg eval shard 失败: {', '.join(failed)}")
 
@@ -1539,7 +1768,7 @@ def _run_parallel_seg_eval_impl(args, eligible) -> bool:
         )
     else:
         _merge_parallel_instance(
-            args, shard_dirs, split=splits[0], final_output_dir=final_output_dir,
+            args, shard_dirs, splits=splits, final_output_dir=final_output_dir,
             checkpoint_path=checkpoint_path,
         )
     shutil.rmtree(shard_root, ignore_errors=True)
@@ -1605,16 +1834,22 @@ def _run_parallel_seg_infer_impl(args, eligible) -> bool:
     if num_shards < 2:
         print(f"[seg/infer] 待推理图片数量为 {len(image_paths)}，进入单卡顺序模式。")
         return False
+    shard_totals = gpu_parallel.shard_item_totals(
+        len(image_paths),
+        num_shards=num_shards,
+        weights=[float(path.stat().st_size) if path.exists() else 1.0 for path in image_paths],
+    )
 
     shard_root = final_output_dir / "_shards"
     shard_dirs = [shard_root / f"shard_{i:02d}" for i in range(num_shards)]
 
-    jobs: list[tuple[int, int, list[str]]] = []
+    jobs: list[tuple[int, int | str, list[str]]] = []
     for i in range(num_shards):
         command = _build_seg_infer_child_command(
             args, shard_index=i, num_shards=num_shards, output_dir=shard_dirs[i], device="auto"
         )
-        jobs.append((i, int(eligible[i]["index"]), command))
+        gpu = eligible[i]
+        jobs.append((i, gpu.get("device_token", int(gpu["index"])), command))
 
     print("[seg/infer] 已进入自动多卡并行模式。")
     for gpu in eligible[:num_shards]:
@@ -1622,12 +1857,23 @@ def _run_parallel_seg_infer_impl(args, eligible) -> bool:
     for shard_index, gpu_index, _ in jobs:
         print(f"[seg/infer] shard={shard_index}/{num_shards} -> CUDA_VISIBLE_DEVICES={gpu_index}")
 
-    failed = gpu_parallel.run_sharded_subprocesses(jobs, cwd=rt.ROOT_DIR)
+    failed = gpu_parallel.run_sharded_subprocesses(
+        jobs, cwd=rt.ROOT_DIR, shard_totals=shard_totals,
+    )
     if failed:
         raise RuntimeError(f"seg infer shard 失败: {', '.join(failed)}")
 
-    for shard_dir in shard_dirs:
-        rt.copy_tree_contents(shard_dir, final_output_dir)
+    for shard_number, shard_dir in enumerate(track(
+        shard_dirs,
+        label="seg/infer 合并分片产物",
+        total=len(shard_dirs),
+        unit="shard",
+    ), start=1):
+        rt.copy_tree_contents(
+            shard_dir,
+            final_output_dir,
+            progress_label=f"seg/infer 合并 {shard_number}/{len(shard_dirs)}",
+        )
     shutil.rmtree(shard_root, ignore_errors=True)
     _write_seg_run_meta(
         final_output_dir / "run_meta.json",
@@ -1646,10 +1892,15 @@ def _merge_parallel_semantic(
 ) -> None:
     """按 split 合并各分片的语义混淆矩阵，写出与顺序路径字节一致的 summary/CSV。"""
     wrote_any = False
+    total_images = 0
     want_vis = getattr(args, "save_visualization", True)
     vis_max = int(getattr(args, "vis_max_images", rt.SEG_EVAL_VIS_MAX_IMAGES))
-    model = None  # 挑图渲染需要重新推理选中的一小批图，故惰性加载一次模型
-    for split in splits:
+    for split in track(
+        splits,
+        label="seg/eval 合并语义分片",
+        total=len(splits),
+        unit="split",
+    ):
         # 每个子进程把该 split 写到 shard_dir/<split>/seg_semantic_shard_result.json。
         split_shard_dirs = [
             sd / split for sd in shard_dirs
@@ -1675,15 +1926,10 @@ def _merge_parallel_semantic(
             checkpoint_path=checkpoint_path,
             data_path=data_path,
         )
-        # summary 已 clean 过 split_output_dir，故渲染放其后。挑图需重新推理，惰性加载模型。
+        # shard 已缓存逐像素预测，父进程只挑图和渲染，不再占用 GPU 重跑模型。
         if want_vis:
-            if model is None:
-                model = rt.lightly_train.load_model(
-                    model=checkpoint_path, device=rt.resolve_device("auto")
-                )
-                model.eval()
             _render_semantic_visualizations(
-                model, data_path, split, merged["rows"],
+                merged["class_names"], data_path, split, merged["rows"],
                 output_dir=split_output_dir, max_images=vis_max,
             )
         _write_seg_run_meta(
@@ -1695,29 +1941,49 @@ def _merge_parallel_semantic(
             num_images=merged["num_samples"],
             device_mode="sharded",
         )
+        total_images += merged["num_samples"]
         wrote_any = True
     if not wrote_any:
         raise ValueError("No image/mask pairs found for semantic segmentation eval.")
+    if len(splits) > 1:
+        _write_seg_run_meta(
+            final_output_dir / "run_meta.json",
+            action="eval",
+            checkpoint_path=checkpoint_path,
+            output_dir=final_output_dir,
+            args=args,
+            num_images=total_images,
+            device_mode="sharded",
+        )
 
 
-def _merge_parallel_instance(args, shard_dirs, *, split, final_output_dir, checkpoint_path) -> None:
-    """合并各分片的实例分割 entry，重算全局 mAP，写出与顺序路径一致的 summary。"""
-    split_shard_dirs = [
-        sd for sd in shard_dirs if (sd / "seg_instance_shard_result.json").exists()
-    ]
-    merged = _merge_instance_shard_results(split_shard_dirs, classwise=args.classwise)
-    summary_path = final_output_dir / "seg_eval_summary.json"
+def _write_instance_summary(
+    output_dir: Path,
+    *,
+    checkpoint_path: Path,
+    data_path: Path,
+    split: str,
+    metric_values: dict[str, Any],
+    num_images: int,
+    images_with_labels: int,
+    infer_time_sum_ms: float,
+    failed: int,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = output_dir / "seg_eval_summary.json"
     summary_path.write_text(
         json.dumps(
             {
                 "checkpoint": str(checkpoint_path),
-                "data": str(args.data),
+                "data": str(data_path),
                 "split": split,
-                "num_images": merged["num_images"],
-                "images_with_labels": merged["images_with_labels"],
-                "metrics": merged["metric_values"],
-                "avg_infer_time_ms": merged["infer_time_sum_ms"] / max(merged["num_images"], 1),
-                "failed_images": merged["failed"],
+                "num_images": num_images,
+                "attempted_images": num_images,
+                "succeeded_images": max(0, num_images - failed),
+                "images_with_labels": images_with_labels,
+                "metrics": metric_values,
+                "avg_infer_time_ms": infer_time_sum_ms / max(num_images - failed, 1),
+                "failed_images": failed,
             },
             indent=2,
             ensure_ascii=False,
@@ -1726,24 +1992,89 @@ def _merge_parallel_instance(args, shard_dirs, *, split, final_output_dir, check
         encoding="utf-8",
     )
     print(f"Summary saved to: {summary_path}")
-    _write_seg_run_meta(
-        final_output_dir / "run_meta.json",
-        action="eval",
-        checkpoint_path=checkpoint_path,
-        output_dir=final_output_dir,
-        args=args,
-        num_images=merged["num_images"],
-        device_mode="sharded",
-    )
+    return summary_path
+
+
+def _merge_parallel_instance(args, shard_dirs, *, splits, final_output_dir, checkpoint_path) -> None:
+    """按 split 合并实例分割分片，分别重算全局 mAP 并落盘。"""
+    total_images = 0
+    wrote_any = False
+    for split in track(
+        splits,
+        label="seg/eval 合并实例分片",
+        total=len(splits),
+        unit="split",
+    ):
+        split_shard_dirs = [
+            sd / split
+            for sd in shard_dirs
+            if (sd / split / "seg_instance_shard_result.json").exists()
+        ]
+        if not split_shard_dirs:
+            continue
+        merged = _merge_instance_shard_results(split_shard_dirs, classwise=args.classwise)
+        split_output_dir = final_output_dir / split if len(splits) > 1 else final_output_dir
+        _write_instance_summary(
+            split_output_dir,
+            checkpoint_path=checkpoint_path,
+            data_path=Path(args.data),
+            split=split,
+            metric_values=merged["metric_values"],
+            num_images=merged["num_images"],
+            images_with_labels=merged["images_with_labels"],
+            infer_time_sum_ms=merged["infer_time_sum_ms"],
+            failed=merged["failed"],
+        )
+        _write_seg_run_meta(
+            split_output_dir / "run_meta.json",
+            action="eval",
+            checkpoint_path=checkpoint_path,
+            output_dir=split_output_dir,
+            args=args,
+            num_images=merged["num_images"],
+            device_mode="sharded",
+        )
+        total_images += merged["num_images"]
+        wrote_any = True
+    if not wrote_any:
+        raise ValueError("No image/label pairs found for instance segmentation eval.")
+    if len(splits) > 1:
+        _write_seg_run_meta(
+            final_output_dir / "run_meta.json",
+            action="eval",
+            checkpoint_path=checkpoint_path,
+            output_dir=final_output_dir,
+            args=args,
+            num_images=total_images,
+            device_mode="sharded",
+        )
 
 
 def run_eval(args) -> None:
+    if _is_seg_shard_child(args) or getattr(args, "dry_run", False):
+        _run_eval_impl(args)
+        return
+    if _seg_reuse_precheck(args, "eval") == run_reuse.REUSE:
+        print(f"[seg/eval] 已复用上次评估结果，未重新评估：{args.output_dir}")
+        return
+    final_output_dir = Path(args.output_dir).expanduser().resolve()
+    original_output_dir = args.output_dir
+    original_overwrite = args.overwrite
+    try:
+        with staged_directory(final_output_dir, overwrite=args.overwrite) as stage:
+            args.output_dir = stage
+            args.overwrite = True
+            args._published_output_dir = final_output_dir
+            _run_eval_impl(args)
+    finally:
+        args.output_dir = original_output_dir
+        args.overwrite = original_overwrite
+        if hasattr(args, "_published_output_dir"):
+            delattr(args, "_published_output_dir")
+
+
+def _run_eval_impl(args) -> None:
     seg_type = _normalize_seg_type(args)
-    # 初步复用检测（仅父进程、非 dry-run），覆盖实例与语义两种 eval。
-    if not _is_seg_shard_child(args) and not getattr(args, "dry_run", False):
-        if _seg_reuse_precheck(args, "eval") == run_reuse.REUSE:
-            print(f"[seg/eval] 已复用上次评估结果，未重新评估：{args.output_dir}")
-            return
     # 自动多卡：device=auto 且 ≥2 张空闲卡时分片到子进程，否则回退顺序模式（返回 False）。
     # 子进程通过 launcher.py eval 重入本函数，_is_seg_shard_child 为真而跳过并行、直走分片写盘。
     if not _is_seg_shard_child(args) and run_parallel_seg_eval(args):
@@ -1756,8 +2087,7 @@ def run_eval(args) -> None:
     action = "eval"
     checkpoint_path = rt.resolve_checkpoint_path(args.checkpoint, args.experiment_dir)
     output_dir = args.output_dir
-    # --split 现在可能是多值列表（语义分割需要），实例评估只取第一个。
-    split = _normalize_splits(args.split)[0]
+    splits = _normalize_splits(args.split)
     if getattr(args, "dry_run", False):
         print(f"[seg/{action}] dry-run 计划")
         print(f"  checkpoint: {checkpoint_path}")
@@ -1765,12 +2095,15 @@ def run_eval(args) -> None:
         print(f"  split: {getattr(args, 'split', None)}")
         print(f"  output_dir: {output_dir}")
         try:
-            samples, _ = rt.list_dataset_samples(data_cfg=rt.load_data_config(args.data), split=split)
-            print(f"  num_images: {len(samples)}")
+            data_cfg = rt.load_data_config(args.data)
+            for split in splits:
+                samples, _ = rt.list_dataset_samples(data_cfg=data_cfg, split=split)
+                print(f"  num_images[{split}]: {len(samples)}")
         except Exception:  # noqa: BLE001 dry-run 仅尽力打印，拿不到数量就跳过
             pass
         return
-    rt.prepare_output_dir(output_dir, args.overwrite, clean=True)
+    if len(splits) > 1:
+        rt.prepare_output_dir(output_dir, args.overwrite, clean=True)
     data_cfg = rt.load_data_config(args.data)
 
     device_mode = args.device
@@ -1781,7 +2114,9 @@ def run_eval(args) -> None:
             print(f"[seg/{action}] {message}")
         else:
             eligible = gpu_parallel.filter_high_memory_gpus(all_gpus)
-            chosen, choose_msg = gpu_parallel.select_fallback_single_gpu(all_gpus, eligible)
+            chosen, choose_msg = gpu_parallel.select_fallback_single_gpu(
+                all_gpus, eligible, component=f"seg/{action}"
+            )
             print(f"[seg/{action}] {choose_msg}")
             if chosen is not None:
                 resolved_device_arg = chosen
@@ -1790,65 +2125,77 @@ def run_eval(args) -> None:
     model = rt.lightly_train.load_model(model=checkpoint_path, device=rt.resolve_device(resolved_device_arg))
     model.eval()
 
-    # 分片子进程：只跑本分片、把序列化预测/标注写盘，由父进程合并出全局 mAP。
-    # mAP 是全局指标，逐分片各算各的再平均是错的，所以分片模式绝不在此计算最终指标。
+    # 分片子进程逐 split 跑本分片，把序列化预测/标注写盘，由父进程分别合并全局 mAP。
     want_vis = getattr(args, "save_visualization", True)
     vis_threshold = float(getattr(args, "threshold", None) or rt.DEFAULT_SEG_THRESHOLD)
     if _is_seg_shard_child(args):
+        for split in splits:
+            accumulated = _accumulate_instance_eval(
+                model, data_cfg, split, args.classwise,
+                shard_index=args.shard_index, num_shards=args.num_shards,
+                vis_dir=(
+                    _eval_compare_dir(
+                        args.output_dir,
+                        split=split,
+                        multi_split=len(splits) > 1,
+                    )
+                    if want_vis
+                    else None
+                ),
+                vis_threshold=vis_threshold,
+                entries_path=args.output_dir / split / "seg_instance_entries.jsonl",
+            )
+            _write_instance_shard_result(
+                args.output_dir / split,
+                split=split,
+                class_names=accumulated["class_names"],
+                entries=accumulated["entries"],
+                entries_path=args.output_dir / split / "seg_instance_entries.jsonl",
+                images_with_labels=accumulated["images_with_labels"],
+                num_images=accumulated["num_images"],
+                infer_time_sum_ms=accumulated["infer_time_sum_ms"],
+                failed=accumulated["failed"],
+            )
+        return
+
+    total_images = 0
+    for split in splits:
+        split_output_dir = output_dir / split if len(splits) > 1 else output_dir
+        rt.prepare_output_dir(split_output_dir, args.overwrite, clean=True)
         accumulated = _accumulate_instance_eval(
             model, data_cfg, split, args.classwise,
-            shard_index=args.shard_index, num_shards=args.num_shards,
-            vis_dir=_eval_compare_dir(args.output_dir) if want_vis else None,
+            vis_dir=_eval_compare_dir(split_output_dir) if want_vis else None,
             vis_threshold=vis_threshold,
         )
-        _write_instance_shard_result(
-            args.output_dir,
+        num_images = accumulated["num_images"]
+        print(f"[seg/eval] 阶段: 计算 {split} 聚合指标", flush=True)
+        result = accumulated["metric"].compute_aggregated_values().metric_values
+        print(f"[seg/eval] 阶段完成: {split} 聚合指标", flush=True)
+        _write_instance_summary(
+            split_output_dir,
+            checkpoint_path=checkpoint_path,
+            data_path=Path(args.data),
             split=split,
-            class_names=accumulated["class_names"],
-            entries=accumulated["entries"],
+            metric_values=result,
+            num_images=num_images,
             images_with_labels=accumulated["images_with_labels"],
-            num_images=accumulated["num_images"],
             infer_time_sum_ms=accumulated["infer_time_sum_ms"],
             failed=accumulated["failed"],
         )
-        return
-
-    accumulated = _accumulate_instance_eval(
-        model, data_cfg, split, args.classwise,
-        vis_dir=_eval_compare_dir(output_dir) if want_vis else None,
-        vis_threshold=vis_threshold,
-    )
-    metric = accumulated["metric"]
-    num_images = accumulated["num_images"]
-    images_with_labels = accumulated["images_with_labels"]
-    infer_time_sum_ms = accumulated["infer_time_sum_ms"]
-    failed = accumulated["failed"]
-
-    result = metric.compute_aggregated_values().metric_values
-    summary_path = output_dir / "seg_eval_summary.json"
-    summary_path.write_text(
-        json.dumps(
-            {
-                "checkpoint": str(checkpoint_path),
-                "data": str(args.data),
-                "split": split,
-                "num_images": num_images,
-                "images_with_labels": images_with_labels,
-                "metrics": result,
-                "avg_infer_time_ms": infer_time_sum_ms / max(num_images, 1),
-                "failed_images": failed,
-            },
-            indent=2,
-            ensure_ascii=False,
+        _write_seg_run_meta(
+            split_output_dir / "run_meta.json",
+            action=action, checkpoint_path=checkpoint_path,
+            output_dir=split_output_dir, args=args, num_images=num_images, device_mode=device_mode,
         )
-        + "\n",
-        encoding="utf-8",
-    )
-    print(f"Summary saved to: {summary_path}")
+        total_images += num_images
 
-    if not _is_seg_shard_child(args):
+    if len(splits) > 1:
         _write_seg_run_meta(
             output_dir / "run_meta.json",
-            action=action, checkpoint_path=checkpoint_path,
-            output_dir=output_dir, args=args, num_images=num_images, device_mode=device_mode,
+            action=action,
+            checkpoint_path=checkpoint_path,
+            output_dir=output_dir,
+            args=args,
+            num_images=total_images,
+            device_mode=device_mode,
         )

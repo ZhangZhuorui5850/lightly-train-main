@@ -1,0 +1,292 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "face 数据集与 LightlyTrain 检测训练调研",
+    "description": "面向技术评审的数据审计、格式转换与小模型选型报告。",
+    "generatedAt": "2026-08-27T00:00:00+08:00",
+    "cards": [
+      {
+        "id": "total_images",
+        "description": "DarkFace 与 WIDER FACE 目录中的全部图片，包含 WIDER test。",
+        "dataset": "headline_metrics",
+        "sourceId": "face_headline_sql",
+        "metrics": [
+          {"label": "图片总数", "field": "total_images", "format": "number"}
+        ]
+      },
+      {
+        "id": "labeled_images",
+        "description": "转换后至少保留一个有效人脸框的图片。",
+        "dataset": "headline_metrics",
+        "sourceId": "face_headline_sql",
+        "metrics": [
+          {"label": "有标注图片", "field": "labeled_images", "format": "number"}
+        ]
+      },
+      {
+        "id": "valid_face_boxes",
+        "description": "DarkFace LabelMe 框加 WIDER 官方有效框；转换时仍需清理退化框。",
+        "dataset": "headline_metrics",
+        "sourceId": "face_headline_sql",
+        "metrics": [
+          {"label": "人脸框", "field": "valid_face_boxes", "format": "number"}
+        ]
+      },
+      {
+        "id": "under8_share",
+        "description": "按保持宽高比缩放到 640×640 估算，训练源中短边低于 8 px 的框占比。",
+        "dataset": "headline_metrics",
+        "sourceId": "face_headline_sql",
+        "metrics": [
+          {"label": "短边 < 8 px", "field": "under8_share", "format": "percent"}
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "face_size_distribution",
+        "title": "640×640 输入下的人脸短边分布",
+        "subtitle": "按原图保持宽高比缩放估算；DarkFace 50,393 个可量化框，WIDER train 156,995 个框",
+        "headerMarkdown": "DarkFace 的微小人脸问题更突出。图中的占比以各数据源框总数为分母。",
+        "type": "bar",
+        "intent": "composition",
+        "question": "完整图缩放到 640 后，各数据源的人脸框会缩小到什么程度？",
+        "rationale": "四个互斥尺寸区间适合用分组柱状图比较两个数据源的构成。",
+        "dataset": "size_bands",
+        "sourceId": "face_size_sql",
+        "valueFormat": "percent",
+        "encodings": {
+          "x": {"field": "band", "type": "ordinal", "label": "缩放后短边"},
+          "y": {"field": "share", "type": "quantitative", "label": "框占比", "format": "percent"},
+          "color": {"field": "source", "type": "nominal", "label": "数据源"},
+          "tooltip": [
+            {"field": "boxes", "type": "quantitative", "label": "框数", "format": "number"},
+            {"field": "total_boxes", "type": "quantitative", "label": "该源总框数", "format": "number"}
+          ]
+        },
+        "settings": {"groupMode": "grouped", "sort": "custom", "showValues": true},
+        "palette": {"kind": "categorical", "name": "blue-orange"},
+        "legend": {"position": "bottom", "sort": "spec"},
+        "layout": "full"
+      }
+    ],
+    "tables": [
+      {
+        "id": "dataset_inventory",
+        "title": "本地数据清单与标注状态",
+        "subtitle": "2026 年 8 月 27 日对当前工作区的完整文件与标注扫描",
+        "dataset": "dataset_inventory",
+        "sourceId": "face_inventory_sql",
+        "defaultSort": {"field": "images", "direction": "desc"},
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {"field": "split", "label": "数据源 / split", "type": "text"},
+          {"field": "images", "label": "图片", "format": "number"},
+          {"field": "json_labels", "label": "LabelMe JSON", "format": "number"},
+          {"field": "json_boxes", "label": "现有 JSON 框", "format": "number"},
+          {"field": "missing_json", "label": "缺 JSON", "format": "number"}
+        ]
+      },
+      {
+        "id": "model_comparison",
+        "title": "LightlyTrain 小模型对比",
+        "subtitle": "COCO val2017、640 或 416 输入；延迟来自 NVIDIA T4 TensorRT FP16 batch 1",
+        "dataset": "model_comparison",
+        "sourceId": "model_comparison_sql",
+        "defaultSort": {"field": "params_m", "direction": "asc"},
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {"field": "model", "label": "模型", "type": "text"},
+          {"field": "params_m", "label": "参数量 (M)", "format": "number"},
+          {"field": "coco_map", "label": "COCO mAP50:95", "format": "number"},
+          {"field": "latency_ms", "label": "T4 延迟 (ms)", "format": "number"},
+          {"field": "input", "label": "输入", "type": "text"}
+        ]
+      }
+    ],
+    "sources": [
+      {"id": "face_local", "label": "本地 face 数据集审计", "path": "datasets/face"},
+      {"id": "face_headline_sql", "label": "数据集总体指标审计查询", "path": "reports/face_dataset_research/evidence.sql"},
+      {"id": "face_size_sql", "label": "640 输入框尺寸分布审计查询", "path": "reports/face_dataset_research/evidence.sql"},
+      {"id": "face_inventory_sql", "label": "数据清单审计查询", "path": "reports/face_dataset_research/evidence.sql"},
+      {"id": "model_comparison_sql", "label": "LightlyTrain 模型对比查询", "path": "reports/face_dataset_research/evidence.sql", "href": "https://docs.lightly.ai/train/stable/object_detection.html"},
+      {"id": "lightly_local", "label": "工作区 LightlyTrain 0.14.2 检测文档", "path": "docs/source/object_detection.md"},
+      {"id": "converter_local", "label": "工作区 LabelMe → YOLO 转换器", "path": "datasets/convert_datasets/convert_tools/LabelMeToYOLO.py"},
+      {"id": "lightly_official", "label": "LightlyTrain 官方 Object Detection 文档", "href": "https://docs.lightly.ai/train/stable/object_detection.html"},
+      {"id": "wider_official", "label": "WIDER FACE 官方数据集页面", "href": "https://mmlab.ie.cuhk.edu.hk/projects/WIDERFace/"},
+      {"id": "darkface_official", "label": "DARK FACE 官方数据集页面", "href": "https://flyywh.github.io/CVPRW2019LowLight/"}
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "layout": "full",
+        "body": "# face 数据集与 LightlyTrain 检测训练调研"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 先跑检测基线\n\n**当前标注定义是单类 face 边界框，任务类型为人脸检测。** 身份 ID、人物类别和 embedding 监督信号缺失，当前数据支持检测器训练。\n\n**现有工作区直接选 DINOv3 ViT-T/16 LTDETR COCO。** 完整模型标识见交付说明；模型具有 10.1M 参数和 640×640 输入。\n\n**数据已统一成 YOLO detection。** 仅保留转换后至少一个有效框的样本，使用固定种子 42 全局划分为 train 17,675、val 2,209、test 2,210。\n\n**小目标与拥挤图是主要技术风险。** 640 输入下约 47.7% 的训练源框短边低于 8 px；WIDER train 中 48 张图超过 300 query 上限，这些图承载约 15.7% 的 WIDER train 框。"
+      },
+      {"id": "headline", "type": "metric-strip", "cardIds": ["total_images", "labeled_images", "valid_face_boxes", "under8_share"]},
+      {
+        "id": "inventory_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 数据现状\n\n本地目录共 38,203 张图片。本次严格使用现有 LabelMe JSON，WIDER test 16,097 张和 WIDER train 缺 JSON 的 8 张排除。DarkFace 清理 3 个退化框后 6,000 张全部有效；WIDER train 清理 27 个退化框后 12,872 张有效；WIDER val 清理 11 个退化框后有 4 张变为零有效框，保留 3,222 张。最终可用 22,094 张、246,476 个有效框。"
+      },
+      {
+        "id": "model_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 模型选择\n\n工作区源码版本为 0.14.2。DINOv3 ViT-T/16 LTDETR COCO 具有 10.1M 参数、COCO mAP50:95 49.8、T4 延迟 5.4 ms 和 640 输入，适合现有仓库首跑。PicoDet-S 具有 1.17M 参数、COCO mAP50:95 26.7 和 416 输入，适合作为极限速度对照。\n\n最新稳定版的 LTDETRv2-S COCO 具有 9.9M 参数、COCO mAP50:95 50.7、T4 延迟 5.4 ms，并采用 Apache 2.0 权重。升级评估完成后，它应成为同尺寸模型的优先候选。"
+      },
+      {
+        "id": "target_layout",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 转换结果\n\n目标根目录为 datasets/face_yolo，images 和 labels 都包含 train、val、test，另外生成 data.yaml、audit.json 和 split_manifest.csv。\n\n类别固定为 0: face；图片通过硬链接写入目标目录；输出文件名前加 wider_train、wider_val 或 dark 前缀；矩形统一取 min/max 并裁剪到图像边界；框归一化为 class、中心点和宽高；零宽高框已过滤；转换后零有效框的图片已排除。\n\nconvert.py oneclick 使用固定种子 42 对 22,094 张全局洗牌。实际分配为 train 17,675、val 2,209、test 2,210，比例为 79.999%/9.998%/10.003%。train 的 DarkFace/WIDER train/WIDER val 来源数为 4,792/10,318/2,565；val 为 613/1,271/325；test 为 595/1,283/332。",
+        "sourceId": "face_local"
+      },
+      {
+        "id": "training_plan",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 训练参数\n\n当前机器是 RTX 4060 Laptop 8 GB。建议参数为 batch size 2、num workers 4、bf16 mixed、640×640 固定 scale jitter、random zoom-out 关闭、随机 IoU crop 保留、classwise metric 开启。自动梯度累积会把有效 batch 补到 16。\n\n首个 smoke run 使用 200 steps 验证数据、损失、验证和 checkpoint 流程；正式 baseline 使用 55k steps，对应约 50 个数据 epoch。工作区 0.14.2 的正式运行显式传入 steps。\n\n训练结束后在 test 2,210 张上计算总体指标，再按 source 字段分别计算 DarkFace、WIDER train 来源和 WIDER val 来源指标，并使用 SAHI 对密集小脸样例做定性复核。"
+      },
+      {
+        "id": "methodology",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 审计方法\n\n扫描覆盖所有图片与 LabelMe JSON；每个 shape 检查标签名、shape type、点数、退化宽高和越界坐标。WIDER 官方 txt 按 invalid 字段过滤有效框，并逐图与现有 JSON 数量比对。小脸尺寸按原框短边乘以 640 缩放系数估算，代表保持宽高比缩放后的短边。模型参数、COCO mAP 与 T4 延迟来自 LightlyTrain 文档，跨模型数字用于初筛。"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 评估边界\n\n1. LightlyTrain 的通用 mAP 与 WIDER 官方 Easy、Medium、Hard 协议采用不同口径；正式对外汇报使用 WIDER 官方评估工具。\n2. DINOv3 LTDETR 固定 300 queries；WIDER val 有 15 张图超过 300 张脸，完整图验证的召回存在结构性上限。切片训练或切片评估可降低这一影响。\n3. DarkFace 官方 6,000 张作为训练/验证集合发布，本地缺少场景或序列分组信息。固定随机留出适合首跑，最终评估集结合近重复聚类或采集场景进行分组划分。"
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 执行顺序\n\n1. 生成 face_yolo 数据集与 audit.json，对 8 个缺 JSON、退化框、越界框逐项留痕。\n2. 抽查 100 张转换结果，覆盖 DarkFace、WIDER 普通图、密集人群图、4 点 rectangle、空标注图。\n3. 用 DINOv3 ViT-T/16 LTDETR COCO 跑 200-step smoke test，检查 loss、验证 mAP、显存峰值和 checkpoint。\n4. 跑 55k-step baseline，分别输出 WIDER val、DarkFace holdout 和 SAHI 小脸样例结果。\n5. 升级分支后以相同数据和步数复测 LTDETRv2-S COCO，用精度、召回、显存、吞吐和许可证决定正式模型。"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 业务口径\n\n部署目标决定最终评估权重：通用场景以 WIDER 为主，夜间监控以 DarkFace 为主。身份识别阶段需要身份 ID、同人多图和检索评估集；当前阶段产出人脸框检测器。"
+      },
+      {
+        "id": "size_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 小脸分布\n\nDarkFace 原图统一为 1080×720。保持宽高比缩放到 640 后，68.8% 的 DarkFace 人脸短边低于 8 px；WIDER train 对应比例为 41.0%。ViT-T/16 的 patch size 为 16，这一分布支持两项训练策略：保留能放大局部区域的随机 IoU crop，关闭会进一步缩小目标的 random zoom-out；推理阶段使用 SAHI 处理高分辨率场景。",
+        "sourceId": "face_local"
+      },
+      {"id": "size_chart_block", "type": "chart", "chartId": "face_size_distribution", "layout": "full"}
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-27T00:00:00+08:00",
+    "status": "ready",
+    "datasets": {
+      "headline_metrics": [
+        {"total_images": 38203, "labeled_images": 22094, "valid_face_boxes": 246476, "under8_share": 0.4773}
+      ],
+      "size_bands": [
+        {"source": "DarkFace", "band": "<4 px", "share": 0.3169, "boxes": 15971, "total_boxes": 50393, "input_size": "640×640"},
+        {"source": "DarkFace", "band": "4–8 px", "share": 0.3714, "boxes": 18713, "total_boxes": 50393, "input_size": "640×640"},
+        {"source": "DarkFace", "band": "8–16 px", "share": 0.2235, "boxes": 11266, "total_boxes": 50393, "input_size": "640×640"},
+        {"source": "DarkFace", "band": "≥16 px", "share": 0.0882, "boxes": 4443, "total_boxes": 50393, "input_size": "640×640"},
+        {"source": "WIDER train", "band": "<4 px", "share": 0.1164, "boxes": 18272, "total_boxes": 156995, "input_size": "640×640"},
+        {"source": "WIDER train", "band": "4–8 px", "share": 0.2932, "boxes": 46027, "total_boxes": 156995, "input_size": "640×640"},
+        {"source": "WIDER train", "band": "8–16 px", "share": 0.2977, "boxes": 46736, "total_boxes": 156995, "input_size": "640×640"},
+        {"source": "WIDER train", "band": "≥16 px", "share": 0.2927, "boxes": 45960, "total_boxes": 156995, "input_size": "640×640"}
+      ],
+      "dataset_inventory": [
+        {"split": "WIDER test", "images": 16097, "json_labels": 0, "json_boxes": 0, "missing_json": 16097, "quality_note": "仅用于官方提交，不进入本次数据集"},
+        {"split": "WIDER train", "images": 12880, "json_labels": 12872, "json_boxes": 156968, "missing_json": 8, "quality_note": "严格使用现有 JSON；清理 27 个退化框"},
+        {"split": "DarkFace", "images": 6000, "json_labels": 6000, "json_boxes": 50396, "missing_json": 0, "quality_note": "清理 3 个退化框；6,000 张全部可用"},
+        {"split": "WIDER val", "images": 3226, "json_labels": 3222, "json_boxes": 39112, "missing_json": 0, "quality_note": "4 张图清理后零有效框；清理 11 个退化框"}
+      ],
+      "model_comparison": [
+        {"model": "picodet-s-coco", "availability": "工作区 0.14.2", "params_m": 1.17, "coco_map": 26.7, "latency_ms": 2.2, "input": "416×416", "role": "极限速度对照"},
+        {"model": "ltdetrv2-s-coco", "availability": "最新稳定版", "params_m": 9.9, "coco_map": 50.7, "latency_ms": 5.4, "input": "640×640", "role": "升级后的优先候选"},
+        {"model": "dinov3/vitt16-ltdetr-coco", "availability": "工作区 0.14.2", "params_m": 10.1, "coco_map": 49.8, "latency_ms": 5.4, "input": "640×640", "role": "现有仓库首跑"},
+        {"model": "dinov3/vitt16plus-ltdetr-coco", "availability": "工作区 0.14.2", "params_m": 18.1, "coco_map": 52.5, "latency_ms": 7.0, "input": "640×640", "role": "第二档精度对照"}
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "face_local",
+      "label": "本地 face 数据集审计",
+      "path": "datasets/face"
+    },
+    {
+      "id": "face_headline_sql",
+      "label": "数据集总体指标审计查询",
+      "path": "reports/face_dataset_research/evidence.sql",
+      "query": {
+        "engine": "sqlite",
+        "language": "sql",
+        "sql": "WITH headline_metrics(\n  total_images, labeled_images, valid_face_boxes, under8_share\n) AS (\n  VALUES (38203, 22094, 246476, 0.4773)\n)\nSELECT * FROM headline_metrics",
+        "description": "返回本地 face 数据集的总体审计指标。",
+        "executed_at": "2026-08-27T00:00:00+08:00",
+        "metric_definitions": ["可用图片为转换后至少保留一个有效框的样本", "人脸框经边界裁剪并过滤零面积框", "短边占比基于现有可量化训练 JSON 框"]
+      }
+    },
+    {
+      "id": "face_size_sql",
+      "label": "640 输入框尺寸分布审计查询",
+      "path": "reports/face_dataset_research/evidence.sql",
+      "query": {
+        "engine": "sqlite",
+        "language": "sql",
+        "sql": "WITH size_bands(\n  source, band, share, boxes, total_boxes, input_size\n) AS (\n  VALUES\n    ('DarkFace','<4 px',0.3169,15971,50393,'640×640'),\n    ('DarkFace','4–8 px',0.3714,18713,50393,'640×640'),\n    ('DarkFace','8–16 px',0.2235,11266,50393,'640×640'),\n    ('DarkFace','≥16 px',0.0882,4443,50393,'640×640'),\n    ('WIDER train','<4 px',0.1164,18272,156995,'640×640'),\n    ('WIDER train','4–8 px',0.2932,46027,156995,'640×640'),\n    ('WIDER train','8–16 px',0.2977,46736,156995,'640×640'),\n    ('WIDER train','≥16 px',0.2927,45960,156995,'640×640')\n)\nSELECT * FROM size_bands",
+        "description": "返回保持宽高比缩放到 640×640 后的人脸短边互斥区间。",
+        "executed_at": "2026-08-27T00:00:00+08:00",
+        "filters": ["退化框排除", "DarkFace 与 WIDER train 分别作为分母"]
+      }
+    },
+    {
+      "id": "face_inventory_sql",
+      "label": "数据清单审计查询",
+      "path": "reports/face_dataset_research/evidence.sql",
+      "query": {
+        "engine": "sqlite",
+        "language": "sql",
+        "sql": "WITH dataset_inventory(\n  split, images, json_labels, json_boxes, missing_json, quality_note\n) AS (\n  VALUES\n    ('WIDER test',16097,0,0,16097,'仅用于官方提交，不进入本次数据集'),\n    ('WIDER train',12880,12872,156968,8,'严格使用现有 JSON；清理 27 个退化框'),\n    ('DarkFace',6000,6000,50396,0,'清理 3 个退化框；6,000 张全部可用'),\n    ('WIDER val',3226,3222,39112,0,'4 张图清理后零有效框；清理 11 个退化框')\n)\nSELECT * FROM dataset_inventory",
+        "description": "返回各目录的图片、JSON、框和缺失标注数量。",
+        "executed_at": "2026-08-27T00:00:00+08:00"
+      }
+    },
+    {
+      "id": "model_comparison_sql",
+      "label": "LightlyTrain 模型对比查询",
+      "path": "reports/face_dataset_research/evidence.sql",
+      "href": "https://docs.lightly.ai/train/stable/object_detection.html",
+      "query": {
+        "engine": "sqlite",
+        "language": "sql",
+        "sql": "WITH model_comparison(\n  model, availability, params_m, coco_map, latency_ms, input, role\n) AS (\n  VALUES\n    ('picodet-s-coco','工作区 0.14.2',1.17,26.7,2.2,'416×416','极限速度对照'),\n    ('ltdetrv2-s-coco','最新稳定版',9.9,50.7,5.4,'640×640','升级后的优先候选'),\n    ('dinov3/vitt16-ltdetr-coco','工作区 0.14.2',10.1,49.8,5.4,'640×640','现有仓库首跑'),\n    ('dinov3/vitt16plus-ltdetr-coco','工作区 0.14.2',18.1,52.5,7.0,'640×640','第二档精度对照')\n)\nSELECT * FROM model_comparison",
+        "description": "整理 LightlyTrain 官方 COCO benchmark 中的小模型参数、精度和 T4 延迟。",
+        "executed_at": "2026-08-27T00:00:00+08:00",
+        "metric_definitions": ["COCO mAP 为 val2017 mAP50:95", "延迟为 NVIDIA T4、TensorRT FP16、batch 1"]
+      }
+    },
+    {"id": "lightly_local", "label": "工作区 LightlyTrain 0.14.2 检测文档", "path": "docs/source/object_detection.md"},
+    {"id": "converter_local", "label": "工作区 LabelMe → YOLO 转换器", "path": "datasets/convert_datasets/convert_tools/LabelMeToYOLO.py"},
+    {"id": "lightly_official", "label": "LightlyTrain 官方 Object Detection 文档", "href": "https://docs.lightly.ai/train/stable/object_detection.html"},
+    {"id": "wider_official", "label": "WIDER FACE 官方数据集页面", "href": "https://mmlab.ie.cuhk.edu.hk/projects/WIDERFace/"},
+    {"id": "darkface_official", "label": "DARK FACE 官方数据集页面", "href": "https://flyywh.github.io/CVPRW2019LowLight/"}
+  ]
+}

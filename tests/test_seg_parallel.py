@@ -172,6 +172,129 @@ def test_build_seg_eval_child_command_preserves_all_splits():
     assert parsed.shard_index == 0 and parsed.num_shards == 2
 
 
+def test_build_instance_eval_child_command_preserves_display_settings():
+    args = SimpleNamespace(
+        seg_train_type="instance", experiment_dir=None, checkpoint=None,
+        data="d.yaml", split=["val", "test"], classwise=False, overwrite=False,
+        threshold=0.65, vis_max_images=24, save_visualization=True,
+    )
+    command = seg_tools._build_seg_eval_child_command(
+        args, shard_index=0, num_shards=2, output_dir="/tmp/shard_00", device="auto"
+    )
+    parsed = parse_cli_args(command[2:])
+    assert parsed.split == ["val", "test"]
+    assert parsed.threshold == 0.65
+    assert parsed.vis_max_images == 24
+
+
+def test_instance_parallel_merge_writes_each_split_separately(tmp_path, monkeypatch):
+    shard_dirs = [tmp_path / "_shards" / "shard_00", tmp_path / "_shards" / "shard_01"]
+    for shard_dir in shard_dirs:
+        for split in ("val", "test"):
+            result_dir = shard_dir / split
+            result_dir.mkdir(parents=True)
+            (result_dir / "seg_instance_shard_result.json").write_text("{}", encoding="utf-8")
+
+    merged_by_split = {
+        "val": {
+            "metric_values": {"map": 0.4}, "num_images": 3,
+            "images_with_labels": 2, "infer_time_sum_ms": 12.0, "failed": 0,
+        },
+        "test": {
+            "metric_values": {"map": 0.6}, "num_images": 5,
+            "images_with_labels": 4, "infer_time_sum_ms": 20.0, "failed": 1,
+        },
+    }
+
+    def _fake_merge(split_shard_dirs, *, classwise):
+        del classwise
+        return merged_by_split[split_shard_dirs[0].name]
+
+    monkeypatch.setattr(seg_tools, "_merge_instance_shard_results", _fake_merge)
+    args = SimpleNamespace(
+        data=tmp_path / "data.yaml", classwise=False, split=["val", "test"],
+        seg_train_type="instance", device="auto", overwrite=True, threshold=0.8,
+    )
+    output_dir = tmp_path / "eval"
+    seg_tools._merge_parallel_instance(
+        args,
+        shard_dirs,
+        splits=["val", "test"],
+        final_output_dir=output_dir,
+        checkpoint_path=tmp_path / "checkpoint.ckpt",
+    )
+
+    import json as _json
+
+    val_summary = _json.loads((output_dir / "val" / "seg_eval_summary.json").read_text())
+    test_summary = _json.loads((output_dir / "test" / "seg_eval_summary.json").read_text())
+    root_meta = _json.loads((output_dir / "run_meta.json").read_text())
+    assert val_summary["split"] == "val" and val_summary["metrics"]["map"] == 0.4
+    assert test_summary["split"] == "test" and test_summary["metrics"]["map"] == 0.6
+    assert root_meta["num_images"] == 8
+
+
+def test_instance_multi_split_compare_dirs_are_isolated(tmp_path):
+    shard_dir = tmp_path / "eval" / "_shards" / "shard_00"
+    assert seg_tools._eval_compare_dir(
+        shard_dir, split="val", multi_split=True
+    ) == tmp_path / "eval" / "val" / "compare"
+    assert seg_tools._eval_compare_dir(
+        shard_dir, split="test", multi_split=True
+    ) == tmp_path / "eval" / "test" / "compare"
+
+
+def test_run_instance_eval_processes_all_splits(tmp_path, monkeypatch):
+    rt.import_runtime_dependencies()
+
+    class _FakeModel:
+        def eval(self):
+            return self
+
+    class _FakeMetric:
+        def __init__(self, split):
+            self.split = split
+
+        def compute_aggregated_values(self):
+            score = 0.4 if self.split == "val" else 0.6
+            return SimpleNamespace(metric_values={"map": score})
+
+    seen = []
+
+    def _fake_accumulate(model, data_cfg, split, classwise, **kwargs):
+        del model, data_cfg, classwise, kwargs
+        seen.append(split)
+        return {
+            "metric": _FakeMetric(split),
+            "num_images": 2,
+            "images_with_labels": 2,
+            "infer_time_sum_ms": 10.0,
+            "failed": 0,
+        }
+
+    monkeypatch.setattr(seg_tools, "_seg_reuse_precheck", lambda *args, **kwargs: "run")
+    monkeypatch.setattr(seg_tools, "run_parallel_seg_eval", lambda args: False)
+    monkeypatch.setattr(seg_tools.rt, "resolve_checkpoint_path", lambda *args: tmp_path / "model.ckpt")
+    monkeypatch.setattr(seg_tools.rt, "load_data_config", lambda path: {})
+    monkeypatch.setattr(seg_tools.rt, "resolve_device", lambda device: device)
+    monkeypatch.setattr(seg_tools.rt.lightly_train, "load_model", lambda **kwargs: _FakeModel())
+    monkeypatch.setattr(seg_tools, "_accumulate_instance_eval", _fake_accumulate)
+
+    args = SimpleNamespace(
+        seg_train_type="instance", checkpoint=tmp_path / "model.ckpt",
+        experiment_dir=tmp_path, output_dir=tmp_path / "eval",
+        data=tmp_path / "data.yaml", split=["val", "test"], threshold=0.8,
+        classwise=False, device="cpu", overwrite=True, save_visualization=False,
+        dry_run=False, shard_index=None, num_shards=1,
+    )
+    seg_tools.run_eval(args)
+
+    assert seen == ["val", "test"]
+    assert (args.output_dir / "val" / "seg_eval_summary.json").exists()
+    assert (args.output_dir / "test" / "seg_eval_summary.json").exists()
+    assert (args.output_dir / "run_meta.json").exists()
+
+
 def test_run_parallel_seg_infer_falls_back_single_gpu(monkeypatch):
     monkeypatch.setattr(
         seg_tools.gpu_parallel, "query_gpu_inventory",

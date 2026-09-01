@@ -47,6 +47,15 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Optional
 
+try:
+    from .progress import tqdm
+    from .text_encoding import read_text_auto
+    from .dataset_transaction import staged_output, validate_output_location
+except ImportError:
+    from progress import tqdm  # type: ignore[no-redef]
+    from text_encoding import read_text_auto  # type: ignore[no-redef]
+    from dataset_transaction import staged_output, validate_output_location  # type: ignore[no-redef]
+
 # ── 支持的图片格式 ────────────────────────────────────────────────────────────
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
               ".webp", ".heic", ".heif", ".svg", ".ico", ".raw", ".cr2",
@@ -156,7 +165,8 @@ def collect_voc_semantic_files(src_roots: list[Path]) -> list[tuple[Path, Path, 
     image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
     results: list[tuple[Path, Path, str]] = []
-    for root in src_roots:
+    used_output_stems: set[str] = set()
+    for source_index, root in enumerate(src_roots):
         # Find image directory
         img_dir = None
         for name in image_dir_names:
@@ -189,7 +199,13 @@ def collect_voc_semantic_files(src_roots: list[Path]) -> list[tuple[Path, Path, 
             if f.is_file() and f.suffix.lower() in image_exts:
                 mask_path = mask_index.get(f.stem)
                 if mask_path is not None:
-                    results.append((f, mask_path, f.stem))
+                    output_stem = sanitize_stem(f.stem)
+                    if output_stem in used_output_stems:
+                        output_stem = unique_stem(
+                            f"src{source_index + 1}_{output_stem}", used_output_stems
+                        )
+                    used_output_stems.add(output_stem)
+                    results.append((f, mask_path, output_stem))
 
     return results
 
@@ -197,11 +213,10 @@ def collect_voc_semantic_files(src_roots: list[Path]) -> list[tuple[Path, Path, 
 def _read_voc_split_file(split_file: Path) -> list[str]:
     """Read a VOC-style split file (one stem per line, no extension)."""
     stems = []
-    with split_file.open("r", encoding="utf-8") as f:
-        for line in f:
-            stem = line.strip()
-            if stem:
-                stems.append(stem)
+    for line in read_text_auto(split_file).splitlines():
+        stem = line.strip()
+        if stem:
+            stems.append(stem)
     return stems
 
 
@@ -223,82 +238,61 @@ def split_voc_semantic_files(
         return {"paired_total": 0, "split_counts": {"train": 0, "val": 0, "test": 0}}
 
     # Check for VOC-style ImageSets split files
-    split_map: dict[str, str] = {}  # stem -> split_name
-    imageset_files: dict[str, list[str]] = {}  # split_name -> [stems]
+    split_map: dict[Path, str] = {}  # image path -> split_name
     split_aliases = {"trn": "train", "val": "val", "test": "test", "train": "train"}
 
     for root in src_roots:
         imagesets_dir = root / "ImageSets"
         if imagesets_dir.is_dir():
+            root_split_files: dict[str, list[str]] = {}
             for f in imagesets_dir.iterdir():
                 if f.suffix.lower() == ".txt":
                     split_name = split_aliases.get(f.stem.lower(), f.stem.lower())
                     stems = _read_voc_split_file(f)
                     if stems:
-                        imageset_files[split_name] = stems
-            break
+                        root_split_files[split_name] = stems
+            for split_name, stems in root_split_files.items():
+                stem_set = set(stems)
+                for image_path, _mask_path, _output_stem in pairs:
+                    try:
+                        image_path.relative_to(root)
+                    except ValueError:
+                        continue
+                    if image_path.stem in stem_set:
+                        split_map[image_path.resolve()] = split_name
 
     required_splits = {"train", "val", "test"}
-    if imageset_files:
-        provided_splits = set(imageset_files.keys())
-        if required_splits.issubset(provided_splits):
-            # All three splits present - use them directly
-            for split_name, stems in imageset_files.items():
-                for stem in stems:
-                    split_map[stem] = split_name
-        else:
-            # Missing one or more splits - merge and re-split 8:1:1
-            all_stems: list[str] = []
-            for stems in imageset_files.values():
-                all_stems.extend(stems)
-            # Deduplicate while preserving order
-            seen: set[str] = set()
-            deduped: list[str] = []
-            for stem in all_stems:
-                if stem not in seen:
-                    seen.add(stem)
-                    deduped.append(stem)
-            print(f"[INFO] ImageSets/ 缺少完整 train/val/test（仅有 {provided_splits}），将合并后重新 8:1:1 划分")
-            rng = random.Random(seed)
-            rng.shuffle(deduped)
-            n = len(deduped)
-            n_train = round(n * 0.8)
-            n_val = round(n * 0.1)
-            for stem in deduped[:n_train]:
-                split_map[stem] = "train"
-            for stem in deduped[n_train:n_train + n_val]:
-                split_map[stem] = "val"
-            for stem in deduped[n_train + n_val:]:
-                split_map[stem] = "test"
 
-    # Create output directories
     all_splits = required_splits if split_map else required_splits
-    for split in all_splits:
-        (dest / "images" / split).mkdir(parents=True, exist_ok=True)
-        (dest / "masks" / split).mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        for split in all_splits:
+            (dest / "images" / split).mkdir(parents=True, exist_ok=True)
+            (dest / "masks" / split).mkdir(parents=True, exist_ok=True)
 
     # Assign splits
-    stem_set = {stem for _, _, stem in pairs}
-    unmatched_in_splits = stem_set - set(split_map.keys())
+    image_paths = [image_path.resolve() for image_path, _, _ in pairs]
+    unmatched_in_splits = [path for path in image_paths if path not in split_map]
 
     if unmatched_in_splits and split_map:
-        # Some stems not in any split file - assign to train by default
-        for stem in unmatched_in_splits:
-            split_map[stem] = "train"
+        print(f"[INFO] {len(unmatched_in_splits)} 个样本未出现在 ImageSets 中，将随机补充分配")
+        rng = random.Random(seed)
+        rng.shuffle(unmatched_in_splits)
+        for index, image_path in enumerate(unmatched_in_splits):
+            split_map[image_path] = ("train", "val", "test")[index % 10 // 8 if index % 10 < 9 else 2]
     elif not split_map:
         # No split files found - random 8:1:1
-        stems_list = sorted(stem_set)
+        stems_list = sorted(image_paths, key=str)
         rng = random.Random(seed)
         rng.shuffle(stems_list)
         n = len(stems_list)
         n_train = round(n * 0.8)
         n_val = round(n * 0.1)
-        for stem in stems_list[:n_train]:
-            split_map[stem] = "train"
-        for stem in stems_list[n_train:n_train + n_val]:
-            split_map[stem] = "val"
-        for stem in stems_list[n_train + n_val:]:
-            split_map[stem] = "test"
+        for image_path in stems_list[:n_train]:
+            split_map[image_path] = "train"
+        for image_path in stems_list[n_train:n_train + n_val]:
+            split_map[image_path] = "val"
+        for image_path in stems_list[n_train + n_val:]:
+            split_map[image_path] = "test"
 
     stats: dict = {
         "paired_total": len(pairs),
@@ -307,8 +301,13 @@ def split_voc_semantic_files(
         "skipped_no_split": 0,
     }
 
-    for img_path, mask_path, stem in pairs:
-        split = split_map.get(stem)
+    for img_path, mask_path, stem in tqdm(
+        pairs,
+        desc="复制语义样本",
+        unit="样本",
+        total=len(pairs),
+    ):
+        split = split_map.get(img_path.resolve())
         if split is None:
             stats["skipped_no_split"] += 1
             continue
@@ -333,23 +332,51 @@ def split_voc_semantic_files(
     return stats
 
 # ── 收集文件 ──────────────────────────────────────────────────────────────────
-def collect_files(src_roots: list, label_format: str):
-    """递归收集所有图片和标注文件，返回两个列表。"""
-    image_records = []   # (src_path, orig_stem, ext)
-    label_records = []   # (src_path, orig_stem)
+_PAIR_CONTAINER_NAMES = {
+    "images", "image", "jpegimages", "imgs",
+    "labels", "label", "annotations", "annotation",
+}
 
-    for root in src_roots:
+
+def _sample_key(root: Path, path: Path, source_index: int) -> tuple[int, str]:
+    """Return a source-scoped, relative sample identity.
+
+    ``images/train/a.jpg`` and ``labels/train/a.txt`` intentionally map to the
+    same key, while equally named samples from different source roots do not.
+    """
+    relative = path.relative_to(root).with_suffix("")
+    parts = list(relative.parts)
+    for index, part in enumerate(parts[:-1]):
+        if part.casefold() in _PAIR_CONTAINER_NAMES:
+            del parts[index]
+            break
+    return source_index, Path(*parts).as_posix().casefold()
+
+
+def collect_files(src_roots: list, label_format: str):
+    """递归收集图片和标注，并保留来源及相对路径身份。"""
+    image_records = []   # (src_path, orig_stem, ext, sample_key)
+    label_records = []   # (src_path, orig_stem, sample_key)
+
+    for source_index, root_value in enumerate(tqdm(
+        src_roots,
+        desc="扫描来源",
+        unit="目录",
+        leave=False,
+    )):
+        root = Path(root_value).expanduser().resolve()
         for dirpath, _, filenames in os.walk(root):
             for fname in filenames:
                 fpath = Path(dirpath) / fname
                 ext   = fpath.suffix.lower()
                 stem  = fpath.stem
+                key = _sample_key(root, fpath, source_index)
                 if ext in IMAGE_EXTS:
-                    image_records.append((fpath, stem, ext))
+                    image_records.append((fpath, stem, ext, key))
                 elif label_format == "labelme" and ext == ".json":
-                    label_records.append((fpath, stem))
+                    label_records.append((fpath, stem, key))
                 elif label_format == "yolo" and ext == ".txt" and fpath.name.lower() not in {"classes.txt"}:
-                    label_records.append((fpath, stem))
+                    label_records.append((fpath, stem, key))
 
     return image_records, label_records
 
@@ -379,12 +406,13 @@ def copy_files(
     label_format: str,
     seed=None,
     dry_run: bool = False,
+    yolo_remaps: dict[int, dict[int, int]] | None = None,
 ):
 
-    # 创建三个子目录
     splits = ["train", "val", "test"]
-    for s in splits:
-        (dest / s).mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        for s in splits:
+            (dest / s).mkdir(parents=True, exist_ok=True)
 
     image_records, label_records = collect_files(src_roots, label_format)
 
@@ -393,10 +421,10 @@ def copy_files(
 
     # 标注索引：orig_stem -> [src_path, ...]
     label_index: dict = defaultdict(list)
-    for src_path, stem in label_records:
-        label_index[stem].append(src_path)
+    for src_path, _stem, sample_key in label_records:
+        label_index[sample_key].append(src_path)
 
-    all_image_orig_stems = {stem for _, stem, _ in image_records}
+    all_image_keys = {sample_key for _, _, _, sample_key in image_records}
 
     stats = {
         "total_images"        : len(image_records),
@@ -424,11 +452,11 @@ def copy_files(
     cprint(C.CYAN + C.BOLD, "═" * 62)
 
     # ── 第一步：生成所有配对 & 确定目标文件名 ────────────────────────────────
-    # paired_items: list of (img_src, label_src, final_stem, ext)
+    # paired_items: list of (img_src, label_src, final_stem, ext, source_index)
     paired_items   = []
     used_stems     = set()
 
-    for src_path, orig_stem, ext in image_records:
+    for src_path, orig_stem, ext, sample_key in image_records:
         # 清洗文件名
         clean_stem = sanitize_stem(orig_stem)
         sanitized  = clean_stem != orig_stem
@@ -452,19 +480,24 @@ def copy_files(
         used_stems.add(final_stem)
 
         # 查找对应标注
-        if orig_stem in label_index:
-            label_candidates = label_index[orig_stem]
+        if sample_key in label_index:
+            label_candidates = label_index[sample_key]
             if len(label_candidates) > 1:
-                cprint(C.YELLOW, f"  [警告]  '{orig_stem}' 有 {len(label_candidates)} 个 {label_name}，取第一个")
+                stats["errors"].append(
+                    f"同一来源及相对路径存在多个标注，已跳过: {src_path} -> {label_candidates}"
+                )
+                stats["images_without_label"] += 1
+                stats["orphan_images"].append(str(src_path))
+                continue
             label_src = label_candidates[0]
-            paired_items.append((src_path, label_src, final_stem, ext))
+            paired_items.append((src_path, label_src, final_stem, ext, sample_key[0]))
         else:
             stats["images_without_label"] += 1
             stats["orphan_images"].append(str(src_path))
 
     # 孤立标注
-    for src_path, stem in label_records:
-        if stem not in all_image_orig_stems:
+    for src_path, _stem, sample_key in label_records:
+        if sample_key not in all_image_keys:
             stats["labels_without_image"] += 1
             stats["orphan_labels"].append(str(src_path))
 
@@ -493,7 +526,12 @@ def copy_files(
     # 每个 split 内部单独管理 used_filenames（不同 split 可以同名）
     split_used: dict = {"train": set(), "val": set(), "test": set()}
 
-    for idx, (img_src, label_src, final_stem, ext) in enumerate(paired_items):
+    for idx, (img_src, label_src, final_stem, ext, source_index) in tqdm(
+        enumerate(paired_items),
+        total=len(paired_items),
+        desc="复制数据",
+        unit="样本",
+    ):
         split = split_map[idx]
         split_dir = dest / split
 
@@ -527,11 +565,29 @@ def copy_files(
                 continue
 
             try:
-                shutil.copy2(label_src, label_dest_path)
+                remap = (yolo_remaps or {}).get(source_index)
+                if label_format == "yolo" and remap and any(old != new for old, new in remap.items()):
+                    converted: list[str] = []
+                    for raw_line in read_text_auto(label_src).splitlines():
+                        parts = raw_line.split()
+                        if not parts:
+                            continue
+                        old_id = int(float(parts[0]))
+                        if old_id not in remap:
+                            raise ValueError(
+                                f"标注类别 ID {old_id} 不在来源 metadata 中: {label_src}"
+                            )
+                        parts[0] = str(remap[old_id])
+                        converted.append(" ".join(parts))
+                    label_dest_path.write_text(
+                        "\n".join(converted) + ("\n" if converted else ""), encoding="utf-8"
+                    )
+                else:
+                    shutil.copy2(label_src, label_dest_path)
             except Exception as e:
                 stats["errors"].append(f"复制标注失败: {label_src} → {label_dest_path}: {e}")
                 cprint(C.RED, f"  [错误]  {label_src.name}: {e}")
-                # 图片已复制但标注失败，记录为无标注
+                img_dest_path.unlink(missing_ok=True)
                 stats["images_without_label"] += 1
                 continue
 
@@ -545,13 +601,23 @@ def copy_files(
     return stats
 
 # ── 报告 ──────────────────────────────────────────────────────────────────────
-def print_report(stats: dict, dest: Path, src_roots: list, elapsed: float, seed):
+def print_report(
+    stats: dict,
+    dest: Path,
+    src_roots: list,
+    elapsed: float,
+    seed,
+    *,
+    dry_run: bool = False,
+    report_dest: Path | None = None,
+):
+    display_dest = (report_dest or dest).resolve()
     print()
     cprint(C.BLUE + C.BOLD, "═" * 62)
     cprint(C.BLUE + C.BOLD, "  📊  完成 · 统计报告")
     cprint(C.BLUE + C.BOLD, "═" * 62)
 
-    print(f"\n  {'输出目录':<22} {C.CYAN}{dest.resolve()}{C.RESET}")
+    print(f"\n  {'输出目录':<22} {C.CYAN}{display_dest}{C.RESET}")
     print(f"  {'源文件夹数量':<22} {C.CYAN}{len(src_roots)}{C.RESET}")
     print(f"  {'标注格式':<22} {C.CYAN}{stats['label_format']}{C.RESET}")
     print(f"  {'随机种子':<22} {C.CYAN}{seed if seed is not None else '随机（不固定）'}{C.RESET}")
@@ -620,12 +686,19 @@ def print_report(stats: dict, dest: Path, src_roots: list, elapsed: float, seed)
         for e in stats["errors"]:
             cprint(C.RED, f"  ✖ {e}")
 
+    if dry_run:
+        print()
+        cprint(C.YELLOW, "  dry-run：未创建目录、复制文件或写入报告。")
+        cprint(C.BLUE + C.BOLD, "═" * 62)
+        print()
+        return
+
     # 写日志
     log_path = dest / "_sync_report.txt"
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("sync_media.py 报告\n")
         f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"输出目录: {dest.resolve()}\n")
+        f.write(f"输出目录: {display_dest}\n")
         f.write(f"随机种子: {seed if seed is not None else '随机'}\n\n")
         f.write("── 数据集分布 ──\n")
         for split, count in stats["split_counts"].items():
@@ -668,7 +741,7 @@ def print_report(stats: dict, dest: Path, src_roots: list, elapsed: float, seed)
                 f.write(f"  {e}\n")
 
     print()
-    cprint(C.GREEN, f"  ✔  完整报告已保存至 {log_path}")
+    cprint(C.GREEN, f"  ✔  完整报告已保存至 {display_dest / log_path.name}")
     cprint(C.BLUE + C.BOLD, "═" * 62)
     print()
 
@@ -693,6 +766,10 @@ def main():
         help="模拟运行，不实际写入文件"
     )
     parser.add_argument(
+        "--overwrite", action="store_true",
+        help="原子替换已有输出；不指定时拒绝覆盖非空目录",
+    )
+    parser.add_argument(
         "--label-format",
         choices=["auto", "labelme", "yolo"],
         default="auto",
@@ -707,7 +784,8 @@ def main():
             cprint(C.RED, f"错误: 源文件夹不存在: {r}")
             sys.exit(1)
 
-    dest = Path(args.output)
+    src_roots = [root.expanduser().resolve() for root in src_roots]
+    dest = validate_output_location(Path(args.output), src_roots)
     detected_format: Optional[str] = None
     if args.label_format == "auto":
         detected_format = detect_label_format(src_roots)
@@ -727,16 +805,30 @@ def main():
     cprint(C.CYAN, f"\n  [INFO] 使用标注格式: {label_format}\n")
 
     start = datetime.now()
-    stats = copy_files(
-        src_roots,
-        dest,
-        label_format=label_format,
-        seed=args.seed,
-        dry_run=args.dry_run,
-    )
-    elapsed = (datetime.now() - start).total_seconds()
+    if args.dry_run:
+        stats = copy_files(
+            src_roots, dest, label_format=label_format, seed=args.seed, dry_run=True,
+        )
+        elapsed = (datetime.now() - start).total_seconds()
+        print_report(stats, dest, src_roots, elapsed, args.seed, dry_run=True)
+        return
 
-    print_report(stats, dest, src_roots, elapsed, args.seed)
+    with staged_output(dest, clean=args.overwrite) as stage:
+        stats = copy_files(
+            src_roots, stage, label_format=label_format, seed=args.seed, dry_run=False,
+        )
+        if stats["errors"]:
+            raise RuntimeError(f"整理过程中有 {len(stats['errors'])} 个错误，未发布输出")
+        elapsed = (datetime.now() - start).total_seconds()
+        print_report(
+            stats,
+            stage,
+            src_roots,
+            elapsed,
+            args.seed,
+            report_dest=dest,
+        )
+    print(f"  原子发布: {dest}")
 
 
 if __name__ == "__main__":

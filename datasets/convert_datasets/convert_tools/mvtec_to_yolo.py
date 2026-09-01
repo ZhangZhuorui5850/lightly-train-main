@@ -32,21 +32,28 @@ try:
     import numpy as np
     import yaml
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
-    sys.exit(f"缺少依赖 {exc.name}，请在项目训练环境中运行。当前 Python: {sys.executable}")
+    if not any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+        sys.exit(f"缺少依赖 {exc.name}，请在项目训练环境中运行。当前 Python: {sys.executable}")
 
 try:
     from .generated_mask_to_yoloseg import mask_to_polygons
-    from .dataset_discovery import auto_datasets_root, scan_mvtec_datasets
+    from .dataset_transaction import staged_output, validate_output_location
+    from .dataset_discovery import auto_datasets_root
+    from .dataset_detector import detect_datasets
     from .interactive_helpers import prompt_choice, prompt_path
     from .output_naming import default_output_dir
+    from .progress import tqdm
 except ImportError:
     from generated_mask_to_yoloseg import mask_to_polygons  # type: ignore[no-redef]
-    from dataset_discovery import (  # type: ignore[no-redef]
-        auto_datasets_root,
-        scan_mvtec_datasets,
+    from dataset_transaction import (  # type: ignore[no-redef]
+        staged_output,
+        validate_output_location,
     )
+    from dataset_discovery import auto_datasets_root  # type: ignore[no-redef]
+    from dataset_detector import detect_datasets  # type: ignore[no-redef]
     from interactive_helpers import prompt_choice, prompt_path  # type: ignore[no-redef]
     from output_naming import default_output_dir  # type: ignore[no-redef]
+    from progress import tqdm  # type: ignore[no-redef]
 
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
@@ -127,6 +134,18 @@ def _mask_for_image(mask_dir: Path, image_stem: str) -> tuple[Path | None, bool]
     return None, False
 
 
+def _mask_from_index(
+    masks: dict[str, Path], duplicates: set[str], image_stem: str
+) -> tuple[Path | None, bool]:
+    """Resolve one image against a mask index built once for its defect."""
+    for stem in (f"{image_stem}_mask", image_stem):
+        if stem in duplicates:
+            return None, True
+        if stem in masks:
+            return masks[stem], False
+    return None, False
+
+
 def discover_samples(src: Path) -> tuple[list[Sample], list[ScanIssue]]:
     categories = discover_category_roots(src)
     if not categories:
@@ -151,8 +170,9 @@ def discover_samples(src: Path) -> tuple[list[Sample], list[ScanIssue]]:
         ):
             defect = defect_dir.name
             mask_dir = category_dir / "ground_truth" / defect
+            masks, duplicates = _unique_files_by_stem(mask_dir)
             for image in _image_files(defect_dir):
-                mask, duplicate = _mask_for_image(mask_dir, image.stem)
+                mask, duplicate = _mask_from_index(masks, duplicates, image.stem)
                 if duplicate:
                     issues.append(ScanIssue(
                         "duplicate_mask", category, defect, image.stem,
@@ -231,7 +251,7 @@ def _write_metadata(
     sources: dict[str, set[str]],
 ) -> None:
     data = {
-        "path": str(root),
+        "path": ".",
         "train": "images/train",
         "val": "images/val",
         "test": "images/test",
@@ -307,7 +327,7 @@ REPORT_FIELDS = (
 )
 
 
-def convert(
+def _convert_unpublished(
     src: Path,
     out: Path,
     *,
@@ -317,8 +337,8 @@ def convert(
     threshold: int = 127,
     min_area: float = 1.0,
     epsilon: float = 0.001,
-    clean: bool = False,
     verbose: bool = True,
+    report_output: Path | None = None,
 ) -> dict[str, object]:
     """Convert a MVTec dataset into YOLO segment, detect, or both."""
     if task not in (*TASKS, "both"):
@@ -334,8 +354,7 @@ def convert(
 
     src = src.expanduser().resolve()
     out = out.expanduser().resolve()
-    if out == src or out in src.parents:
-        raise ValueError("输出目录必须与输入目录分离，且不能位于输入目录的上层")
+    published_root = report_output or out
     samples, scan_issues = discover_samples(src)
     if not samples:
         raise ValueError(f"MVTec 数据集中未发现图片: {src}")
@@ -344,14 +363,7 @@ def convert(
         raise ValueError(f"MVTec 数据集中未发现带掩码的缺陷样本: {src}")
     class_ids = {name: index for index, name in enumerate(names)}
     outputs = _task_outputs(out, task)
-    if task == "both":
-        if clean and out.exists():
-            shutil.rmtree(out)
-        if out.exists() and any(out.iterdir()):
-            raise FileExistsError(f"输出目录已存在且含有文件: {out}")
-        _prepare_outputs(outputs, clean=False)
-    else:
-        _prepare_outputs(outputs, clean)
+    _prepare_outputs(outputs, clean=False)
 
     sources: dict[str, set[str]] = {name: set() for name in names}
     rows: list[dict[str, object]] = [
@@ -376,7 +388,12 @@ def convert(
 
     used_stems: set[str] = set()
     converted = empty_masks = skipped = 0
-    for sample in samples:
+    for sample in tqdm(
+        samples,
+        desc=f"转换 {src.name}",
+        unit="图片",
+        disable=not verbose,
+    ):
         image = cv2.imread(str(sample.image), cv2.IMREAD_COLOR)
         mask = (
             cv2.imread(str(sample.mask), cv2.IMREAD_UNCHANGED)
@@ -480,28 +497,65 @@ def convert(
         writer.writeheader()
         writer.writerows(rows)
 
+    published_outputs = {
+        output_task: published_root / root.relative_to(out)
+        for output_task, root in outputs.items()
+    }
+    published_report = published_root / report_path.relative_to(out)
     result: dict[str, object] = {
         "src": src,
-        "out": out,
-        "outputs": outputs,
+        "out": published_root,
+        "outputs": published_outputs,
         "samples": len(samples),
         "converted": converted,
         "empty_masks": empty_masks,
         "skipped": skipped,
         "scan_issues": len(scan_issues),
         "names": names,
-        "report": report_path,
+        "report": published_report,
     }
     if verbose:
-        print(f"转换完成: {src} -> {out}")
+        print(f"转换完成: {src} -> {published_root}")
         print(
             f"样本 {len(samples)}，写入 {converted}，空掩码 {empty_masks}，"
             f"跳过 {skipped}，配对问题 {len(scan_issues)}"
         )
         print("类别: " + ", ".join(f"{index}={name}" for index, name in enumerate(names)))
-        for output_task, root in outputs.items():
+        for output_task, root in published_outputs.items():
             print(f"{output_task}: {root / 'data.yaml'}")
-        print(f"报告: {report_path}")
+        print(f"报告: {published_report}")
+    return result
+
+
+def convert(
+    src: Path,
+    out: Path,
+    *,
+    task: str = "both",
+    class_mode: str = "defect",
+    split_mode: str = "all-train",
+    threshold: int = 127,
+    min_area: float = 1.0,
+    epsilon: float = 0.001,
+    clean: bool = False,
+    verbose: bool = True,
+) -> dict[str, object]:
+    """Convert into a validated staging tree and publish it atomically."""
+    source = src.expanduser().resolve()
+    published_output = validate_output_location(out, [source])
+    with staged_output(published_output, clean=clean) as stage:
+        result = _convert_unpublished(
+            source,
+            stage,
+            task=task,
+            class_mode=class_mode,
+            split_mode=split_mode,
+            threshold=threshold,
+            min_area=min_area,
+            epsilon=epsilon,
+            verbose=verbose,
+            report_output=published_output,
+        )
     return result
 
 
@@ -509,7 +563,7 @@ def choose_source(search_root: Path) -> Path | None:
     """Scan and interactively select one MVTec dataset root."""
     search_root = search_root.expanduser().resolve()
     print(f"\n扫描 MVTec AD 数据: {search_root}")
-    candidates = scan_mvtec_datasets(search_root)
+    candidates = detect_datasets(search_root, kinds={"mvtec"})
     if not candidates:
         print("扫描范围内暂未发现包含 test/ 和 ground_truth/ 的 MVTec 数据。")
         return None
@@ -579,6 +633,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epsilon", type=float, default=0.001, help="轮廓简化比例")
     parser.add_argument("--clean", action="store_true", help="清空已有输出后重建")
     parser.add_argument("--yes", action="store_true", help="使用默认输出并直接执行")
+    parser.add_argument("--dry-run", action="store_true", help="分析输入并显示输出计划，保持零写入")
     args = parser.parse_args(argv)
     interactive_mode = args.src is None or args.out is None
     try:
@@ -601,6 +656,14 @@ def main(argv: list[str] | None = None) -> int:
             if out is None:
                 print("已退出。")
                 return 0
+
+        if args.dry_run:
+            validate_output_location(out, [src])
+            print("\n[dry-run] MVTec AD → YOLO")
+            print(f"  输入: {src}")
+            print(f"  输出: {out}")
+            print(f"  task={args.task}, class_mode={args.class_mode}, split_mode={args.split_mode}")
+            return 0
 
         clean = args.clean
         if out.exists() and any(out.iterdir()) and not clean:
@@ -628,12 +691,16 @@ def main(argv: list[str] | None = None) -> int:
             threshold=args.threshold,
             min_area=args.min_area,
             epsilon=args.epsilon,
-            clean=args.clean,
+            clean=clean,
         )
     except (ValueError, FileExistsError) as exc:
         parser.error(str(exc))
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         print("\n已退出。")
+        return 0
+    except KeyboardInterrupt:
+        print("\n已退出。")
+        return 130
     return 0
 
 

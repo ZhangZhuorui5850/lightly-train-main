@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import shutil
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -37,22 +36,27 @@ try:
     import cv2  # noqa: F401
     import numpy as np  # noqa: F401
 except ModuleNotFoundError as e:
-    sys.exit(
-        f"\n[依赖缺失] 找不到模块 '{e.name}'。\n"
-        "你很可能没激活正确的 conda 环境(比如还在 base 里)。\n"
-        "请先运行:  conda activate lightlytrain   然后重试。\n"
-        f"(当前 Python: {sys.executable})\n"
-    )
+    if not any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+        sys.exit(
+            f"\n[依赖缺失] 找不到模块 '{e.name}'。\n"
+            "你很可能没激活正确的 conda 环境(比如还在 base 里)。\n"
+            "请先运行:  conda activate lightlytrain   然后重试。\n"
+            f"(当前 Python: {sys.executable})\n"
+        )
 
 # 复用 legacy 转换器里已验证的核心逻辑。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from yoloseg_to_mvtec import IMG_EXTS, SPLITS, find_image, load_names, make_mask, parse_label  # noqa: E402,F401
-
-try:  # 单行进度条;缺 tqdm 时退化为直接迭代
-    from tqdm import tqdm
-except ModuleNotFoundError:  # pragma: no cover
-    def tqdm(it, **_kw):
-        return it
+from yoloseg_to_mvtec import (  # noqa: E402,F401
+    IMG_EXTS,
+    SPLITS,
+    find_image,
+    load_names,
+    make_mask,
+    parse_label,
+)
+from dataset_transaction import staged_output, validate_output_location  # noqa: E402
+from output_naming import safe_path_component  # noqa: E402
+from progress import tqdm  # noqa: E402
 
 
 class DuplicateStemError(RuntimeError):
@@ -94,8 +98,12 @@ def scan_staging(staging: Path) -> tuple[dict[str, list[Path]], dict[str, list[s
     stem_objs: dict[str, list[str]] = defaultdict(list)
     for obj_dir in sorted(p for p in staging.iterdir() if p.is_dir()):
         imgs: list[Path] = []
+        seen_stems: set[str] = set()
         for img in sorted(obj_dir.iterdir()):
             if img.is_file() and img.suffix.lower() in IMG_EXTS:
+                if img.stem in seen_stems:
+                    continue
+                seen_stems.add(img.stem)
                 imgs.append(img)
                 if obj_dir.name not in stem_objs[img.stem]:
                     stem_objs[img.stem].append(obj_dir.name)
@@ -137,30 +145,26 @@ def _print_report(result: dict) -> None:
             print(f"  {obj}/{stem}")
 
 
-def convert(
+def _write_image(path: Path, image: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), image):
+        raise OSError(f"图片写入失败: {path}")
+
+
+def _convert_unpublished(
     staging: Path,
     src: Path,
     out: Path,
-    clean: bool = False,
-    verbose: bool = True,
+    *,
+    verbose: bool,
 ) -> dict:
     """把 staging(人工分好的物体文件夹) + src(YOLO-seg) 转成物体版 MVTec 到 out。
 
     返回统计 dict:{stats, missing, conflicts, manifest}。从不修改 src。
     """
-    staging, src, out = staging.resolve(), src.resolve(), out.resolve()
     names = load_names(src)
     index = build_label_index(src)
     objects, conflicts = scan_staging(staging)
-
-    if clean and out.exists():
-        shutil.rmtree(out)
-    if out.exists() and any(out.iterdir()):
-        raise SystemExit(
-            f"[拒绝覆盖] 输出目录已存在且非空: {out}\n"
-            "用 --clean 从头重建,或换一个 --out。"
-        )
-    out.mkdir(parents=True, exist_ok=True)
 
     # stats[物体][缺陷名 或 "good"] = 计数
     stats: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -168,7 +172,8 @@ def convert(
     manifest: list[dict[str, str]] = []
 
     for obj, imgs in objects.items():
-        cat = out / obj
+        safe_object = safe_path_component(obj, fallback="object")
+        cat = out / safe_object
         _ensure_empty_layout(cat)
         bar = tqdm(imgs, desc=f"物体 {obj}", unit="img", disable=not verbose,
                    dynamic_ncols=True, leave=False)
@@ -191,7 +196,7 @@ def convert(
 
             if not present:  # 空标签 → 对该物体是 good
                 dst = cat / "test" / "good"
-                cv2.imwrite(str(dst / f"{stem}.png"), img)
+                _write_image(dst / f"{stem}.png", img)
                 stats[obj]["good"] += 1
             else:
                 for cls in present:
@@ -202,14 +207,13 @@ def convert(
                             "请检查是不是 --src 指错了,或 data.yaml 与标签不匹配。"
                         )
                     dname = names[cls]
-                    dst = cat / "test" / dname
-                    dst.mkdir(parents=True, exist_ok=True)
-                    cv2.imwrite(str(dst / f"{stem}.png"), img)
+                    safe_defect = safe_path_component(dname, fallback=f"class_{cls}")
+                    dst = cat / "test" / safe_defect
+                    _write_image(dst / f"{stem}.png", img)
                     only = [p for c, p in polys if c == cls]
                     mask = make_mask(only, w, h)
-                    gt = cat / "ground_truth" / dname
-                    gt.mkdir(parents=True, exist_ok=True)
-                    cv2.imwrite(str(gt / f"{stem}_mask.png"), mask)
+                    gt = cat / "ground_truth" / safe_defect
+                    _write_image(gt / f"{stem}_mask.png", mask)
                     stats[obj][dname] += 1
 
             manifest.append({
@@ -232,7 +236,26 @@ def convert(
     return result
 
 
-def main() -> None:
+def convert(
+    staging: Path,
+    src: Path,
+    out: Path,
+    clean: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """Convert and atomically publish a complete object-oriented MVTec tree."""
+    staging = staging.expanduser().resolve()
+    src = src.expanduser().resolve()
+    published_out = validate_output_location(out, [staging, src])
+    if published_out.is_dir() and any(published_out.iterdir()) and not clean:
+        raise SystemExit(
+            f"输出目录已有内容: {published_out}；使用 --clean 重新生成"
+        )
+    with staged_output(published_out, clean=clean) as stage:
+        return _convert_unpublished(staging, src, stage, verbose=verbose)
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="物体版 YOLO-seg → MVTec AD 转换器")
     ap.add_argument("--staging", required=True, type=Path,
                     help="人工分好的物体文件夹根目录(staging/<物体>/*.jpg)")
@@ -240,12 +263,26 @@ def main() -> None:
                     help="YOLO-seg 源数据集(labels/{train,val,test}/*.txt + data.yaml)")
     ap.add_argument("--out", required=True, type=Path, help="输出 MVTec AD 根目录")
     ap.add_argument("--clean", action="store_true", help="先清空 --out")
-    args = ap.parse_args()
+    ap.add_argument("--dry-run", action="store_true", help="检查输入并显示输出计划，保持零写入")
+    args = ap.parse_args(argv)
     try:
+        if args.dry_run:
+            staging = args.staging.expanduser().resolve()
+            src = args.src.expanduser().resolve()
+            out = validate_output_location(args.out, [staging, src])
+            objects, conflicts = scan_staging(staging)
+            print("[dry-run] 物体版 YOLO Seg → MVTec AD")
+            print(f"  staging: {staging}")
+            print(f"  输入: {src}")
+            print(f"  输出: {out}")
+            print(f"  物体目录: {len(objects)}, 文件名冲突: {len(conflicts)}")
+            return 0
         convert(args.staging, args.src, args.out, clean=args.clean, verbose=True)
     except DuplicateStemError as e:
-        sys.exit(str(e))
+        print(str(e), file=sys.stderr)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -367,37 +367,12 @@ def _load_data_config_light(data_path: Path) -> dict[str, Any]:
         raise ValueError(f"Invalid data config: {resolved_path}")
 
     base_dir = resolved_path.parent
-    root_value = payload.get("path")
-    configured_root_dir = (
-        base_dir
-        if root_value is None
-        else rt.resolve_data_yaml_path(Path(root_value), base_dir=base_dir)
-    )
     payload["_data_yaml_path"] = resolved_path
     payload["_base_dir"] = base_dir
-    payload["_root_dir"] = rt.resolve_dataset_root_dir(
-        configured_root_dir=configured_root_dir,
-        data_yaml_dir=base_dir,
-        split_values={
-            "train": payload.get("train"),
-            "val": payload.get("val"),
-            "test": payload.get("test"),
-        },
+    payload["_root_dir"] = rt.dataset_adapter.resolve_dataset_root(
+        resolved_path, payload
     )
     return payload
-
-
-def _list_image_relative_paths(image_dir: Path) -> list[Path]:
-    image_dir = image_dir.expanduser().resolve()
-    if not image_dir.exists():
-        return []
-    paths = [
-        path.relative_to(image_dir)
-        for path in image_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in rt.VISUALIZATION_SUFFIXES
-    ]
-    paths.sort(key=lambda item: item.as_posix())
-    return paths
 
 
 def _collect_source_image_infos_light(
@@ -407,24 +382,34 @@ def _collect_source_image_infos_light(
     export_split_paths: dict[str, str] = {}
     source_root = Path(source_cfg["_root_dir"]).resolve()
     for split_name in SPLIT_ORDER:
-        if not source_cfg.get(split_name):
+        split_value = source_cfg.get(split_name)
+        if not split_value:
             continue
-        split_image_dir, split_label_dir, _ = rt.resolve_dataset_split_paths(source_cfg, split_name)
-        if split_label_dir is None or not split_image_dir.exists():
+        try:
+            samples, _ = rt.list_dataset_samples(source_cfg, split_name)
+        except ValueError:
             continue
         source_infos_by_split[split_name] = [
             _LightSourceImageInfo(
                 split_name=split_name,
-                rel_path=rel_path,
-                src_image_path=split_image_dir / rel_path,
-                src_label_path=(split_label_dir / rel_path).with_suffix(".txt"),
+                rel_path=sample.relative_path,
+                src_image_path=sample.image_path,
+                src_label_path=sample.label_path
+                or (source_root / ".missing_labels" / split_name / sample.relative_path).with_suffix(".txt"),
             )
-            for rel_path in _list_image_relative_paths(split_image_dir)
+            for sample in samples
         ]
-        try:
-            export_split_paths[split_name] = split_image_dir.resolve().relative_to(source_root).as_posix()
-        except ValueError:
+        complex_source = isinstance(split_value, (list, dict)) or Path(
+            str(split_value)
+        ).suffix.casefold() in ({".txt"} | rt.VISUALIZATION_SUFFIXES)
+        if complex_source:
             export_split_paths[split_name] = (Path("images") / split_name).as_posix()
+        else:
+            split_image_dir, _, _ = rt.resolve_dataset_split_paths(source_cfg, split_name)
+            try:
+                export_split_paths[split_name] = split_image_dir.resolve().relative_to(source_root).as_posix()
+            except ValueError:
+                export_split_paths[split_name] = (Path("images") / split_name).as_posix()
     return source_infos_by_split, export_split_paths
 
 
@@ -1338,12 +1323,16 @@ def _default_eda_output_dir(source_data_path: Path) -> Path:
     source_root = Path(source_cfg["_root_dir"]).resolve()
     dataset_tag = rt.dataset_tag_from_dir(source_root)
     base_dir = rt.EDA_OUTPUT_ROOT_DIR / f"{dataset_tag}-eda"
-    return rt.deduplicate_path(base_dir)
+    return base_dir
 
 
 def generate_eda_report(*, source_data_path: Path, output_dir: Path | None, overwrite: bool) -> Path:
     source_data_path = source_data_path.expanduser().resolve()
-    final_output_dir = output_dir.expanduser().resolve() if output_dir is not None else _default_eda_output_dir(source_data_path)
+    if output_dir is not None:
+        final_output_dir = output_dir.expanduser().resolve()
+    else:
+        base_dir = _default_eda_output_dir(source_data_path)
+        final_output_dir = base_dir if overwrite else rt.deduplicate_path(base_dir)
     rt.prepare_output_dir(final_output_dir, overwrite=overwrite)
 
     report, per_image_rows = _collect_dataset_eda(source_data_path)

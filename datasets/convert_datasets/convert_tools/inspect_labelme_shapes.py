@@ -7,6 +7,13 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+try:
+    from .progress import tqdm
+    from .text_encoding import read_text_auto
+except ImportError:
+    from progress import tqdm  # type: ignore[no-redef]
+    from text_encoding import read_text_auto  # type: ignore[no-redef]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -20,12 +27,17 @@ def parse_args() -> argparse.Namespace:
 def iter_json_files(source: Path) -> list[Path]:
     if source.is_file():
         return [source]
-    return sorted(source.rglob("*.json"))
+    return sorted(tqdm(
+        source.rglob("*.json"),
+        desc="索引 JSON 文件",
+        unit="file",
+        leave=False,
+    ))
 
 
 def load_json(path: Path) -> dict[str, Any] | list[Any] | None:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(read_text_auto(path))
     except Exception:
         return None
 
@@ -329,7 +341,12 @@ def main() -> None:
     unknown_items: list[str] = []
     parse_failed: list[str] = []
 
-    for json_file in json_files:
+    for json_file in tqdm(
+        json_files,
+        desc="解析 JSON 标注",
+        unit="file",
+        total=len(json_files),
+    ):
         data = load_json(json_file)
         if not isinstance(data, dict):
             parse_failed.append(str(json_file))
