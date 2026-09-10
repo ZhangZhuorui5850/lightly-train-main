@@ -170,6 +170,10 @@ python launcher.py infer --image-dir path/to/images --score-threshold 0.4
 
 ---
 
+infer/eval 复用指纹覆盖所选 split 的图片、标注、清单和 YAML 配置，包含外部路径与软链接目标；
+SAHI 的 NMS、全局局部合并阈值和小图策略参与指纹比较。输出目录采用软链接检查，
+发布时通过同目录文件锁串行执行，并重新校验覆盖权限。
+
 ### `eval` — 目标检测评估
 
 eval 对全部样本计算指标，每个 split 默认抽样保存 50 张 `[原图|GT|预测]` 对比图。
@@ -276,7 +280,7 @@ python datasets/convert_datasets/convert.py oneclick \
 `python datasets/convert_datasets/convert.py list` 查看。
 
 常用写入命令统一支持 `--dry-run`。`python datasets/convert_datasets/convert.py doctor`
-会检查命令注册、脚本存在性和 dry-run 契约。
+会检查命令注册、脚本存在性，并运行常用写入工具的 `--help` 检查 dry-run 参数。
 
 ---
 

@@ -89,3 +89,10 @@ def test_signaled_child_exit_is_normalized(monkeypatch) -> None:
     monkeypatch.setattr(entry["subprocess"], "call", Mock(return_value=-2))
 
     assert entry["_run"](entry["COMMANDS"]["datasets"], []) == 130
+
+
+def test_doctor_checks_real_cli_contract(monkeypatch):
+    import subprocess
+    entry = _load_entry()
+    monkeypatch.setattr(entry["subprocess"], "run", Mock(return_value=subprocess.CompletedProcess([], 0, "usage: example", "")))
+    assert entry["main"](["doctor"]) == 2

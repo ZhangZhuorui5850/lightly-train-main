@@ -92,7 +92,8 @@ python convert.py mvtec2yolo ...  # 标准 MVTec 同时转 YOLO Seg 和 Det
 
 菜单中的能力标签含义：`只读` 表示只做检测，`dry-run` 表示支持零写入预览，
 `原子替换` 表示写入 staging 校验后发布。所有常用写入命令都注册了 `--dry-run`；
-`convert.py doctor` 会持续检查这项约束。
+`convert.py doctor` 会检查注册表，并实际运行常用写入工具的 `--help`，确认启动成功且公开 `--dry-run` 参数。
+输出目录会在路径解析前检查软链接；重新划分工具的 `--dry-run` 同样校验源输出目录分离。
 菜单默认列出常用主流程；输入 `more` 展开单步/辅助工具。
 
 ## 主流程

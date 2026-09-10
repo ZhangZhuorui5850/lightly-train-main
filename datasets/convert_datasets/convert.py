@@ -284,6 +284,27 @@ def validate_registry(commands: list[str] | tuple[str, ...] | None = None) -> li
     return errors
 
 
+def validate_cli_contracts() -> list[str]:
+    """Check that primary writers actually expose the advertised CLI option."""
+    errors = []
+    for command, tool in COMMANDS.items():
+        if not tool.primary or tool.read_only:
+            continue
+        try:
+            result = subprocess.run(
+                [sys.executable, str(TOOLS_DIR / tool.script), "--help"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"{command}: CLI 检查失败: {exc}")
+            continue
+        if result.returncode != 0:
+            errors.append(f"{command}: --help 执行失败 (exit={result.returncode}): {result.stderr.strip()}")
+        elif "--dry-run" not in result.stdout:
+            errors.append(f"{command}: CLI 帮助缺少 --dry-run")
+    return errors
+
+
 def _capability_text(tool: Tool) -> str:
     if tool.read_only:
         return "[只读]"
@@ -432,6 +453,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if first == "doctor":
         registry_errors = validate_registry()
+        if not registry_errors:
+            registry_errors.extend(validate_cli_contracts())
         if registry_errors:
             _print_registry_errors(registry_errors)
             return 2
