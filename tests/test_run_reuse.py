@@ -80,3 +80,59 @@ def test_incomplete_run_meta_is_never_reused(tmp_path):
         args, output, fingerprint, action_label="det/infer", required=["run_meta.json"]
     ) == run_reuse.RUN
     assert args.overwrite is True
+
+
+def test_external_yaml_and_symlink_samples_invalidate_reuse(tmp_path):
+    external = tmp_path / "external"
+    image = external / "images" / "test" / "a.jpg"
+    label = external / "labels" / "test" / "a.txt"
+    image.parent.mkdir(parents=True)
+    label.parent.mkdir(parents=True)
+    image.write_bytes(b"image")
+    label.write_text("0 0.5 0.5 0.2 0.2")
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "images").symlink_to(external / "images", target_is_directory=True)
+    (dataset / "labels").symlink_to(external / "labels", target_is_directory=True)
+    config = tmp_path / "data.yaml"
+    config.write_text(f"path: {dataset}\ntest: images/test\nnames: [face]\n")
+    signature = lambda: run_reuse._dataset_signature(config, split="test")
+    before = signature()
+    image.write_bytes(b"changed-image")
+    assert signature() != before
+    before = signature()
+    label.write_text("0 0.4 0.4 0.1 0.1")
+    assert signature() != before
+    before = signature()
+    config.write_text(f"path: {dataset}\ntest: images/test\nnames: [other]\n")
+    assert signature() != before
+
+
+def test_fingerprint_tracks_manifest_members_and_ignores_unselected_split(tmp_path):
+    image = tmp_path / "a.jpg"
+    image.write_bytes(b"image")
+    manifest = tmp_path / "test.txt"
+    manifest.write_text(str(image) + "\n")
+    config = tmp_path / "data.yaml"
+    config.write_text("path: .\ntest: test.txt\nnames: [face]\n")
+    signature = lambda: run_reuse._dataset_signature(config, split="test")
+    before = signature()
+    (tmp_path / "unrelated.json").write_text('{"new": true}')
+    assert signature() == before
+    manifest.write_text("")
+    assert signature() != before
+
+
+def test_external_template_mask_invalidates_signature(tmp_path):
+    image = tmp_path / "images" / "test" / "a.jpg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"image")
+    mask = tmp_path / "external_masks" / "a.png"
+    mask.parent.mkdir()
+    mask.write_bytes(b"mask")
+    config = tmp_path / "data.yaml"
+    config.write_text(f'path: .\ntest:\n  images: images/test\n  masks: "{mask.parent}/{{image_path.stem}}.png"\nclasses: {{0: face}}\n')
+    signature = lambda: run_reuse._dataset_signature(config, split="test", annotation="masks")
+    before = signature()
+    mask.write_bytes(b"changed-mask")
+    assert signature() != before

@@ -591,19 +591,7 @@ def write_run_meta(
         data=getattr(args, "data", None), split=getattr(args, "split", None),
         threshold=getattr(args, "score_threshold", None), input_mode=input_mode,
         image=getattr(args, "image", None), image_dir=getattr(args, "image_dir", None),
-        options={
-            "save_visualization": bool(getattr(args, "save_visualization", False)),
-            "save_json": bool(getattr(args, "save_json", False)),
-            "save_txt": bool(getattr(args, "save_txt", False)),
-            "save_test_report": bool(getattr(args, "save_test_report", False)),
-            "compute_metrics": bool(getattr(args, "compute_metrics", False)),
-            "metric_classwise": bool(getattr(args, "metric_classwise", False)),
-            "vis_max_images": getattr(args, "vis_max_images", None),
-            "report_iou_threshold": getattr(args, "report_iou_threshold", None),
-            "sahi": bool(getattr(args, "sahi", False)),
-            "sahi_slice_size": getattr(args, "sahi_slice_size", None),
-            "sahi_overlap": getattr(args, "sahi_overlap", None),
-        },
+        options=_det_fingerprint_options(args),
     )
     temp_meta = meta_path.with_name(f".{meta_path.name}.{os.getpid()}.tmp")
     temp_meta.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1843,6 +1831,25 @@ def run_parallel_all_infer(args, splits: list[str]) -> bool:
     return True
 
 
+
+def _det_fingerprint_options(args) -> dict[str, Any]:
+    return {
+        "save_visualization": bool(getattr(args, "save_visualization", False)),
+        "save_json": bool(getattr(args, "save_json", False)),
+        "save_txt": bool(getattr(args, "save_txt", False)),
+        "save_test_report": bool(getattr(args, "save_test_report", False)),
+        "compute_metrics": bool(getattr(args, "compute_metrics", False)),
+        "metric_classwise": bool(getattr(args, "metric_classwise", False)),
+        "vis_max_images": getattr(args, "vis_max_images", None),
+        "report_iou_threshold": getattr(args, "report_iou_threshold", None),
+        "sahi": bool(getattr(args, "sahi", False)),
+        "sahi_overlap": getattr(args, "sahi_overlap", rt.INFER_DEFAULT_SAHI_OVERLAP),
+        "sahi_nms_iou": getattr(args, "sahi_nms_iou", rt.INFER_DEFAULT_SAHI_NMS_IOU),
+        "sahi_global_local_iou": getattr(args, "sahi_global_local_iou", rt.INFER_DEFAULT_SAHI_GLOBAL_LOCAL_IOU),
+        "sahi_skip_small": getattr(args, "sahi_skip_small", rt.INFER_DEFAULT_SAHI_SKIP_SMALL),
+    }
+
+
 def _det_reuse_precheck(args, output_dir: Path, checkpoint_path: Path) -> str:
     """构造 det 指纹并做复用前置检查，返回 run_reuse 的决策常量。"""
     data = getattr(args, "data", None)
@@ -1858,19 +1865,7 @@ def _det_reuse_precheck(args, output_dir: Path, checkpoint_path: Path) -> str:
         data=data, split=getattr(args, "split", None),
         threshold=getattr(args, "score_threshold", None), input_mode=input_mode,
         image=getattr(args, "image", None), image_dir=getattr(args, "image_dir", None),
-        options={
-            "save_visualization": bool(getattr(args, "save_visualization", False)),
-            "save_json": bool(getattr(args, "save_json", False)),
-            "save_txt": bool(getattr(args, "save_txt", False)),
-            "save_test_report": bool(getattr(args, "save_test_report", False)),
-            "compute_metrics": bool(getattr(args, "compute_metrics", False)),
-            "metric_classwise": bool(getattr(args, "metric_classwise", False)),
-            "vis_max_images": getattr(args, "vis_max_images", None),
-            "report_iou_threshold": getattr(args, "report_iou_threshold", None),
-            "sahi": bool(getattr(args, "sahi", False)),
-            "sahi_slice_size": getattr(args, "sahi_slice_size", None),
-            "sahi_overlap": getattr(args, "sahi_overlap", None),
-        },
+        options=_det_fingerprint_options(args),
     )
     required = ["run_meta.json"]
     if action == "infer" and getattr(args, "save_visualization", False):

@@ -95,8 +95,10 @@ def _path_signature(value: Any) -> dict[str, Any] | None:
     }
 
 
-def _dataset_signature(value: Any) -> dict[str, Any] | None:
-    """Return a metadata digest for a dataset config and its effective root.
+def _dataset_signature(
+    value: Any, *, split: Any = None, annotation: str = "labels"
+) -> dict[str, Any] | None:
+    """Fingerprint the config and selected samples, including external files.
 
     Inference reuse must become stale when an image, label, mask, or manifest is
     added, removed, or edited.  Hashing the full image payload would make every
@@ -111,6 +113,7 @@ def _dataset_signature(value: Any) -> dict[str, Any] | None:
         return _path_signature(value)
 
     root = config_path if config_path.is_dir() else config_path.parent
+    selected_paths: set[Path] | None = None
     if config_path.is_file() and config_path.suffix.casefold() in {".yaml", ".yml"}:
         try:
             import yaml
@@ -118,22 +121,55 @@ def _dataset_signature(value: Any) -> dict[str, Any] | None:
             config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
             if isinstance(config, dict):
                 root = rt.dataset_adapter.resolve_dataset_root(config_path, config)
+                requested = _norm_split(split) or ["train", "val", "test"]
+                splits = set()
+                for name in requested:
+                    splits.update(["train", "val", "test"] if name == "all" else name.split("+"))
+                selected_paths = {config_path}
+                for name in sorted(splits):
+                    if name not in config:
+                        continue
+                    samples = rt.dataset_adapter.resolve_split_samples(
+                        config_path, config, name, annotation=annotation
+                    )
+                    for image_path, label_path, _ in samples:
+                        selected_paths.update((image_path, label_path))
+                    split_config = config[name]
+                    mask_value = (
+                        split_config.get("masks")
+                        if isinstance(split_config, dict)
+                        else config.get(f"{name}_masks")
+                    )
+                    if annotation == "masks" and isinstance(mask_value, str) and "{image_path" in mask_value:
+                        for image_path, _, _ in samples:
+                            selected_paths.add(Path(mask_value.format(image_path=image_path)).expanduser())
+                    # Include split manifests, including empty ones and external paths.
+                    values = [config[name]]
+                    while values:
+                        value = values.pop()
+                        if isinstance(value, dict):
+                            values.extend(value.values())
+                        elif isinstance(value, list):
+                            values.extend(value)
+                        elif isinstance(value, str) and "{image_path" not in value:
+                            path = Path(value).expanduser()
+                            path = path if path.is_absolute() else root / path
+                            if path.is_file():
+                                selected_paths.add(path)
         except Exception:  # 配置读取失败时仍可对配置所在目录生成保守指纹
             root = config_path.parent
+            selected_paths = None
 
     digest = hashlib.sha256()
     file_count = 0
     total_size = 0
     latest_mtime_ns = 0
     try:
-        paths = sorted(
-            find_files(
-                [root],
-                label="索引数据集指纹",
-                patterns=["*"],
-            ),
-            key=lambda path: path.as_posix().casefold(),
-        )
+        if selected_paths is None:
+            selected_paths = set(find_files([root], label="索引数据集指纹", patterns=["*"]))
+            if config_path.is_file():
+                selected_paths.add(config_path)
+        paths = sorted({path.resolve() for path in selected_paths}, key=lambda path: path.as_posix())
     except OSError:
         return {"path": normalized, "root": str(root), "unreadable": True}
 
@@ -143,10 +179,11 @@ def _dataset_signature(value: Any) -> dict[str, Any] | None:
         total=len(paths),
         unit="file",
     ):
+        relative = path.as_posix()
         try:
             stat = path.stat()
-            relative = path.relative_to(root).as_posix()
-        except (OSError, ValueError):
+        except OSError:
+            digest.update(relative.encode("utf-8", errors="surrogatepass") + b"\0<missing>\n")
             continue
         file_count += 1
         total_size += int(stat.st_size)
@@ -202,7 +239,7 @@ def make_fingerprint(
         "seg_train_type": str(seg_train_type) if seg_train_type is not None else None,
         "source_signatures": {
             "checkpoint": _path_signature(checkpoint),
-            "data": _dataset_signature(data),
+            "data": _dataset_signature(data, split=split, annotation="masks" if seg_train_type == "semantic" else "labels"),
             "image": _path_signature(image),
             "image_dir": _dataset_signature(image_dir),
         },

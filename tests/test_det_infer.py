@@ -677,3 +677,17 @@ def test_export_bad_class_images_writes_named_visualizations_and_manifest(tmp_pa
 
     manifest_payload = json.loads((bad_images_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest_payload["summary"]["bad_class_count"] == 1
+
+
+def test_sahi_options_invalidate_reuse(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tool_lib import det_infer, run_reuse
+
+    captured = []
+    monkeypatch.setattr(run_reuse, "precheck", lambda args, output, fingerprint, **kwargs: captured.append(fingerprint))
+    args = SimpleNamespace(data=None, image=None, image_dir=None, tool_action="infer", sahi=True, sahi_nms_iou=0.3, sahi_global_local_iou=0.1, sahi_skip_small=True)
+    det_infer._det_reuse_precheck(args, tmp_path, tmp_path / "model.pt")
+    for field, value in [("sahi_nms_iou", 0.9), ("sahi_global_local_iou", 0.8), ("sahi_skip_small", False)]:
+        setattr(args, field, value)
+        det_infer._det_reuse_precheck(args, tmp_path, tmp_path / "model.pt")
+        assert run_reuse.fingerprint_diff(captured[-1], captured[-2]) == ["options"]
