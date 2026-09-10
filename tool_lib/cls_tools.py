@@ -74,11 +74,20 @@ def run_eval(args) -> None:
     if not image_paths:
         raise ValueError("测试目录中没有找到图片。")
 
+    test_root = Path(args.test_dir).expanduser().resolve()
+    true_labels = {}
+    for image_path in image_paths:
+        relative = image_path.absolute().relative_to(test_root)
+        name = relative.parts[0] if len(relative.parts) > 1 else ""
+        if name not in name_to_id:
+            raise ValueError(f"测试图片类别 {name!r} 缺少模型类别映射: {image_path}")
+        true_labels[image_path] = name
+
     rows: list[dict[str, object]] = []
     correct = 0
     for image_path in track(image_paths, label="cls/eval 评估", unit="img"):
-        true_label_name = image_path.parent.name
-        true_label_id = name_to_id.get(true_label_name, -1)
+        true_label_name = true_labels[image_path]
+        true_label_id = name_to_id[true_label_name]
         pred = model.predict(str(image_path), topk=args.topk, threshold=args.threshold)
         pred_labels = pred["labels"]
         pred_scores = pred["scores"]
