@@ -207,3 +207,12 @@ def test_report_cli_auto_selects_without_input(monkeypatch: pytest.MonkeyPatch) 
     args = parse_cli_args(["report"])
 
     assert args.experiment_dir == selected
+
+
+def test_validate_args_rejects_symlink_output(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    output = tmp_path / "output"
+    output.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match="符号链接"):
+        interactive.validate_args(argparse.Namespace(output_dir=output))

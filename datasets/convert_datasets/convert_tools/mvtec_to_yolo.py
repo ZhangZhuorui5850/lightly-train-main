@@ -648,7 +648,7 @@ def main(argv: list[str] | None = None) -> int:
         print_analysis(src, args.class_mode)
         default_out = default_output_dir(src, "mvtec-to-yolo")
         if args.out:
-            out = args.out.expanduser().resolve()
+            out = args.out.expanduser()
         elif args.yes:
             out = default_out
         else:

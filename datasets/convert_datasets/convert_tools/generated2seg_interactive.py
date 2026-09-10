@@ -132,12 +132,12 @@ def main(argv: list[str] | None = None) -> int:
         print_analysis(src, args.names_from)
         default_out = default_output(src).resolve()
         if args.out:
-            out = args.out.expanduser().resolve()
+            out = args.out.expanduser()
         elif args.yes:
             out = default_out
         else:
             raw_out = input(f"\nYOLO Seg 输出目录 [默认 {default_out}]: ").strip()
-            out = Path(raw_out).expanduser().resolve() if raw_out else default_out
+            out = Path(raw_out).expanduser() if raw_out else default_out
 
         if args.dry_run:
             print("\n[dry-run] image/fg → YOLO Seg")

@@ -21,3 +21,15 @@ def test_staged_output_rejects_concurrent_writer(tmp_path: Path) -> None:
                 pass
 
     assert (output / "sentinel").read_text(encoding="utf-8") == "first"
+
+
+def test_staged_output_rejects_symlink_before_resolution(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "keep.txt").write_text("keep")
+    output = tmp_path / "output"
+    output.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match="符号链接"):
+        with transaction.staged_output(output, clean=True):
+            pytest.fail("symlink output accepted")
+    assert (target / "keep.txt").read_text() == "keep"

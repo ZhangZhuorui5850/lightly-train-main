@@ -2066,7 +2066,7 @@ def main(argv: list[str] | None = None) -> int:
     source_config = common.read_yaml(source_config_path)
     source_root = dataset_root_from_config(source_config_path, source_config)
     output = (
-        args.out.expanduser().resolve()
+        args.out.expanduser()
         if args.out is not None
         else default_output_dir(source_root, "balanced-test")
     )

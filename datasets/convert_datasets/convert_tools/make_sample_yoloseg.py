@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, default=ROOT, help="输出目录")
     parser.add_argument("--force", action="store_true", help="安全替换已有输出")
     args = parser.parse_args(argv)
-    output = args.out.expanduser().resolve()
+    output = args.out.expanduser()
     with staged_output(output, clean=args.force) as stage:
         _generate(stage)
     print(f"Wrote sample YOLO-seg dataset to {output}")

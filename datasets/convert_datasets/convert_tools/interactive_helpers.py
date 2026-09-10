@@ -32,7 +32,7 @@ def prompt_path(prompt: str, default: Path) -> Path | None:
         return None
     if raw.lower() in {"q", "quit", "exit"}:
         return None
-    return Path(raw).expanduser().resolve() if raw else default.resolve()
+    return Path(raw).expanduser().absolute() if raw else default.absolute()
 
 
 def run_python_tool(script: Path, args: list[str]) -> int:

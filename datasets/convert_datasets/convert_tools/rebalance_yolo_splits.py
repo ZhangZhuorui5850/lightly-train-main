@@ -965,12 +965,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         forced_kind=forced_kind,
     )
     print_summary(plan)
+    if args.out is not None:
+        validate_output_location(args.out, [plan.dataset.root])
     if args.dry_run:
         print("DRY-RUN 完成。")
         return 0
 
     default_output = plan.dataset.root.parent / f"{plan.dataset.root.name}__balanced_splits"
-    output = args.out.expanduser().resolve() if args.out is not None else default_output
+    output = args.out.expanduser() if args.out is not None else default_output
     if interactive and args.out is None:
         chosen = prompt_path("输出目录", default_output)
         if chosen is None:

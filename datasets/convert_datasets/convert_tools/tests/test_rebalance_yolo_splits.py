@@ -252,3 +252,24 @@ def test_rgb_semantic_mask_labels_are_supported(tmp_path: Path) -> None:
     assert plan.format_kind == "semantic_mask"
     assert all(plan.class_image_counts[1][split] == 1 for split in rebalance.SPLITS)
     assert sum(plan.class_amount_counts[1].values()) == 3
+
+
+def test_cli_rejects_symlink_output_and_dry_run_is_read_only(tmp_path):
+    import pytest
+
+    source = _make_dataset(tmp_path / "source", [("train", "a", (0,)), ("val", "b", (0,)), ("test", "c", (0,))])
+    target = tmp_path / "target"
+    target.mkdir()
+    marker = target / "keep.txt"
+    marker.write_text("keep")
+    output = tmp_path / "output"
+    output.symlink_to(target, target_is_directory=True)
+    args = ["--src", str(source), "--out", str(output), "--clean", "--yes"]
+    with pytest.raises(ValueError, match="符号链接"):
+        rebalance.main([*args, "--dry-run"])
+    with pytest.raises(ValueError, match="符号链接"):
+        rebalance.main(args)
+    assert marker.read_text() == "keep"
+    safe_output = tmp_path / "safe_output"
+    assert rebalance.main(["--src", str(source), "--out", str(safe_output), "--dry-run"]) == 0
+    assert not safe_output.exists()

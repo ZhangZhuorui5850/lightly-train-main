@@ -2923,6 +2923,10 @@ def _validate_ratio_text(value: object, *, field: str, allow_empty: bool = False
 
 def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     """Validate normalized CLI and interactive arguments with one shared contract."""
+    for field in ("output_dir", "out_dir"):
+        value = getattr(args, field, None)
+        if value is not None and Path(value).expanduser().is_symlink():
+            raise ValueError(f"输出路径不能是符号链接: {value}")
     unit_interval_fields = {
         "threshold",
         "score_threshold",

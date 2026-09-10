@@ -546,13 +546,13 @@ def main() -> int:
         if picked is None:
             return 1
         if args.output is not None:
-            picked["out_root"] = args.output.expanduser().resolve()
+            picked["out_root"] = args.output.expanduser()
         return run_mirror(dry_run=args.dry_run, clean=args.clean, **picked)
 
     # 非交互：两个路径都给了，直接跑。
     det_root, det_cfg = _resolve_root_and_yaml(args.det_subset)
     seg_root, seg_cfg = _resolve_root_and_yaml(args.seg_source)
-    out_root = (args.output.expanduser().resolve() if args.output
+    out_root = (args.output.expanduser() if args.output
                 else _default_out_root(
                     args.det_subset.stem if args.det_subset.suffix == ".yaml"
                     else args.det_subset.name, seg_root))

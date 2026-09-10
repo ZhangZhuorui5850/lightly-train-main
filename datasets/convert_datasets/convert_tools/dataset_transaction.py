@@ -102,9 +102,7 @@ def validate_output_location(output: Path, source_roots: list[Path]) -> Path:
 
 def create_output_stage(output: Path, *, clean: bool) -> Path:
     """Create a sibling stage without changing the currently published tree."""
-    output = output.expanduser().resolve()
-    if output.is_symlink():
-        raise ValueError(f"输出路径不能是符号链接: {output}")
+    output = validate_output_location(output, [])
     if output.exists() and any(output.iterdir()) and not clean:
         raise FileExistsError(f"输出目录已有内容: {output}；使用 --clean 重新生成")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -116,7 +114,7 @@ def create_output_stage(output: Path, *, clean: bool) -> Path:
 def publish_output_stage(stage: Path, output: Path, *, clean: bool) -> None:
     """Atomically publish a completed stage and restore the old tree on failure."""
     stage = stage.expanduser().resolve()
-    output = output.expanduser().resolve()
+    output = validate_output_location(output, [])
     if not stage.is_dir():
         raise FileNotFoundError(f"staging 目录不存在: {stage}")
     if output.exists() and any(output.iterdir()) and not clean:
@@ -178,6 +176,9 @@ def _staged_output_unlocked(output: Path, *, clean: bool = False) -> Iterator[Pa
     committed = False
     try:
         yield stage
+        validate_output_location(output, [])
+        if output.exists() and any(output.iterdir()) and not clean:
+            raise FileExistsError(f"输出目录已有内容: {output}；使用 --clean 重新生成")
         if output.exists():
             backup = Path(
                 tempfile.mkdtemp(prefix=f".{output.name}.backup-", dir=str(output.parent))
@@ -206,7 +207,7 @@ def _staged_output_unlocked(output: Path, *, clean: bool = False) -> Iterator[Pa
 @contextmanager
 def staged_output(output: Path, *, clean: bool = False) -> Iterator[Path]:
     """Yield a staging directory and atomically publish it under a writer lock."""
-    output = output.expanduser().resolve()
+    output = validate_output_location(output, [])
     with _output_lock(output):
         with _staged_output_unlocked(output, clean=clean) as stage:
             yield stage
