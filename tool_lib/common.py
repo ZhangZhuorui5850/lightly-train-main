@@ -1222,7 +1222,17 @@ def remap_labels(labels: Any, mapping: dict[int, int]) -> Any:
         raise ModuleNotFoundError("torch is not imported. Call import_runtime_dependencies() first.")
     if labels.numel() == 0:
         return torch.zeros((0,), dtype=torch.int64)
-    return torch.as_tensor([mapping[int(label)] for label in labels.tolist()], dtype=torch.int64)
+    label_ids = [int(label) for label in labels.tolist()]
+    missing = sorted(set(label_ids) - set(mapping))
+    if missing:
+        known = sorted(mapping)
+        raise ValueError(
+            f"标签 id {missing} 不在类别映射中（当前 data.yaml 的类别 id 为 {known}）。"
+            "通常是评测数据集与 checkpoint 训练时的类别集合不一致："
+            "请确认 --data 指向的数据集与该模型训练时使用的数据集相同，"
+            "并检查标签 txt 中是否存在超出 nc 范围的类别 id。"
+        )
+    return torch.as_tensor([mapping[label] for label in label_ids], dtype=torch.int64)
 
 
 def visualization_suffix(image_path: Path) -> str:
