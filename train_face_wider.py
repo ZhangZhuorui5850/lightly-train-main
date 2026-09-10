@@ -20,7 +20,7 @@ from tool_lib.training_run import inspect_run_mode, prepare_run  # noqa: E402
 
 # ======================== 常用设置：直接改这里 ========================
 
-DATASETS_ROOT = PROJECT_ROOT / "datasets"
+DATASETS_ROOT = PROJECT_ROOT / "datasets" / "face_detect"
 OUTPUT_ROOT = PROJECT_ROOT / "out" / "face_wider"
 
 VARIANT = "tile"         # original / copy-paste / tile / combined

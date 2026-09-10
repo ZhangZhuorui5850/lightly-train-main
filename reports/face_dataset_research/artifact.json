@@ -150,7 +150,7 @@
         "id": "target_layout",
         "type": "markdown",
         "layout": "full",
-        "body": "## 转换结果\n\n目标根目录为 datasets/face_yolo，images 和 labels 都包含 train、val、test，另外生成 data.yaml、audit.json 和 split_manifest.csv。\n\n类别固定为 0: face；图片通过硬链接写入目标目录；输出文件名前加 wider_train、wider_val 或 dark 前缀；矩形统一取 min/max 并裁剪到图像边界；框归一化为 class、中心点和宽高；零宽高框已过滤；转换后零有效框的图片已排除。\n\nconvert.py oneclick 使用固定种子 42 对 22,094 张全局洗牌。实际分配为 train 17,675、val 2,209、test 2,210，比例为 79.999%/9.998%/10.003%。train 的 DarkFace/WIDER train/WIDER val 来源数为 4,792/10,318/2,565；val 为 613/1,271/325；test 为 595/1,283/332。",
+        "body": "## 转换结果\n\n目标根目录为 datasets/face_detect/face_yolo，images 和 labels 都包含 train、val、test，另外生成 data.yaml、audit.json 和 split_manifest.csv。\n\n类别固定为 0: face；图片通过硬链接写入目标目录；输出文件名前加 wider_train、wider_val 或 dark 前缀；矩形统一取 min/max 并裁剪到图像边界；框归一化为 class、中心点和宽高；零宽高框已过滤；转换后零有效框的图片已排除。\n\nconvert.py oneclick 使用固定种子 42 对 22,094 张全局洗牌。实际分配为 train 17,675、val 2,209、test 2,210，比例为 79.999%/9.998%/10.003%。train 的 DarkFace/WIDER train/WIDER val 来源数为 4,792/10,318/2,565；val 为 613/1,271/325；test 为 595/1,283/332。",
         "sourceId": "face_local"
       },
       {

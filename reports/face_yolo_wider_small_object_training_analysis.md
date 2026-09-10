@@ -1,6 +1,6 @@
 # face_yolo_wider 小目标检测与训练优化分析
 
-> 数据集：`datasets/face_yolo_wider`  
+> 数据集：`datasets/face_detect/face_yolo_wider`
 > 任务：单类别人脸检测  
 > 当前模型：DINOv3 ViT-S/16 系列 backbone + LTDETR  
 > 本机环境：RTX 4060 Laptop，8GB 显存  
@@ -18,9 +18,9 @@
 
 ### 1.1 数据来源
 
-- 数据配置：[data.yaml](../datasets/face_yolo_wider/data.yaml)
-- 图片目录：`datasets/face_yolo_wider/images/{train,val,test}`
-- 标签目录：`datasets/face_yolo_wider/labels/{train,val,test}`
+- 数据配置：[data.yaml](../datasets/face_detect/face_yolo_wider/data.yaml)
+- 图片目录：`datasets/face_detect/face_yolo_wider/images/{train,val,test}`
+- 标签目录：`datasets/face_detect/face_yolo_wider/labels/{train,val,test}`
 - LTDETR 训练增强：[transforms.py](../src/lightly_train/_task_models/dinov3_ltdetr_object_detection/transforms.py)
 - LTDETR 查询数量：[task_model.py](../src/lightly_train/_task_models/dinov3_ltdetr_object_detection/task_model.py)
 - LightlyTrain 梯度累积：[train_task.py](../src/lightly_train/_commands/train_task.py)
@@ -421,16 +421,16 @@ Recall_>=32px
 服务器代码更新受限时，优先采用离线派生数据集：
 
 ```text
-datasets/face_yolo_wider
+datasets/face_detect/face_yolo_wider
     原始数据集
 
-datasets/face_yolo_wider_copypaste_v1
+datasets/face_detect/face_yolo_wider_copypaste_v1
     原始train + Copy-Paste增强副本
     原始val/test
     独立data.yaml
     augmentation_manifest.jsonl
 
-datasets/face_yolo_wider_tiles_v1
+datasets/face_detect/face_yolo_wider_tiles_v1
     原始train + 训练tiles
     原始val/test
     独立data.yaml

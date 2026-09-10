@@ -63,7 +63,7 @@
       {
         "id": "dataset_config",
         "label": "face_yolo_wider 数据配置",
-        "path": "datasets/face_yolo_wider/data.yaml"
+        "path": "datasets/face_detect/face_yolo_wider/data.yaml"
       },
       {
         "id": "local_benchmark",
@@ -180,7 +180,7 @@
         "metric_definitions": ["有效 epoch = steps × 16 ÷ 12,883", "时间区间以本机 4.29 秒/step 为下界并为 ViT-S/16 Plus、密集目标和验证预留余量"]
       }
     },
-    {"id": "dataset_config", "label": "face_yolo_wider 数据配置", "path": "datasets/face_yolo_wider/data.yaml"},
+    {"id": "dataset_config", "label": "face_yolo_wider 数据配置", "path": "datasets/face_detect/face_yolo_wider/data.yaml"},
     {"id": "local_benchmark", "label": "RTX 4060 DINOv3 ViT-S/16 训练日志", "path": "out/0428/0428-neu-vits16/train.log"},
     {"id": "training_runtime", "label": "LightlyTrain 训练与梯度累积实现", "path": "src/lightly_train/_commands/train_task.py"}
   ]
