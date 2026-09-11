@@ -1,0 +1,339 @@
+{
+  "original_train": {
+    "images": 12883,
+    "boxes": 156219,
+    "short_quantiles": [
+      3.7497599999999998,
+      9.37472,
+      36.25024
+    ],
+    "short_bins": [
+      63246,
+      45741,
+      28226,
+      19006
+    ],
+    "images_over100": 235,
+    "images_over300": 50,
+    "excess100": 33339,
+    "invalid": 0
+  },
+  "original_val": {
+    "images": 1596,
+    "boxes": 16995,
+    "short_quantiles": [
+      4.37504,
+      10.62528,
+      39.91129600000001
+    ],
+    "short_bins": [
+      5908,
+      5448,
+      3344,
+      2295
+    ],
+    "images_over100": 22,
+    "images_over300": 4,
+    "excess100": 2219,
+    "invalid": 0
+  },
+  "original_test": {
+    "images": 1615,
+    "boxes": 22866,
+    "short_quantiles": [
+      4.37504,
+      9.37472,
+      32.49984
+    ],
+    "short_bins": [
+      9335,
+      7144,
+      4088,
+      2299
+    ],
+    "images_over100": 38,
+    "images_over300": 9,
+    "excess100": 5290,
+    "invalid": 0
+  },
+  "combined_train": {
+    "images": 20791,
+    "boxes": 298564,
+    "short_quantiles": [
+      4.999680000000001,
+      14.0519232,
+      40.0
+    ],
+    "short_bins": [
+      73468,
+      95079,
+      83759,
+      46258
+    ],
+    "images_over100": 235,
+    "images_over300": 50,
+    "excess100": 33339,
+    "invalid": 0
+  },
+  "combined_val": {
+    "images": 1596,
+    "boxes": 16995,
+    "short_quantiles": [
+      4.37504,
+      10.62528,
+      39.91129600000001
+    ],
+    "short_bins": [
+      5908,
+      5448,
+      3344,
+      2295
+    ],
+    "images_over100": 22,
+    "images_over300": 4,
+    "excess100": 2219,
+    "invalid": 0
+  },
+  "combined_test": {
+    "images": 1615,
+    "boxes": 22866,
+    "short_quantiles": [
+      4.37504,
+      9.37472,
+      32.49984
+    ],
+    "short_bins": [
+      9335,
+      7144,
+      4088,
+      2299
+    ],
+    "images_over100": 38,
+    "images_over300": 9,
+    "excess100": 5290,
+    "invalid": 0
+  },
+  "tile_": {
+    "images": 6442,
+    "boxes": 135455,
+    "short_quantiles": [
+      8.6154624,
+      17.69152,
+      39.126995199999996
+    ],
+    "short_bins": [
+      10222,
+      48580,
+      53360,
+      23293
+    ],
+    "images_over100": 0,
+    "images_over300": 0,
+    "excess100": 0,
+    "invalid": 0
+  },
+  "cp_": {
+    "images": 1466,
+    "boxes": 6890,
+    "short_quantiles": [
+      15.67186048,
+      38.75008,
+      83.12512
+    ],
+    "short_bins": [
+      0,
+      758,
+      2173,
+      3959
+    ],
+    "images_over100": 0,
+    "images_over300": 0,
+    "excess100": 0,
+    "invalid": 0
+  },
+  "val_identity": {
+    "labels": {
+      "same_names": true,
+      "different_bytes": 0
+    },
+    "images": {
+      "same_names": true,
+      "different_bytes": 0
+    }
+  },
+  "test_identity": {
+    "labels": {
+      "same_names": true,
+      "different_bytes": 0
+    },
+    "images": {
+      "same_names": true,
+      "different_bytes": 0
+    }
+  },
+  "tile_boundary": {
+    "affected_tiles": 2405,
+    "dropped_visible_boxes": 3915,
+    "dropped_fraction25_short8": 1241,
+    "kept_partial_boxes": 3785,
+    "source_images": 3454,
+    "source_reuse": {
+      "3": 1087,
+      "1": 1553,
+      "2": 814
+    },
+    "examples": [
+      {
+        "tile": "tile_005053_wider_train_50_Celebration_Or_Party_houseparty_50_308.jpg",
+        "source": "wider_train_50_Celebration_Or_Party_houseparty_50_308.jpg",
+        "crop": [
+          179,
+          181,
+          701,
+          703
+        ],
+        "dropped_box": [
+          247.00006400000004,
+          527.999488,
+          755.00032,
+          1023.999488
+        ],
+        "visible_fraction": 0.3153185373145821,
+        "visible_short640": 214.56001471264364
+      },
+      {
+        "tile": "tile_006379_wider_train_19_Couple_Couple_19_693.jpg",
+        "source": "wider_train_19_Couple_Couple_19_693.jpg",
+        "crop": [
+          259,
+          0,
+          806,
+          547
+        ],
+        "dropped_box": [
+          262.000128,
+          409.999744,
+          480.00051199999996,
+          712.000128
+        ],
+        "visible_fraction": 0.45364265497092876,
+        "visible_short640": 160.29280409506399
+      },
+      {
+        "tile": "tile_003878_wider_train_2_Demonstration_Demonstration_Or_Protest_2_151.jpg",
+        "source": "wider_train_2_Demonstration_Demonstration_Or_Protest_2_151.jpg",
+        "crop": [
+          200,
+          83,
+          798,
+          681
+        ],
+        "dropped_box": [
+          684.0002559999999,
+          0.0003724999999900336,
+          862.000128,
+          218.0000375
+        ],
+        "visible_fraction": 0.39660871125967234,
+        "visible_short640": 122.00641498327768
+      },
+      {
+        "tile": "tile_005642_wider_train_19_Couple_Couple_19_483.jpg",
+        "source": "wider_train_19_Couple_Couple_19_483.jpg",
+        "crop": [
+          0,
+          0,
+          682,
+          682
+        ],
+        "dropped_box": [
+          558.0001279999999,
+          298.99915500000003,
+          938.999808,
+          787.999485
+        ],
+        "visible_fraction": 0.25491019539800697,
+        "visible_short640": 116.3635162463344
+      },
+      {
+        "tile": "tile_006098_wider_train_2_Demonstration_Protesters_2_877.jpg",
+        "source": "wider_train_2_Demonstration_Protesters_2_877.jpg",
+        "crop": [
+          448,
+          0,
+          1024,
+          576
+        ],
+        "dropped_box": [
+          340.99968,
+          140.99990400000002,
+          545.99936,
+          416.00016
+        ],
+        "visible_fraction": 0.4780464047553636,
+        "visible_short640": 108.8881777777778
+      },
+      {
+        "tile": "tile_001712_wider_train_35_Basketball_Basketball_35_194.jpg",
+        "source": "wider_train_35_Basketball_Basketball_35_194.jpg",
+        "crop": [
+          0,
+          0,
+          522,
+          522
+        ],
+        "dropped_box": [
+          441.000448,
+          68.999904,
+          632.0,
+          293.999904
+        ],
+        "visible_fraction": 0.424082418790176,
+        "visible_short640": 99.30979555555555
+      },
+      {
+        "tile": "tile_002762_wider_val_2_Demonstration_Demonstration_Or_Protest_2_665.jpg",
+        "source": "wider_val_2_Demonstration_Demonstration_Or_Protest_2_665.jpg",
+        "crop": [
+          0,
+          94,
+          531,
+          625
+        ],
+        "dropped_box": [
+          381.999616,
+          553.999705,
+          500.99967999999996,
+          721.0003149999999
+        ],
+        "visible_fraction": 0.4251499141230687,
+        "visible_short640": 85.57474350282492
+      },
+      {
+        "tile": "tile_000887_wider_train_28_Sports_Fan_Sports_Fan_28_113.jpg",
+        "source": "wider_train_28_Sports_Fan_Sports_Fan_28_113.jpg",
+        "crop": [
+          123,
+          152,
+          688,
+          717
+        ],
+        "dropped_box": [
+          555.999744,
+          643.000105,
+          703.0000640000001,
+          786.999727
+        ],
+        "visible_fraction": 0.46145169413074955,
+        "visible_short640": 83.82288991150446
+      }
+    ]
+  },
+  "manifest_nontrain_sources": 0,
+  "cp_pasted_boxes": 2931,
+  "split_name_overlap": {
+    "train_val": 0,
+    "train_test": 0,
+    "val_test": 0
+  }
+}

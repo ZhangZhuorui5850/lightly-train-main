@@ -23,18 +23,18 @@ from tool_lib.training_run import inspect_run_mode, prepare_run  # noqa: E402
 DATASETS_ROOT = PROJECT_ROOT / "datasets" / "face_detect"
 OUTPUT_ROOT = PROJECT_ROOT / "out" / "face_wider"
 
-VARIANT = "tile"         # original / copy-paste / tile / combined
+VARIANT = "combined"         # original / copy-paste / tile / combined
 OUT: Path | None = None   # None = out/face_wider/<variant>_<image_size>
-STEPS = 20_000
+STEPS = 80000
 IMAGE_SIZE = 640          # 640 / 800
-BATCH_SIZE = 0            # 全局batch；0=按可见GPU数量和总显存自动选择
+BATCH_SIZE = 32           # 全局batch；0=按可见GPU数量和总显存自动选择
 FRESH = False             # True=归档同名旧实验并重新训练
 
-MODEL = "dinov3/vits16plus-ltdetr"
+MODEL = "dinov3/vits16-ltdetr"
 BACKBONE_WEIGHTS = (
     PROJECT_ROOT
     / "weights"
-    / "dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth"
+    / "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
 )
 BACKBONE_FREEZE = True
 LEARNING_RATE = 5e-5

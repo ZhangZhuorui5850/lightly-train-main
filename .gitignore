@@ -300,3 +300,6 @@ $RECYCLE.BIN/
 backup_resume_fix/
 _git_state.sh
 _do_versioning.sh
+
+# 报告渲染的临时验证截图
+reports/**/*.verification-failure.png

@@ -1,0 +1,13 @@
+{
+  "reconstruction_mismatch": 0,
+  "tiles": 6442,
+  "tile_side_quantiles": [
+    221.0,
+    520.0,
+    594.0,
+    695.0,
+    768.0
+  ],
+  "tiles_from_sources_over100": 471,
+  "tiles_from_sources_over300": 37
+}
