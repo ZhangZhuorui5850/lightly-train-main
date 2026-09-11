@@ -474,6 +474,22 @@ def test_det_eval_parser_defaults_to_limited_visualizations() -> None:
     assert args.save_json is False
 
 
+def test_det_eval_parser_allows_save_json_opt_in(monkeypatch) -> None:
+    opted_in = parse_cli_args(
+        ["eval", "--task", "det", "--data", "data.yaml", "--save-json"]
+    )
+    opted_out = parse_cli_args(
+        ["eval", "--task", "det", "--data", "data.yaml", "--save-json", "--skip-json"]
+    )
+    assert opted_in.save_json is True
+    assert opted_out.save_json is False
+
+    monkeypatch.setattr(rt, "DET_EVAL_SAVE_JSON", True)
+    assert parse_cli_args(["eval", "--task", "det", "--data", "data.yaml"]).save_json is True
+    # infer 的默认行为不受这项配置影响。
+    assert parse_cli_args(["infer", "--task", "det", "--data", "data.yaml"]).save_json is True
+
+
 def test_det_eval_parser_normalizes_val_test() -> None:
     args = parse_cli_args(
         ["eval", "--task", "det", "--data", "data.yaml", "--split", "val", "test"]
@@ -518,6 +534,22 @@ def test_run_eval_applies_metric_only_profile(monkeypatch) -> None:
     assert captured["metric_classwise"] is True
 
 
+def test_run_eval_forwards_save_json_opt_in(monkeypatch) -> None:
+    captured = {}
+    monkeypatch.setattr(det_infer, "run_infer", lambda args: captured.update(vars(args)))
+
+    det_infer.run_eval(
+        SimpleNamespace(
+            data=Path("data.yaml"), save_json=True, vis_max_images=None,
+            save_visualization=True,
+        )
+    )
+
+    assert captured["save_json"] is True
+    assert captured["save_txt"] is False
+    assert captured["compute_metrics"] is True
+
+
 def test_eval_parallel_child_command_reenters_det_eval(tmp_path: Path) -> None:
     args = SimpleNamespace(
         tool_action="eval",
@@ -557,7 +589,19 @@ def test_eval_parallel_child_command_reenters_det_eval(tmp_path: Path) -> None:
 
     assert command[2:5] == ["eval", "--task", "det"]
     assert "--vis-max-images" in command
-    assert "--save-json" not in command
+    assert "--skip-json" in command
+
+    # 显式打开时，多卡子进程必须能重新进入带 JSON 输出的 eval。
+    opted_in = build_parallel_child_command(
+        args=SimpleNamespace(**{**vars(args), "save_json": True}),
+        split="test",
+        device="auto",
+        output_dir=tmp_path / "shard",
+        report_path=tmp_path / "shard" / "test_report.json",
+        shard_index=0,
+        num_shards=2,
+    )
+    assert "--save-json" in opted_in
 
 
 def test_report_name_tracks_requested_split(tmp_path: Path) -> None:

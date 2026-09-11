@@ -54,6 +54,14 @@ DET_SETTINGS = {
     # 0 表示关闭数量限制。
     "det_eval_vis_max_images": 50,
 
+    # det_eval_save_json:
+    #   eval 是否保存每图预测 JSON（落在 <eval 输出目录>/_tempfile/json）。
+    #   默认 False：eval 只出指标与限额对比图。要拿预测明细做后处理
+    #   （例如按尺寸档统计召回）时置 True，或命令行加 --save-json。
+    #   注意 JSON 里的预测会被 det_score_threshold 过滤，做指标分析时应同时
+    #   把 det_score_threshold 或 --score-threshold 设为 0。
+    "det_eval_save_json": False,
+
     # 可选覆盖项
     # 如果你不填，系统会自动推导：
     # det_data_yaml          -> <det_dataset_dir>/data.yaml

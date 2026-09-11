@@ -907,6 +907,9 @@ def build_parallel_child_command(
     command.append("--save-visualization" if args.save_visualization else "--skip-visualization")
     if det_action(args) == "eval":
         command.extend(["--vis-max-images", str(getattr(args, "vis_max_images", rt.DET_EVAL_VIS_MAX_IMAGES))])
+        command.append(
+            "--save-json" if getattr(args, "save_json", rt.DET_EVAL_SAVE_JSON) else "--skip-json"
+        )
         if args.metric_classwise:
             command.append("--classwise")
     else:
@@ -2245,7 +2248,10 @@ def run_eval(args) -> None:
     args.command = "eval"
     args.image = None
     args.image_dir = None
-    args.save_json = False
+    # eval 默认只出指标与限额对比图；需要预测明细做后处理时显式打开 --save-json。
+    args.save_json = bool(
+        getattr(args, "save_json", rt.DET_EVAL_SAVE_JSON)
+    )
     args.save_txt = False
     args.compute_metrics = True
     args.save_test_report = True

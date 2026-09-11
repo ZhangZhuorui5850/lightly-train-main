@@ -193,10 +193,14 @@ python launcher.py eval --task det --data datasets/mydata/data.yaml --split test
 | `--classwise` | `False` | 输出按类 mAP 指标 |
 | `--vis-max-images` | `50` | 每个 split 的对比图上限；0 = 全量 |
 | `--save-visualization` / `--skip-visualization` | 保存 | 控制抽样对比图 |
+| `--save-json` / `--skip-json` | `False` | 是否保存每图预测 JSON（`<输出目录>/_tempfile/json`），供分档指标等后处理 |
 | `--device` | `auto` | 评估设备 |
 | `--overwrite` | `False` | 输出目录非空时是否覆盖 |
 
 评估目录包含 `metrics_summary.json`、`*_report.json`、`run_meta.json`、报告 Markdown 和限额后的 `compare/`。
+默认不保存预测明细；需要时加 `--save-json`（或把 `DET_SETTINGS` 的 `det_eval_save_json` 置 `True`）。
+注意 JSON 里的预测会被 `--score-threshold` 过滤，做指标后处理时应同时传 `--score-threshold 0`，
+否则低置信度的（尤其是小脸）预测会在写入前被砍掉。
 
 ---
 

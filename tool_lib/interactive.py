@@ -955,6 +955,11 @@ def build_det_cli_preview(args: argparse.Namespace) -> str:
                 parts.append("--classwise")
             if not getattr(args, "save_visualization", True):
                 parts.append("--skip-visualization")
+            # eval 的 save_json 命令行默认是 False，只有打开时才需要在预览里体现。
+            if getattr(args, "save_json", False):
+                parts.append("--save-json")
+        if getattr(args, "sahi", False):
+            parts.append("--sahi")
     elif args.command == "export":
         if args.report_json is not None:
             parts.extend(["--report-json", str(args.report_json)])
@@ -2685,7 +2690,10 @@ def build_interactive_args() -> argparse.Namespace | None:
                 prompt_int("每个 split 最多输出多少张对比图 --vis-max-images", rt.DET_EVAL_VIS_MAX_IMAGES)
                 if use_custom else rt.DET_EVAL_VIS_MAX_IMAGES
             ),
-            save_json=False,
+            save_json=(
+                prompt_yes_no("是否保存每图预测 JSON --save-json", rt.DET_EVAL_SAVE_JSON)
+                if use_custom else rt.DET_EVAL_SAVE_JSON
+            ),
             save_txt=False,
             compute_metrics=True,
             save_test_report=True,
@@ -3186,6 +3194,9 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="评估对比图每个 split 最多出多少张；0=不限制。",
     )
+    eval_parser.add_argument("--save-json", dest="save_json", action="store_true")
+    eval_parser.add_argument("--skip-json", dest="save_json", action="store_false")
+    eval_parser.set_defaults(save_json=rt.DET_EVAL_SAVE_JSON)
     eval_parser.add_argument("--sahi", action="store_true", default=rt.INFER_DEFAULT_SAHI)
     eval_parser.add_argument("--sahi-overlap", dest="sahi_overlap", type=float, default=rt.INFER_DEFAULT_SAHI_OVERLAP)
     eval_parser.add_argument("--sahi-nms-iou", dest="sahi_nms_iou", type=float, default=rt.INFER_DEFAULT_SAHI_NMS_IOU)
@@ -3590,7 +3601,8 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
             args.metric_classwise = bool(args.classwise)
             args.compute_metrics = True
             args.save_test_report = True
-            args.save_json = False
+            # eval 默认只出指标；需要预测明细做后处理时由 --save-json 打开。
+            args.save_json = bool(getattr(args, "save_json", rt.DET_EVAL_SAVE_JSON))
             args.save_txt = False
             args.vis_max_images = (
                 rt.DET_EVAL_VIS_MAX_IMAGES

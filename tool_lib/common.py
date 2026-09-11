@@ -87,6 +87,9 @@ DEFAULT_SEG_THRESHOLD = 0.8
 DEFAULT_SCORE_THRESHOLD = 0.3
 # det eval 每个 split 默认抽样输出的对比图数量；0 表示关闭数量限制。
 DET_EVAL_VIS_MAX_IMAGES = 50
+# det eval 是否默认保存每图预测 JSON（供分档指标、混淆分析等后处理使用）。
+# 默认关闭：eval 的定位是只出指标与限额对比图，需要预测明细时再显式打开。
+DET_EVAL_SAVE_JSON = False
 # seg eval 对比图默认最多出多少张（好/差各半，类别尽量全）；0 表示不限制、出全部。
 SEG_EVAL_VIS_MAX_IMAGES = 100
 
@@ -523,6 +526,7 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     global SEG_EVAL_VIS_MAX_IMAGES
     global DEFAULT_SCORE_THRESHOLD
     global DET_EVAL_VIS_MAX_IMAGES
+    global DET_EVAL_SAVE_JSON
     global INFER_DEFAULT_SCORE_THRESHOLD
     global INFER_DEFAULT_REPORT_IOU_THRESHOLD
     global INFER_DEFAULT_SAHI
@@ -577,6 +581,9 @@ def apply_user_settings(settings: dict[str, Any]) -> None:
     DEFAULT_SCORE_THRESHOLD = float(settings.get("det_score_threshold", DEFAULT_SCORE_THRESHOLD))
     DET_EVAL_VIS_MAX_IMAGES = int(
         settings.get("det_eval_vis_max_images", DET_EVAL_VIS_MAX_IMAGES)
+    )
+    DET_EVAL_SAVE_JSON = bool(
+        settings.get("det_eval_save_json", DET_EVAL_SAVE_JSON)
     )
     det_experiment_value = settings.get("det_experiment_dir")
     if det_experiment_value in {None, "", "auto"}:
