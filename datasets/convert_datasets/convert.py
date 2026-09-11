@@ -234,6 +234,7 @@ COMMANDS: dict[str, Tool] = {
         "更多",
         "--help 看参数；需 LabelMe 目录",
         interactive=False, primary=False,
+        read_only=True,
     ),
 }
 
@@ -273,10 +274,10 @@ def validate_registry(commands: list[str] | tuple[str, ...] | None = None) -> li
         script = TOOLS_DIR / tool.script
         if not script.is_file():
             errors.append(f"{command}: 脚本不存在 {script}")
-        elif tool.primary and not tool.read_only:
+        elif not tool.read_only:
             source = script.read_text(encoding="utf-8", errors="ignore")
             if "--dry-run" not in source:
-                errors.append(f"{command}: 常用写入工具缺少统一 --dry-run")
+                errors.append(f"{command}: 写入工具缺少统一 --dry-run")
         previous = scripts.get(tool.script)
         if previous is not None:
             errors.append(f"{command}: 与 {previous} 重复登记脚本 {tool.script}")
@@ -285,11 +286,9 @@ def validate_registry(commands: list[str] | tuple[str, ...] | None = None) -> li
 
 
 def validate_cli_contracts() -> list[str]:
-    """Check that primary writers actually expose the advertised CLI option."""
+    """Check every registered CLI and the dry-run contract for writers."""
     errors = []
     for command, tool in COMMANDS.items():
-        if not tool.primary or tool.read_only:
-            continue
         try:
             result = subprocess.run(
                 [sys.executable, str(TOOLS_DIR / tool.script), "--help"],
@@ -300,7 +299,7 @@ def validate_cli_contracts() -> list[str]:
             continue
         if result.returncode != 0:
             errors.append(f"{command}: --help 执行失败 (exit={result.returncode}): {result.stderr.strip()}")
-        elif "--dry-run" not in result.stdout:
+        elif not tool.read_only and "--dry-run" not in result.stdout:
             errors.append(f"{command}: CLI 帮助缺少 --dry-run")
     return errors
 
@@ -430,7 +429,10 @@ def interactive() -> int:
             _run(tool, ["-h"])
             print()
             continue
-        return _run(tool, args)
+        result = _run(tool, args)
+        if result in (0, 130) or result >= 128:
+            return result
+        print("\n工具执行失败，返回菜单修正参数。\n")
 
 
 def _print_registry_errors(errors: list[str]) -> None:

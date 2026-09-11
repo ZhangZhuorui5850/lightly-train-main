@@ -27,9 +27,9 @@ import numpy as np
 from PIL import Image
 
 try:
-    from .dataset_transaction import staged_output
+    from .dataset_transaction import staged_output, validate_output_location
 except ImportError:
-    from dataset_transaction import staged_output  # type: ignore[no-redef]
+    from dataset_transaction import staged_output, validate_output_location  # type: ignore[no-redef]
 
 ROOT = Path(__file__).resolve().parent.parent / "sample_yoloseg"
 W = H = 256
@@ -124,8 +124,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="生成可复现的 YOLO-seg 示例数据")
     parser.add_argument("--out", type=Path, default=ROOT, help="输出目录")
     parser.add_argument("--force", action="store_true", help="安全替换已有输出")
+    parser.add_argument("--dry-run", action="store_true", help="显示示例数据生成计划，保持零写入")
     args = parser.parse_args(argv)
-    output = args.out.expanduser()
+    output = validate_output_location(args.out, [])
+    if args.dry_run:
+        print(f"[dry-run] 计划生成 {len(SPEC)} 张图片，{len(CLASSES)} 个类别 -> {output}")
+        return 0
     with staged_output(output, clean=args.force) as stage:
         _generate(stage)
     print(f"Wrote sample YOLO-seg dataset to {output}")

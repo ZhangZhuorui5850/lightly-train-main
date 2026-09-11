@@ -38,7 +38,7 @@ try:
         load_yaml,
         split_sample_files,
     )
-    from .output_naming import safe_path_component
+    from .output_naming import allocate_flat_sample_stem, safe_path_component
     from .progress import tqdm, write as progress_write
 except ImportError:
     from dataset_transaction import (  # type: ignore[no-redef]
@@ -52,7 +52,7 @@ except ImportError:
         load_yaml,
         split_sample_files,
     )
-    from output_naming import safe_path_component  # type: ignore[no-redef]
+    from output_naming import allocate_flat_sample_stem, safe_path_component  # type: ignore[no-redef]
     from progress import tqdm, write as progress_write  # type: ignore[no-redef]
 
 try:
@@ -146,6 +146,15 @@ def make_mask(polys: list[np.ndarray], w: int, h: int) -> np.ndarray:
     return mask
 
 
+def mvtec_defect_names(names: list[str]) -> dict[int, str]:
+    """为缺陷分配独立目录，并保留 MVTec 的正常样本目录 good。"""
+    used = {"good"}
+    return {
+        cid: allocate_flat_sample_stem(safe_path_component(name, fallback=f"class_{cid}"), used)
+        for cid, name in enumerate(names)
+    }
+
+
 def _write_image(path: Path, image: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(path), image):
@@ -158,6 +167,7 @@ def _convert_unpublished(
     *,
     report_out: Path,
     verbose: bool,
+    dry_run: bool = False,
 ) -> dict:
     names = load_names(src)
 
@@ -167,12 +177,12 @@ def _convert_unpublished(
         i: safe_path_component(f"{i:0{pad}d}_{name}", fallback=f"{i:0{pad}d}_class")
         for i, name in enumerate(names)
     }
-    defect_name = {
-        i: safe_path_component(name, fallback=f"class_{i}") for i, name in enumerate(names)
-    }
+    defect_name = mvtec_defect_names(names)
     if not names:
         raise ValueError(f"类别列表为空: {src}")
     for cls in range(len(names)):
+        if dry_run:
+            continue
         category = out / cat_name[cls]
         (category / "train" / "good").mkdir(parents=True, exist_ok=True)
         (category / "test" / "good").mkdir(parents=True, exist_ok=True)
@@ -249,23 +259,25 @@ def _convert_unpublished(
             if cls in present:
                 # anomaly for this class -> test/<class> + mask
                 dst = cat / "test" / defect_name[cls]
-                _write_image(dst / f"{output_stem}.png", img)
                 only = [p for c, p in polys if c == cls]
                 mask = make_mask(only, w, h)
                 gt = cat / "ground_truth" / defect_name[cls]
-                _write_image(gt / f"{output_stem}_mask.png", mask)
+                if not dry_run:
+                    _write_image(dst / f"{output_stem}.png", img)
+                    _write_image(gt / f"{output_stem}_mask.png", mask)
                 stats[cls]["defect"] += 1
             else:
                 # good relative to this class
                 sub = "train" if split == "train" else "test"
                 dst = cat / sub / "good"
-                _write_image(dst / f"{output_stem}.png", img)
+                if not dry_run:
+                    _write_image(dst / f"{output_stem}.png", img)
                 stats[cls]["train_good" if sub == "train" else "test_good"] += 1
 
     if verbose:
         if skipped:
             print(f"  ({skipped} 张因缺图/无法读取被跳过)")
-        print(f"\nConverted {src.name} -> {report_out}  (Option B, relative-good)\n")
+        print(f"\n{'[dry-run] 预览' if dry_run else 'Converted'} {src.name} -> {report_out}  (Option B, relative-good)\n")
         print(f"{'category':<22}{'train/good':>11}{'test/good':>11}{'test/defect':>13}")
         for i in range(len(names)):
             s = stats[i]
@@ -273,7 +285,7 @@ def _convert_unpublished(
     return stats
 
 
-def convert(src: Path, out: Path, clean: bool = False, verbose: bool = True) -> dict:
+def convert(src: Path, out: Path, clean: bool = False, verbose: bool = True, *, dry_run: bool = False) -> dict:
     """Convert a YOLO-seg dataset and atomically publish the completed output."""
     src = src.expanduser().resolve()
     try:
@@ -283,6 +295,8 @@ def convert(src: Path, out: Path, clean: bool = False, verbose: bool = True) -> 
     else:
         source_root = dataset_root_from_config(config_path, load_yaml(config_path))
     published_out = validate_output_location(out, [src, source_root])
+    if dry_run:
+        return _convert_unpublished(src, published_out, report_out=published_out, verbose=verbose, dry_run=True)
     with staged_output(published_out, clean=clean) as stage:
         return _convert_unpublished(
             src,
@@ -297,8 +311,9 @@ def main() -> None:
     ap.add_argument("--src", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--clean", action="store_true", help="wipe --out first")
+    ap.add_argument("--dry-run", action="store_true", help="检查图片和标签并预览转换统计，保持零写入")
     args = ap.parse_args()
-    convert(args.src, args.out, clean=args.clean)
+    convert(args.src, args.out, clean=args.clean, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

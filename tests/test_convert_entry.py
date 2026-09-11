@@ -96,3 +96,23 @@ def test_doctor_checks_real_cli_contract(monkeypatch):
     entry = _load_entry()
     monkeypatch.setattr(entry["subprocess"], "run", Mock(return_value=subprocess.CompletedProcess([], 0, "usage: example", "")))
     assert entry["main"](["doctor"]) == 2
+
+
+def test_interactive_returns_to_menu_after_tool_argument_error(monkeypatch):
+    entry = _load_entry()
+    answers = iter(["oneclick", "--invalid", "q"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    entry["_run"] = Mock(return_value=2)
+    assert entry["interactive"]() == 0
+
+
+def test_doctor_checks_auxiliary_cli_startup(monkeypatch):
+    import subprocess
+    entry = _load_entry()
+
+    def run(command, **kwargs):
+        broken = Path(command[1]).name == "seg_sample_browse.py"
+        return subprocess.CompletedProcess(command, 2 if broken else 0, "--dry-run", "bad import" if broken else "")
+
+    monkeypatch.setattr(entry["subprocess"], "run", run)
+    assert entry["main"](["doctor"]) == 2

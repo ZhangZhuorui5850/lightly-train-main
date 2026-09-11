@@ -203,3 +203,54 @@ def test_oneclick_all_with_semantic_keeps_each_requested_component(tmp_path):
     assert not (output / "dataset_seg").exists()
     det_yaml = (output / "dataset_det" / "data.yaml").read_text(encoding="utf-8")
     assert '1: "defect"' in det_yaml
+
+
+def test_labelme_dry_run_creates_no_output_or_lock(tmp_path):
+    source = tmp_path / "source"
+    _pair(source, "train", 0, (255, 0, 0))
+    (source / "classes.txt").write_text("defect\n")
+    output = tmp_path / "new-parent" / "converted"
+    one_click_convert.labelme_to_yolo.main([
+        "--source-root", str(source), "--output-root", str(output),
+        "--task", "det", "--source-format", "yolo", "--dry-run",
+    ])
+    assert not output.parent.exists()
+
+
+def test_preview_dry_run_creates_no_output_or_lock(tmp_path):
+    import seg_sample_browse
+    source = tmp_path / "source"
+    (source / "labels" / "train").mkdir(parents=True)
+    (source / "images" / "train").mkdir(parents=True)
+    (source / "classes.txt").write_text("defect\n")
+    Image.new("RGB", (16, 16)).save(source / "images" / "train" / "a.png")
+    (source / "labels" / "train" / "a.txt").write_text("0 0.1 0.1 0.8 0.1 0.5 0.8\n")
+    output = tmp_path / "new-parent" / "preview"
+    assert seg_sample_browse.browse(source, output, dry_run=True) == 1
+    assert not output.parent.exists()
+
+
+def test_sample_generator_dry_run_has_no_output(tmp_path):
+    import make_sample_yoloseg
+    output = tmp_path / "new-parent" / "sample"
+    assert make_sample_yoloseg.main(["--out", str(output), "--dry-run"]) == 0
+    assert not output.parent.exists()
+
+
+def test_labelme_late_output_requires_overwrite_authorization(tmp_path, monkeypatch):
+    converter = one_click_convert.labelme_to_yolo
+    monkeypatch.setattr(converter, "EXISTING_OUTPUT_POLICY", "ask")
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "output"
+
+    def write_after_initial_check(args, source_root, stage, published, policy):
+        output.mkdir()
+        (output / "concurrent.txt").write_text("keep")
+        (stage / "new.txt").write_text("new")
+
+    monkeypatch.setattr(converter, "_main_unpublished", write_after_initial_check)
+    with pytest.raises(FileExistsError):
+        converter.main(["--source-root", str(source), "--output-root", str(output)])
+    assert (output / "concurrent.txt").read_text() == "keep"
+    assert not (output / "new.txt").exists()

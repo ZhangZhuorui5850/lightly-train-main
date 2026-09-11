@@ -158,6 +158,7 @@ def _browse_unpublished(
     *,
     limit: int,
     font_path: Path | None,
+    dry_run: bool = False,
 ) -> int:
     """抽样最多 limit 张,生成标注预览 png + sample_index.csv。返回成功渲染的张数。"""
     names = load_names(src)
@@ -182,8 +183,9 @@ def _browse_unpublished(
         if img is None:
             continue
         polys = parse_label(txt)
-        preview = render_preview(img, polys, names, split, font_path=font_path)
-        preview.save(out / f"{stem}.png")
+        if not dry_run:
+            preview = render_preview(img, polys, names, split, font_path=font_path)
+            preview.save(out / f"{stem}.png")
         classes = sorted({cls for cls, _ in polys})
         rows.append({
             "stem": stem,
@@ -194,6 +196,8 @@ def _browse_unpublished(
         })
 
     fields = ["stem", "split", "defects", "n_defect_classes", "n_polygons"]
+    if dry_run:
+        return len(rows)
     with (out / "sample_index.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -208,12 +212,15 @@ def browse(
     font_path: Path | None = None,
     *,
     clean: bool = False,
+    dry_run: bool = False,
 ) -> int:
     """抽样生成预览，并原子发布完整输出目录。"""
     if limit <= 0:
         raise ValueError("limit 需要大于 0")
     source = src.expanduser().resolve()
     published_out = validate_output_location(out, [source])
+    if dry_run:
+        return _browse_unpublished(source, published_out, limit=limit, font_path=font_path, dry_run=True)
     with staged_output(published_out, clean=clean) as stage:
         return _browse_unpublished(
             source,
@@ -231,6 +238,7 @@ def main() -> None:
     ap.add_argument("--font", type=Path, default=None,
                     help="中文 TTF 字体路径(默认用仓库自带 tool_lib/msyh.ttc)")
     ap.add_argument("--clean", action="store_true", help="安全替换已有预览输出")
+    ap.add_argument("--dry-run", action="store_true", help="检查图片配对和标签并显示预览数量，保持零写入")
     args = ap.parse_args()
     n = browse(
         args.src,
@@ -238,8 +246,9 @@ def main() -> None:
         limit=args.limit,
         font_path=args.font,
         clean=args.clean,
+        dry_run=args.dry_run,
     )
-    print(f"\n生成 {n} 张标注预览到 {args.out};"
+    print(f"\n{'[dry-run] 计划生成' if args.dry_run else '生成'} {n} 张标注预览到 {args.out};"
           f"看图 + sample_index.csv 归纳物体,再建 staging/<物体>/ 分图。")
 
 

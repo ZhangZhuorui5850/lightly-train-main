@@ -326,3 +326,30 @@ def test_wizard_run_build_forwards(monkeypatch, tmp_path):
     result = wiz.run_build(tmp_path / "stg", tmp_path / "src", tmp_path / "out", clean=True)
     assert calls["clean"] is True and calls["staging"] == tmp_path / "stg"
     assert "manifest" in result
+
+
+@pytest.mark.parametrize("names", [["good", "good", "other"], ["Ｄｅｆｅｃｔ", "defect", "other"]])
+def test_conflicting_defect_names_keep_individual_masks(tmp_path, names):
+    src = make_src(tmp_path / "src")
+    (src / "data.yaml").write_text(yaml.safe_dump({"names": names}, allow_unicode=True))
+    staging = make_staging(tmp_path / "staging")
+    output = tmp_path / "output"
+    om.convert(staging, src, output, verbose=False)
+    masks = list((output / "管道" / "ground_truth").glob("*/b_mask.png"))
+    assert len(masks) == 2
+    assert len({path.parent.name.casefold() for path in masks}) == 2
+    assert all(path.parent.name.casefold() != "good" for path in masks)
+    assert not np.array_equal(cv2.imread(str(masks[0]), 0), cv2.imread(str(masks[1]), 0))
+    assert all((output / "管道" / "test" / p.parent.name / "b.png").is_file() for p in masks)
+
+
+def test_normalized_object_names_keep_separate_categories(tmp_path):
+    src = make_src(tmp_path / "src")
+    staging = tmp_path / "staging"
+    _img(staging / "Ａ" / "a.jpg")
+    _img(staging / "A" / "c.jpg")
+    output = tmp_path / "output"
+    om.convert(staging, src, output, verbose=False)
+    categories = [p for p in output.iterdir() if p.is_dir()]
+    assert len(categories) == 2
+    assert len({p.name.casefold() for p in categories}) == 2

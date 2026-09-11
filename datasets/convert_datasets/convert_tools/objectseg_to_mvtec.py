@@ -52,10 +52,11 @@ from yoloseg_to_mvtec import (  # noqa: E402,F401
     find_image,
     load_names,
     make_mask,
+    mvtec_defect_names,
     parse_label,
 )
 from dataset_transaction import staged_output, validate_output_location  # noqa: E402
-from output_naming import safe_path_component  # noqa: E402
+from output_naming import allocate_flat_sample_stem, safe_path_component  # noqa: E402
 from progress import tqdm  # noqa: E402
 
 
@@ -163,6 +164,7 @@ def _convert_unpublished(
     返回统计 dict:{stats, missing, conflicts, manifest}。从不修改 src。
     """
     names = load_names(src)
+    defect_names = mvtec_defect_names(names)
     index = build_label_index(src)
     objects, conflicts = scan_staging(staging)
 
@@ -171,8 +173,9 @@ def _convert_unpublished(
     missing: list[tuple[str, str]] = []
     manifest: list[dict[str, str]] = []
 
+    used_objects: set[str] = set()
     for obj, imgs in objects.items():
-        safe_object = safe_path_component(obj, fallback="object")
+        safe_object = allocate_flat_sample_stem(safe_path_component(obj, fallback="object"), used_objects)
         cat = out / safe_object
         _ensure_empty_layout(cat)
         bar = tqdm(imgs, desc=f"物体 {obj}", unit="img", disable=not verbose,
@@ -207,7 +210,7 @@ def _convert_unpublished(
                             "请检查是不是 --src 指错了,或 data.yaml 与标签不匹配。"
                         )
                     dname = names[cls]
-                    safe_defect = safe_path_component(dname, fallback=f"class_{cls}")
+                    safe_defect = defect_names[cls]
                     dst = cat / "test" / safe_defect
                     _write_image(dst / f"{stem}.png", img)
                     only = [p for c, p in polys if c == cls]

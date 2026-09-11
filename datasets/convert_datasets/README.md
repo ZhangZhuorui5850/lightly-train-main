@@ -91,8 +91,8 @@ python convert.py mvtec2yolo ...  # 标准 MVTec 同时转 YOLO Seg 和 Det
 命令或参数输入错误会留在当前启动台继续修正。非交互工具的参数处直接回车会显示帮助。
 
 菜单中的能力标签含义：`只读` 表示只做检测，`dry-run` 表示支持零写入预览，
-`原子替换` 表示写入 staging 校验后发布。所有常用写入命令都注册了 `--dry-run`；
-`convert.py doctor` 会检查注册表，并实际运行常用写入工具的 `--help`，确认启动成功且公开 `--dry-run` 参数。
+`原子替换` 表示写入 staging 校验后发布。所有已注册的写入命令都提供 `--dry-run`；
+`convert.py doctor` 会检查注册表，并实际运行全部工具的 `--help`，确认启动成功，同时检查写入工具公开 `--dry-run` 参数。
 输出目录会在路径解析前检查软链接；重新划分工具的 `--dry-run` 同样校验源输出目录分离。
 菜单默认列出常用主流程；输入 `more` 展开单步/辅助工具。
 
@@ -545,6 +545,11 @@ python convert.py mvtec2yolo --src /path/to/mvtec --out /path/to/dataset_det --t
 `oneclick --task all --seg-type semantic` 会同时生成 `dataset_semantic`、
 `dataset_det` 和 `dataset_cls`；各组件先在隔离目录完成，再一次性发布。
 
+辅助命令 `labelme2yolo`、`seg2mvtec`、`sample-browse`、`make-sample` 同样支持
+`--dry-run`。`labelme2yolo` 预览输入格式与类别映射，`seg2mvtec` 检查图片与多边形并
+统计转换数量，`sample-browse` 检查配对与标签，`make-sample` 显示示例生成计划。
+上述预览保持输出目录、锁文件及源数据零写入。`labelme2yolo --clean` 可显式原子替换旧输出。
+
 ## ③ 转 MVTec AD 的约定(交付多模态团队用)
 
 - **结构 = 方案 B**：每个缺陷类 → 一个顶层 MVTec category(20+ 类就 20+ 个文件夹)。
@@ -552,6 +557,8 @@ python convert.py mvtec2yolo --src /path/to/mvtec --out /path/to/dataset_det --t
   (源 train → `train/good/`，源 val/test → `test/good/`)。
 - **一图多类**：复制进每个相关 category，各自只保留本类多边形掩码。
 - **无标注样本**：图片目录为样本清单，缺少 TXT 或空 TXT 都按 good 处理。
+- **目录名**：`good` 专供正常样本；缺陷名与其冲突时自动追加序号（如 `good__2`）。
+  重复名称、大小写及 Unicode 规范化后重名的缺陷也会分配独立目录，物体版采用相同规则。
 - **掩码**：二值 PNG `{0,255}`，与原图同尺寸，命名 `<stem>_mask.png`。
 - **内容识别**：扫描器依据 YOLO polygon 标签内容选出数据集，目录名可以自定义；
   det 的 4 坐标 bbox 会标记为 `DET-skip`。

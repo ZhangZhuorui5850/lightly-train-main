@@ -208,3 +208,22 @@ def test_make_sample_help_has_no_output_side_effect(tmp_path: Path) -> None:
 
     assert result.returncode == 0
     assert not output.exists()
+
+
+def test_good_class_uses_separate_anomaly_directory(tmp_path):
+    source = _dataset(tmp_path / "source")
+    (source / "classes.txt").write_text("good\n")
+    output = tmp_path / "output"
+    converter.convert(source, output, verbose=False)
+    category = output / "0_good"
+    assert not (category / "test" / "good" / "bad.png").exists()
+    masks = list((category / "ground_truth").rglob("bad_mask.png"))
+    assert len(masks) == 1
+    assert (category / "test" / masks[0].parent.name / "bad.png").is_file()
+
+
+def test_legacy_dry_run_validates_without_writes(tmp_path):
+    source = _dataset(tmp_path / "source")
+    output = tmp_path / "new-parent" / "output"
+    converter.convert(source, output, verbose=False, dry_run=True)
+    assert not output.parent.exists()

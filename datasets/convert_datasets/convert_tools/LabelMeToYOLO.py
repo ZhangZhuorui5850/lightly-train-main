@@ -146,6 +146,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="参考类别文件（data.yaml / classes.txt），输出将使用其中的完整类别列表和 ID 映射",
     )
+    parser.add_argument("--dry-run", action="store_true", help="检查输入格式和类别映射并显示计划，保持零写入")
+    parser.add_argument("--clean", action="store_true", help="原子替换已有输出目录")
     return parser.parse_args(argv)
 
 
@@ -1320,6 +1322,19 @@ def _main_unpublished(
         print("\n[ERROR] 未检测到可用标注文件（.json 或 .txt）。")
         sys.exit(1)
 
+    if source_format == "labelme":
+        class_map = collect_classes(source_root, SPLITS)
+    else:
+        class_map = collect_classes_from_yolo(source_root, SPLITS)
+    if not class_map:
+        raise ValueError(f"没有收集到任何类别: {source_root}")
+    print(f"\n[INFO] 类别映射（共 {len(class_map)} 类）：")
+    for k, v in sorted(class_map.items(), key=lambda x: x[1]):
+        print(f"  {v:3d}  {k}")
+    if args.dry_run:
+        print("[dry-run] 输入格式和类别映射检查完成，以上为输出计划。")
+        return
+
     safe_mkdir(output_root)
     selected_targets = []
     if "det" in selected_tasks:
@@ -1338,19 +1353,6 @@ def _main_unpublished(
         else:
             safe_mkdir(target / "images")
             safe_mkdir(target / "labels")
-
-    if source_format == "labelme":
-        class_map = collect_classes(source_root, SPLITS)
-    else:
-        class_map = collect_classes_from_yolo(source_root, SPLITS)
-    if not class_map:
-        print("\n[ERROR] 没有收集到任何类别！")
-        print(f"  SOURCE_ROOT: {source_root.resolve()}")
-        sys.exit(1)
-
-    print(f"\n[INFO] 类别映射（共 {len(class_map)} 类）：")
-    for k, v in sorted(class_map.items(), key=lambda x: x[1]):
-        print(f"  {v:3d}  {k}")
 
     if "det" in selected_tasks:
         write_classes_file(class_map, target_det / "classes.txt")
@@ -1408,7 +1410,10 @@ def main(argv: list[str] | None = None) -> None:
     published_output_root = validate_output_location(
         Path(args.output_root), [source_root]
     )
-    publish_policy = EXISTING_OUTPUT_POLICY
+    publish_policy = "clean" if args.clean else EXISTING_OUTPUT_POLICY
+    if args.dry_run:
+        _main_unpublished(args, source_root, published_output_root, published_output_root, publish_policy)
+        return
     if (
         publish_policy == "ask"
         and published_output_root.is_dir()
@@ -1419,7 +1424,7 @@ def main(argv: list[str] | None = None) -> None:
             "    输入 y 重新生成，输入 n 合并到旧输出 [y/n]: "
         ).strip().lower()
         publish_policy = "clean" if answer == "y" else "keep"
-    with staged_output(published_output_root, clean=True) as output_root:
+    with staged_output(published_output_root, clean=publish_policy in {"clean", "keep"}) as output_root:
         if publish_policy == "keep" and published_output_root.exists():
             shutil.copytree(published_output_root, output_root, dirs_exist_ok=True)
         _main_unpublished(
