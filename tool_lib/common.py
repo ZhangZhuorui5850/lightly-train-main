@@ -1182,9 +1182,10 @@ def ensure_image_samples(samples: list[ImageSample]) -> None:
 
 
 def save_records_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    """按 fieldnames 导出指定列，保留原始记录中的内部辅助字段。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 

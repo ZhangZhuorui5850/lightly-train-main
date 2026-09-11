@@ -1438,13 +1438,13 @@ def _write_semantic_summary(
     num_samples: int,
     infer_time_sum_ms: float,
     failed: int,
-    overwrite: bool,
     checkpoint_path: Path,
     data_path: Path,
 ) -> dict[str, Any]:
     """计算 IoU、写 summary/CSV 并打印指标。顺序路径与并行合并路径共用，保证产物字节一致。"""
     metrics, per_class = _compute_semantic_iou(confusion)
-    rt.prepare_output_dir(output_dir, overwrite, clean=True)
+    # 目录清理由调用方在运行边界负责；多卡汇总时目录内仍有待读取的分片缓存。
+    output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "seg_semantic_eval_summary.json"
     csv_path = output_dir / "seg_semantic_eval_samples.csv"
     rt.save_records_csv(csv_path, rows, ["image_path", "mask_path", "valid_pixels", "vis_miou", "vis_class"])
@@ -1527,6 +1527,7 @@ def _evaluate_semantic_split(
         )
         return None
 
+    rt.prepare_output_dir(output_dir, overwrite, clean=True)
     summary = _write_semantic_summary(
         output_dir,
         split=split,
@@ -1537,11 +1538,10 @@ def _evaluate_semantic_split(
         num_samples=num_samples,
         infer_time_sum_ms=infer_time_sum_ms,
         failed=failed,
-        overwrite=overwrite,
         checkpoint_path=checkpoint_path,
         data_path=data_path,
     )
-    # summary 里已 clean 过 output_dir，故渲染放在其后，避免对比图被清掉。
+    # 输出目录已准备完毕，随后生成对比图。
     if save_visualization:
         _render_semantic_visualizations(
             model, data_path, split, rows,
@@ -1922,7 +1922,6 @@ def _merge_parallel_semantic(
             num_samples=merged["num_samples"],
             infer_time_sum_ms=merged["infer_time_sum_ms"],
             failed=merged["failed"],
-            overwrite=args.overwrite,
             checkpoint_path=checkpoint_path,
             data_path=data_path,
         )
